@@ -157,3 +157,29 @@ rediscovering them.
 Items 10–14 (server-side trace history, event-stream push updates, CML node
 tagging, Windows nodes as trace sources, access control) are product/scope
 decisions, not API assumptions to verify — left as originally described.
+
+## Diagnostic: Firewall-DR-2 <-> Firewall-HQ-1 (2026-09-24)
+
+Ping was 100% healthy the whole time (150/150, 1-2ms RTT) — the trace tool's
+own calibration bug (above) made it *look* broken by fabricating a fake path.
+After fixing that, the trace still showed a real, surprising route: traffic
+left via DMZSwitch-DR-2 -> DMZSwitch-DR-1 -> Firewall-DR-1 -> CoreSwitch-DR-1
+instead of Firewall-DR-2's own direct core links. Confirmed live (not a trace
+artifact) via `show route` and `show running-config` on Firewall-DR-2: its
+`outside`/`inside` interfaces had explicit `ospf cost 50`, but `dmz` was left
+at Cisco's cheap default — cheaper than its own core uplinks. Every other
+firewall in the lab avoids this (HQ-2 explicitly sets `dmz` to `ospf cost
+200`; DR-1/HQ-1 leave both sides at matching defaults). Fixed by adding
+`ospf cost 200` to Firewall-DR-2's `dmz` interface (`GigabitEthernet0/5`),
+matching HQ-2's pattern, and saved. Re-verified: `show route` now sends
+everything via its own `inside`/`inside2` interfaces, and a live trace
+confirms a clean 4-hop path (Firewall-DR-2 -> CoreSwitch-DR-2 ->
+CoreSwitch-DR-1 -> CoreSwitch-HQ-1 -> Firewall-HQ-1), factor 0.323, no
+detour through Firewall-DR-1.
+
+## Diagnostic: WFH user (VPN client) -> ServerRoomSwitch-HQ-1 (2026-09-24)
+
+100% loss, by design. Traceroute reaches EdgeRouter-HQ-1 (10.255.10.5) then
+stops; verdict correctly reports requests got as far as Firewall-HQ-1. Matches
+known-issue #19 — the perimeter denies an untunneled internet client from
+reaching RFC1918 space. Not a fault.
