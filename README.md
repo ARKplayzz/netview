@@ -28,26 +28,27 @@ desktop network tool around one view: the path between two nodes.
 
 - **Menu bar** (Lab / View / Tools) and **Refresh from CML** (`R`).
 - **Node list** (left, always there): every node grouped by layer, filterable
-  by search (`/`) and site, with its state lamp and address. Click to inspect;
-  **From** / **To** on a row set the ends of the path; double-click for the
-  console log; right-click for everything else.
-- **Path view** (centre): choose From and To (or use the list). The nodes
-  between them are drawn left to right in hop order, with redundant
-  alternatives stacked in the same column; a long path wraps onto the next
-  row like a line of text. Dashed = possible, solid = what the packets
-  actually crossed, with the packet count on each link. After a failover the
-  previous run's nodes stay on the diagram, dotted, marked stopped / not used
-  now. See "Path trace" below.
-- **Properties sidebar** (right): the lab summary with nothing selected; with a
-  node selected, Node / Addresses / Interfaces / DHCP / Ping tabs, each value
-  labelled with where it came from.
-- **Bottom pane**: node table (sortable, groupable), Trace details (links
-  crossed, traceroute hops, every run this session), Baseline matrix (click a
-  row to trace that path), DNS audit, Live addresses, Ping log, and one tab
-  per console log.
+  by search (`/`) and site, with its state lamp and address (or its flags:
+  absent, undeclared, address drift). Click to inspect; **From** / **To** on a
+  row set the ends of the path; double-click for the console log; right-click
+  for the rest.
+- **Path view** (centre): From, To, address, packet count, **Check DNS**,
+  **Repeat**, **Run trace**. The nodes between the two ends are drawn left to
+  right in hop order, with redundant alternatives stacked in the same column;
+  a long path wraps onto the next row. Dashed = possible, solid = what the
+  packets actually crossed, with packet counts. After a failover the previous
+  run's nodes stay on the diagram, dotted. See "Path trace" below.
+- **Properties sidebar** (right): lab summary and "needs attention" with
+  nothing selected; with a node selected, Node / Addresses / Interfaces / DHCP
+  tabs, every value labelled with where it came from.
+- **Bottom pane**: Trace details (links crossed, traceroute hops, DNS answer,
+  every run this session), Baseline matrix (click a row to trace that path),
+  DNS audit, and one tab per console log.
 
-Hidden nodes persist as an **exclusion** list, so anything new in the lab
-defaults to visible.
+Removed in the redesign, because the path trace does the same job better or
+because they read offline files: the full-lab canvas, the standalone ping
+tool and ping log, the node table, live link-rate counters, hide-node,
+group-by options and open-issue badges (`docs/known-issues.md`).
 
 ## Where the data comes from
 
@@ -66,7 +67,6 @@ sidebar is labelled with where it came from.
 | Link counters | CML `simulation_stats` |
 | Plan to compare against | `data/manifest.yml`, optional; its values are kept as `declared` and differences are shown under "Lab against manifest" |
 | DNS short name rule, DHCP scopes | `render_configs` (unchanged) |
-| Issue badges | `docs/known-issues.md`, OPEN sections only |
 
 Which CML reads succeeded is shown in the Lab panel and the status bar; a
 read CML does not answer is reported, never silently left blank.
@@ -74,8 +74,9 @@ read CML does not answer is reported, never silently left blank.
 ## Path trace
 
 Pick a source and a destination (From / To above the path view, the From /
-To links in the node list, a node's right-click menu, or `T` to pick in the
-list). The path view draws the nodes between them left to right.
+To links in the node list, a node's right-click menu, `T` to pick in the list,
+or a Baseline matrix row). The path view draws the nodes between them left to
+right.
 
 1. **Predicted**: every shortest path over the running part of the lab,
    dashed. With redundancy there are several.
@@ -87,6 +88,9 @@ list). The path view draws the nodes between them left to right.
    calibrated from the source's own links, not assumed. This sees layer 2
    hops too, so it shows which redundant switch or uplink was actually used.
 3. **Traceroute** from the same source names the routed hops.
+4. **Check DNS** (optional) resolves the destination's name from the source
+   (or, for an IOS/ASA source, a Linux node at the same site) and flags an
+   answer that differs from the address being traced.
 
 If the target does not answer, the counters still show how far the requests
 got ("requests got as far as X"). Every run is kept for the session, and a run
@@ -110,11 +114,12 @@ Three different clocks, none conflated:
   names its read time. Desktops lease too but their image has no command that
   reports remaining time, and the page says so instead of inventing a number.
 
-## Probes — resolve, then ping
+## DNS checks — resolve, then compare
 
-Three facts reported separately: did the name resolve, does the answer match the
-manifest (a resolver confidently serving a stale address is the failure no ping
-can see), and did ICMP arrive (loss, RTT, per-packet pattern).
+Used by the path trace's **Check DNS** and by the DNS audit. Two facts reported
+separately: did the name resolve, and does the answer match the address being
+traced (a resolver confidently serving a stale address is the failure no ping
+can see).
 
 No device config is changed. IOS nodes ship `no ip domain lookup`, so the lookup
 runs from a node that genuinely has a resolver — preferred order: the source
@@ -182,20 +187,15 @@ answering its DHCP lease address instead of its static record.
 
 | Route | Purpose |
 |---|---|
-| `GET /api/inventory` | full model + state + issues + drift counts |
-| `GET /api/state` | cheap poll: label → state |
-| `POST /api/probe`, `GET /api/probe/<id>` | point probe (queued, pooled) |
+| `GET /api/inventory` | full model from CML + state + drift counts + which CML reads worked |
 | `GET /api/matrix`, `POST /api/matrix/run` | baseline matrix (4 parallel sessions) |
 | `GET /api/dnsaudit`, `POST /api/dnsaudit/run` | estate DNS audit |
 | `GET /api/dhcp/<label>` | live lease read (~15s) |
 | `GET /api/harvest`, `POST /api/harvest/run` | live address harvest across all drivable nodes |
-| `GET /api/simstats` | per-link packet/drop counters, 0.04s, no console |
 | `GET /api/console-log/<label>?line=&lines=` | console scrollback, no attach |
-| `GET /api/issues` | parsed known-issues index |
 | `GET /api/export.csv` | full inventory as CSV |
 | `GET /api/inventory?fresh=1` | as above, bypassing the 5 s CML read cache |
-| `GET /api/path?source=&target=` | predicted shortest paths only, no console |
-| `POST /api/trace`, `GET /api/trace/<id>` | measured path trace (console burst + link counters + traceroute) |
+| `POST /api/trace`, `GET /api/trace/<id>` | measured path trace (console burst + link counters + traceroute, optional DNS) |
 
 ## Concurrency model
 
@@ -207,7 +207,7 @@ concurrent sessions returned clean, correctly-attributed results. Whole-estate
 runs (matrix, audit) partition their probes **by source node** across workers.
 
 Measured effect: baseline matrix 9 min → **65 s**; DNS audit 467 s → **25 s**;
-two point probes in parallel finish in the time of the slower one.
+two traces from different sources run in parallel.
 
 Where the REST API already knows the answer, the console is not used at all:
 link counters (`simulation_stats`) and console logs are 0.02–0.05 s reads.
@@ -227,7 +227,8 @@ link counters (`simulation_stats`) and console logs are 0.02–0.05 s reads.
   harvest reads the running state.
 
 - Linux (BusyBox) pings report loss + pattern, no RTT; IOS sources report RTT.
-- A point probe still costs ~10–17 s: the console attach is real work.
+- A path trace costs ~15–35 s: 3 s of background sampling, the console attach,
+  the ping burst (100 pings; about 20 s from a BusyBox source) and a traceroute.
 - Parallel console READS are proven safe; parallel config WRITES are not tested
   — anything that writes device config stays serial.
 - **Windows (`win2025`) nodes: live addresses only.** The harvest reads them from

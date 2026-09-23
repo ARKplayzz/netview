@@ -14,8 +14,6 @@
   --tool:    #f5f6f8;   /* toolbar, section heads */
   --panel:   #ffffff;
   --canvas:  #ffffff;
-  --grid-s:  #f0f2f5;
-  --grid-l:  #e2e6eb;
   --ink:     #1d2127;
   --ink2:    #50585f;
   --ink3:    #858c94;
@@ -42,15 +40,13 @@
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
     --bar: #24272c; --tool: #2a2e33; --panel: #1e2125; --canvas: #1a1c1f;
-    --grid-s: #202327; --grid-l: #2a2e33; --ink: #dfe2e6; --ink2: #a9afb6; --ink3: #767d85;
-    --line: #3a3f45; --line2: #2e3237; --sel: #6aa1ea; --selbg: #263a55; --hover: #262a2f;
+      --line: #3a3f45; --line2: #2e3237; --sel: #6aa1ea; --selbg: #263a55; --hover: #262a2f;
     --dev: #4b7fb6; --devoff: #555c64; --wire: #6c747c;
     --ok: #6cc07a; --warn: #e0a54a; --bad: #ef6f69; --infobg: #3a3220; --infoln: #5e5130;
   }
 }
 :root[data-theme="dark"] {
   --bar: #24272c; --tool: #2a2e33; --panel: #1e2125; --canvas: #1a1c1f;
-  --grid-s: #202327; --grid-l: #2a2e33; --ink: #dfe2e6; --ink2: #a9afb6; --ink3: #767d85;
   --line: #3a3f45; --line2: #2e3237; --sel: #6aa1ea; --selbg: #263a55; --hover: #262a2f;
   --dev: #4b7fb6; --devoff: #555c64; --wire: #6c747c;
   --ok: #6cc07a; --warn: #e0a54a; --bad: #ef6f69; --infobg: #3a3220; --infoln: #5e5130;
@@ -116,10 +112,11 @@ a { color: var(--sel); }
 
 /* path view: the main area */
 .pathview { display: flex; flex-direction: column; min-height: 0; background: var(--canvas); }
-.path-head { display: flex; align-items: center; gap: 12px; padding: 0 10px; height: 38px; flex: none;
-             background: var(--tool); border-bottom: 1px solid var(--line); white-space: nowrap; overflow-x: auto; }
+.path-head { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 12px; padding: 5px 10px;
+             min-height: 38px; flex: none; background: var(--tool); border-bottom: 1px solid var(--line);
+             white-space: nowrap; }
 .path-head label { display: flex; align-items: center; gap: 5px; color: var(--ink2); }
-.path-head select { max-width: 200px; }
+.path-head select { max-width: 190px; }
 .path-body { flex: 1; min-height: 0; overflow: auto; }
 .path-status { padding: 8px 14px 0; display: flex; gap: 6px; align-items: baseline; flex-wrap: wrap; }
 .path-status .meter { flex-basis: 100%; max-width: 420px; }
@@ -229,10 +226,7 @@ table.g td.wrap { white-space: normal; }
 table.g tr.row { cursor: default; }
 table.g tr.row:hover td { background: var(--hover); }
 table.g tr.sel td { background: var(--selbg); }
-table.g tr.grp td { background: var(--tool); font-weight: 600; color: var(--ink2); padding-top: 4px; }
 table.g tr.off td { color: var(--ink3); }
-table.g th.sortable { cursor: pointer; }
-table.g th.sorted { color: var(--ink); font-weight: 600; }
 
 /* status words and lamps */
 .lamp-i { display: inline-block; width: 8px; height: 8px; margin-right: 6px; vertical-align: 0;
@@ -255,21 +249,11 @@ table.p td { padding: 3px 8px; border-bottom: 1px solid var(--line2); vertical-a
 table.p tr:last-child td { border-bottom: 0; }
 table.p td:first-child { width: 38%; color: var(--ink2); border-right: 1px solid var(--line2); }
 table.p tr.drift td { background: var(--infobg); }
-.side-body .pmsg { border-bottom: 1px solid var(--line2); }
 .side-body .acts { display: flex; gap: 6px; flex-wrap: wrap; padding: 8px; }
 .side-empty { padding: 10px 8px; color: var(--ink3); }
 .copy { border: 0; background: none; padding: 0 0 0 6px; color: var(--ink3); text-decoration: underline; font-size: 11px; }
 .copy:hover { color: var(--sel); background: none; }
 
-/* ping form */
-.form { padding: 8px; display: grid; gap: 6px; }
-.form label { display: grid; gap: 2px; color: var(--ink2); }
-.form select { width: 100%; }
-.form .row2 { display: flex; gap: 10px; align-items: center; }
-.result { padding: 6px 8px; border-bottom: 1px solid var(--line2); }
-.result .h { display: flex; gap: 8px; }
-.pattern { font-family: var(--mono); letter-spacing: 1px; }
-.pattern .miss { color: var(--bad); font-weight: 700; }
 .meter { height: 4px; background: var(--line2); margin-top: 4px; }
 .meter i { display: block; height: 100%; background: var(--sel); width: 0; }
 

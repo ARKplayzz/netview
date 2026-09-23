@@ -16,7 +16,6 @@
 'use strict';
 
 const REFRESH_S = 15;
-const HIDE_KEY = 'netview.hidden.v2';
 const SITE_KEY = 'netview.site.v1';
 const PREF_KEY = 'netview.workbench.v2';
 const SVGNS = 'http://www.w3.org/2000/svg';
@@ -31,20 +30,15 @@ const BY = new Map();
 let selected = null, countdown = REFRESH_S, paused = false;
 let site = store.get(SITE_KEY, 'all');
 if (!['all', 'HQ', 'DR', 'other'].includes(site)) site = 'all';
-const hidden = new Set(store.get(HIDE_KEY, []));
 const prefs = Object.assign({
-  ip: true, iface: false, traffic: false, theme: null, paneH: 260, paneMin: false,
-  groupBy: 'layer', hideDown: false, sort: 'label', sortDir: 1,
+  theme: null, paneH: 260, paneMin: false,
 }, store.get(PREF_KEY, {}));
 const savePrefs = () => store.set(PREF_KEY, prefs);
 
-let paneTab = 'nodes';           // nodes | matrix | dns | harvest | pings | con:<label>
-let sideTab = 'node';            // node | addresses | interfaces | dhcp | ping
+let paneTab = 'trace';           // trace | matrix | dns | con:<label>
+let sideTab = 'node';            // node | addresses | interfaces | dhcp
 const consoles = [];             // labels with an open console tab
 const consoleText = new Map();
-// Ping jobs live here rather than in DOM nodes, so switching tabs or
-// selecting another node never loses a run in flight.
-const probeJobs = [];
 
 const $ = (s) => document.querySelector(s);
 const el = (tag, cls, text) => {
@@ -76,14 +70,14 @@ async function boot() {
 /* The whole inventory is re-read from the server on every refresh, and the
  * server re-reads CML (topology, states, addresses, configs) for it, so a
  * node added, moved, re-cabled or re-addressed in CML appears here on the
- * next tick.  Only per-session state (pings, consoles, the trace) is kept. */
+ * next tick.  Only per-session state (consoles, the trace) is kept. */
 async function loadInventory(fresh) {
   const inv = await getJSON('/api/inventory' + (fresh ? '?fresh=1' : ''));
   const keep = new Map(NODES.map((n) => [n.label, { lastSource: n.lastSource }]));
   INV = inv;
   NODES = INV.nodes.concat(INV.ghosts.map((g) => Object.assign({
     ghost: true, up: false, dns: {}, links: [], vlans: [], addresses: [],
-    ha: {}, issues: [], interfaces: [], probe_family: 'none',
+    ha: {}, interfaces: [], probe_family: 'none',
     can_source_probe: false, addressing: 'unaddressed',
   }, g)));
   BY.clear();
@@ -98,7 +92,6 @@ async function poll(fresh) {
     countdown = REFRESH_S;
     renderPathBody(); renderNodeList(); renderStatus(); renderPaneTabs();
     if (!$('#path-head').contains(document.activeElement)) renderPathHead();
-    if (paneTab === 'nodes') renderPaneBody();
     if (!selected || ['node', 'addresses', 'interfaces'].includes(sideTab)) renderSide();
     if (fresh) infobar();
   } catch (e) { /* one missed poll is not worth an error state */ }
@@ -140,10 +133,6 @@ function infobar() {
     line('bad', `CML is unreachable. Showing the cached snapshot (${age != null ? age + ' h old' : 'age unknown'}); ` +
       'anything changed in the lab since then is missing.');
   }
-  if (m.counts.undeclared) {
-    line(null, `${m.counts.undeclared} node(s) are in the lab but not in the manifest and get no generated config. ` +
-      'They are flagged "undeclared" in the node list.');
-  }
   box.hidden = !box.children.length;
 }
 
@@ -163,15 +152,12 @@ function hay(n) {
   return p.filter(Boolean).join(' ').toLowerCase();
 }
 
-/* The canvas keeps every node in place (moving the lab around under a filter
- * would be disorienting); filters DIM on the canvas and REMOVE from the table. */
+/* Search and the site selector narrow the node list. */
 function matches(n) {
   const q = $('#q').value.trim().toLowerCase();
   if (site !== 'all' && siteBucket(n) !== site) return false;
-  if (prefs.hideDown && !n.up && !n.ghost) return false;
   return !q || hay(n).includes(q);
 }
-const shown = (n) => !hidden.has(n.label);
 
 /* Live address (read off the device) outranks the manifest's declaration. */
 function displayIp(n) {
@@ -254,59 +240,13 @@ const shortIf = (s) => (s || '')
   .replace(/^FastEthernet/i, 'Fa').replace(/^Ethernet/i, 'e').replace(/^Management/i, 'Mgmt')
   .replace(/^Port-channel/i, 'Po').replace(/^Vlan/i, 'Vl');
 
-/* ------------------------------------------------------- link traffic ---- */
-/* Two samples of the lab-wide link counters give live pkts/s and a cumulative
- * drop count per link, read over REST with no console attach (0.04s). */
-let trafficTimer = null, lastStats = null, linkRates = {};
-
-function startTraffic() {
-  stopTraffic();
-  const sample = async () => {
-    try {
-      const s = await getJSON('/api/simstats');
-      if (s.error) throw s.error;
-      const t = Date.now();
-      if (lastStats) {
-        const dt = (t - lastStats.t) / 1000;
-        linkRates = {};
-        Object.entries(s.links).forEach(([id, v]) => {
-          const p = lastStats.links[id];
-          if (p) linkRates[id] = {
-            pps: Math.max(0, ((v.readpackets + v.writepackets) - (p.readpackets + p.writepackets)) / dt),
-            drops: v.drops,
-          };
-        });
-      }
-      lastStats = { t, links: s.links };
-      if (selected && sideTab === 'interfaces') renderSide();
-    } catch (e) { linkRates = {}; }
-  };
-  sample();
-  trafficTimer = setInterval(sample, 3000);
-}
-function stopTraffic() {
-  clearInterval(trafficTimer); trafficTimer = null; lastStats = null; linkRates = {};
-}
-function setTraffic(on) {
-  prefs.traffic = on; savePrefs();
-  if (on) startTraffic(); else stopTraffic();
-  if (selected && sideTab === 'interfaces') renderSide();
-}
-
 /* ------------------------------------------------------------ selection -- */
 function select(label) {
   selected = label;
   const n = label && BY.get(label);
-  if (n && ((sideTab === 'dhcp' && !n.dhcp) || (n.ghost && sideTab === 'ping'))) sideTab = 'node';
+  if (n && sideTab === 'dhcp' && !n.dhcp) sideTab = 'node';
   if (n) document.body.classList.add('side-open');
   markPathSelection(); renderSide(); renderStatus();
-}
-
-function hideNode(label) {
-  hidden.add(label);
-  store.set(HIDE_KEY, [...hidden]);
-  if (selected === label) selected = null;
-  renderAll();
 }
 
 /* ----------------------------------------------------------- status bar -- */
@@ -335,10 +275,8 @@ function renderStatus() {
   $('#lab-state').textContent = m.topology_source === 'live'
     ? `${allUp} of ${all.length} nodes running` : 'CML unreachable';
 
-  const hb = $('#hidden-btn');
-  hb.hidden = hidden.size === 0;
-  hb.textContent = `${hidden.size} hidden`;
-  hb.title = 'Show hidden nodes again: ' + [...hidden].join(', ');
+  const h = LAB.harvest.st;
+  $('#harvest-line').textContent = h && h.status === 'running' ? `Reading consoles ${h.done_count}/${h.total}` : '';
 
   const n = selected && BY.get(selected);
   $('#sel-line').textContent = n ? `${n.label}  (${n.node_definition || 'not in lab'})` : '';
@@ -348,7 +286,7 @@ function renderAll() { renderPathHead(); renderPathBody(); renderNodeList(); ren
 
 /* ============================================================== sidebar == */
 const SIDE_TABS = [['node', 'Node'], ['addresses', 'Addresses'], ['interfaces', 'Interfaces'],
-                   ['dhcp', 'DHCP'], ['ping', 'Ping']];
+                   ['dhcp', 'DHCP']];
 
 function renderSide() {
   const tabs = $('#side-tabs'), body = $('#side-body');
@@ -363,11 +301,7 @@ function renderSide() {
   }
   SIDE_TABS.forEach(([k, t]) => {
     if (k === 'dhcp' && !n.dhcp) return;
-    if (k === 'ping' && n.ghost) return;
     const b = el('button', 'tab' + (sideTab === k ? ' on' : ''), t);
-    if (k === 'ping' && probeJobs.some((j) => j.target === n.label && !['done', 'error'].includes(j.status))) {
-      b.appendChild(el('span', 'n', 'running'));
-    }
     b.addEventListener('click', () => { sideTab = k; renderSide(); });
     tabs.appendChild(b);
   });
@@ -379,7 +313,7 @@ function renderSide() {
   tabs.appendChild(close);
 
   const fn = { node: sideNode, addresses: sideAddresses, interfaces: sideInterfaces,
-               dhcp: sideDhcp, ping: sidePing }[sideTab] || sideNode;
+               dhcp: sideDhcp }[sideTab] || sideNode;
   body.appendChild(fn(n));
   body.scrollTop = scroll;
 }
@@ -437,16 +371,6 @@ function labSummary() {
     ['Manifest', m.manifest ? 'loaded, used for comparison' : 'not found (nothing to compare)'],
   ])));
 
-  const byKind = new Map();
-  NODES.forEach((n) => {
-    const k = kind(n);
-    if (!byKind.has(k)) byKind.set(k, { up: 0, all: 0 });
-    const r = byKind.get(k); r.all++; if (n.up) r.up++;
-  });
-  d.appendChild(sect('Device types', props([...byKind.entries()]
-    .sort((a, b) => b[1].all - a[1].all)
-    .map(([k, r]) => [KIND_NAME[k], `${r.up} of ${r.all} running`]))));
-
   const rows = [];
   const link = (n, text, cls) => {
     const a = el('a', cls, text);
@@ -458,8 +382,6 @@ function labSummary() {
   NODES.filter((n) => n.config_status === 'undeclared').forEach((n) => link(n, 'in lab, not in manifest', 's-warn'));
   NODES.filter((n) => n.live_ip && n.live_ip !== n.primary_ip)
     .forEach((n) => link(n, `address ${n.live_ip}, manifest ${n.primary_ip || 'none'}`, 's-warn'));
-  NODES.filter((n) => (n.issues || []).length)
-    .forEach((n) => link(n, n.issues.map((i) => `#${i.id} ${i.title}`).join('; ')));
   d.appendChild(sect('Needs attention', rows.length ? props(rows) : el('div', 'side-empty', 'Nothing flagged.')));
   d.appendChild(el('div', 'side-empty',
     'Click a node in the list to inspect it; right-click for actions. Choose From and To above the path to trace between two nodes.'));
@@ -525,9 +447,6 @@ function sideNode(n) {
     d.appendChild(sect('Lab against manifest', diff.length ? props(diff.map(([k, v]) => [k, colored(v, 's-warn')]))
       : el('div', 'side-empty', 'No differences in site, role or addresses.')));
   }
-  if ((n.issues || []).length) {
-    d.appendChild(sect('Known issues', props(n.issues.map((i) => ['#' + i.id, i.title]))));
-  }
   if (!n.ghost && !n.can_source_probe && n.no_source_reason) {
     d.appendChild(el('div', 'pmsg', 'Cannot send test traffic: ' + n.no_source_reason + '. It can still be a target.'));
   }
@@ -537,19 +456,17 @@ function sideNode(n) {
     const c = el('button', null, 'Console log');
     c.addEventListener('click', () => openConsole(n.label));
     acts.appendChild(c);
-    const p = el('button', null, 'Ping...');
-    p.addEventListener('click', () => { sideTab = 'ping'; renderSide(); });
-    acts.appendChild(p);
     if (n.can_source_probe && n.up) {
       const t = el('button', null, 'Trace from here');
       t.addEventListener('click', () => setTraceEnds(n.label, trace.target === n.label ? null : trace.target));
       acts.appendChild(t);
     }
+    if (trace.source && trace.source !== n.label) {
+      const t2 = el('button', null, 'Trace to here');
+      t2.addEventListener('click', () => setTraceEnds(trace.source, n.label));
+      acts.appendChild(t2);
+    }
   }
-  const h = el('button', null, 'Hide');
-  h.title = 'Hide from the canvas and node table (restore from the status bar)';
-  h.addEventListener('click', () => hideNode(n.label));
-  acts.appendChild(h);
   d.appendChild(acts);
   return d;
 }
@@ -592,7 +509,7 @@ function sideAddresses(n) {
   const acts = el('div', 'acts');
   const b = el('button', null, live ? 'Read consoles again' : 'Read running addresses from consoles');
   b.title = '"Seen by CML" and "CML config" refresh on their own. This reads the running state off each device console (about 40 s for the lab).';
-  b.addEventListener('click', () => { LAB.harvest.run(); showPane('harvest'); });
+  b.addEventListener('click', () => LAB.harvest.run());
   acts.appendChild(b);
   d.appendChild(acts);
 
@@ -609,20 +526,14 @@ function sideInterfaces(n) {
   const d = el('div');
   const head = el('div', 'phead');
   head.appendChild(el('span', 'd', `${(n.iface_detail || []).length || n.interface_count || 0} interfaces, ${(n.links || []).length} connected`));
-  const lab = el('label');
-  const cb = el('input'); cb.type = 'checkbox'; cb.checked = prefs.traffic;
-  cb.addEventListener('change', () => setTraffic(cb.checked));
-  lab.appendChild(cb); lab.appendChild(document.createTextNode('Live counters'));
-  head.appendChild(lab);
   d.appendChild(head);
   const links = new Map((n.links || []).map((l) => [l.local_iface, l]));
   const ifs = (n.iface_detail || []).length ? n.iface_detail
     : (n.links || []).map((l) => ({ name: l.local_iface, connected: true, ip4: [] }));
   if (!ifs.length) { d.appendChild(el('div', 'side-empty', 'No interfaces.')); return d; }
-  const t = gridTable(['Interface', 'Peer', 'Address', 'Rate']);
+  const t = gridTable(['Interface', 'Peer', 'Address']);
   ifs.forEach((f) => {
     const l = links.get(f.name);
-    const r = l && prefs.traffic ? linkRates[l.link_id] : null;
     const tr = el('tr', 'row' + (l ? '' : ' off'));
     const c0 = el('td', 'm', shortIf(f.name));
     c0.title = [f.name, f.mac && 'MAC ' + f.mac, f.desc, f.vlan && 'access VLAN ' + f.vlan, f.shutdown && 'shutdown in config']
@@ -638,7 +549,6 @@ function sideInterfaces(n) {
     } else peer.textContent = '-';
     tr.appendChild(peer);
     tr.appendChild(el('td', 'm', (f.ip4 || []).concat(f.config_ip && !(f.ip4 || []).includes(f.config_ip) ? [f.config_ip] : []).join(', ') || (l && l.subnet) || '-'));
-    tr.appendChild(el('td', 'm' + (r && r.drops > 0 ? ' s-bad' : ''), r ? (r.pps >= 1 ? Math.round(r.pps) + ' pps' : 'idle') + (r.drops ? `, ${r.drops} drops` : '') : '-'));
     t.appendChild(tr);
   });
   d.appendChild(t);
@@ -711,161 +621,6 @@ function startLeaseTicker(container, lease) {
   const iv = setInterval(() => { if (!line.isConnected) clearInterval(iv); else paint(); }, 1000);
 }
 
-/* ---------------------------------------------------------------- ping --- */
-function sidePing(n) {
-  const d = el('div');
-  const sources = NODES.filter((x) => x.can_source_probe && x.up && x.label !== n.label).sort(byLabel);
-  if (!sources.length) {
-    d.appendChild(el('div', 'pmsg warn', 'No running node can source a ping right now.'));
-  } else {
-    const f = el('div', 'form');
-    const l1 = el('label', null, 'From');
-    const src = el('select');
-    sources.forEach((x) => {
-      const o = el('option', null, x.label + (x.site ? '  (' + x.site + ')' : ''));
-      o.value = x.label;
-      src.appendChild(o);
-    });
-    if (n.lastSource && sources.some((x) => x.label === n.lastSource)) src.value = n.lastSource;
-    l1.appendChild(src);
-    f.appendChild(l1);
-
-    // Target list: live-read addresses first (what the device actually holds
-    // right now), manifest addresses after, labelled so it's clear which is
-    // which.
-    const l2 = el('label', null, 'To address');
-    const dst = el('select');
-    const liveAddrs = ((n.live || {}).addresses || []).filter((a) => a.proto === 'up');
-    const liveIps = new Set(liveAddrs.map((a) => a.ip));
-    liveAddrs.forEach((a) => {
-      const o = el('option', null, `${a.ip}  ${a.iface}, live${a.ip === n.primary_ip ? ', manifest primary' : ''}`);
-      o.value = a.ip;
-      dst.appendChild(o);
-    });
-    (n.addresses || []).forEach((a) => {
-      if (liveIps.has(a.value)) return;
-      const o = el('option', null, `${a.value}  ${a.label}, manifest${n.live ? ', not seen live' : ''}`);
-      o.value = a.value;
-      dst.appendChild(o);
-    });
-    if (!dst.children.length) {
-      const o = el('option', null, 'No address known. Read addresses first.');
-      o.value = ''; o.disabled = true;
-      dst.appendChild(o);
-    }
-    l2.appendChild(dst);
-    f.appendChild(l2);
-
-    const row = el('div', 'row2');
-    const lab = el('label');
-    lab.style.display = 'flex';
-    const cDns = el('input'); cDns.type = 'checkbox';
-    const hasShellVantage = NODES.some((x) => x.probe_family === 'linux' && x.up);
-    cDns.checked = !!(n.dns || {}).fqdn && hasShellVantage;
-    cDns.disabled = !(n.dns || {}).fqdn || !hasShellVantage;
-    lab.appendChild(cDns);
-    lab.appendChild(document.createTextNode('Also resolve the DNS name'));
-    row.appendChild(lab);
-    const go = el('button', 'default', 'Ping');
-    go.style.marginLeft = 'auto';
-    go.addEventListener('click', () => {
-      n.lastSource = src.value;
-      runProbe(src.value, n.label, dst.value || null, cDns.checked ? ['ip', 'dns'] : ['ip']);
-    });
-    row.appendChild(go);
-    f.appendChild(row);
-    d.appendChild(sect('Ping ' + n.label, f));
-  }
-  const mine = probeJobs.filter((j) => j.target === n.label).slice(0, 6);
-  if (mine.length) d.appendChild(sect('Results', mine.map(jobBlock)));
-  return d;
-}
-
-async function runProbe(source, target, target_ip, methods) {
-  const job = { source, target, target_ip, status: 'queued', stage: 'queued', eta: 25, t0: Date.now() };
-  probeJobs.unshift(job);
-  refreshProbeViews();
-  try {
-    const r = await fetch('/api/probe', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ source, target, methods, count: 5, target_ip }),
-    });
-    const j = await r.json();
-    if (!r.ok) { job.status = 'error'; job.error = j.error; refreshProbeViews(); return; }
-    Object.assign(job, { eta: j.eta_seconds || 25, target_ip: j.target_ip, status: 'running' });
-    refreshProbeViews();
-    for (;;) {
-      await new Promise((ok) => setTimeout(ok, 1500));
-      const res = await getJSON('/api/probe/' + j.job_id);
-      job.stage = res.stage || job.stage;
-      if (res.status === 'done') { job.status = 'done'; job.result = res.result; break; }
-      if (res.status === 'error') { job.status = 'error'; job.error = res.error; break; }
-      document.querySelectorAll(`[data-job="${job.t0}"]`).forEach((s) => { s.textContent = job.stage; });
-    }
-  } catch (e) { job.status = 'error'; job.error = String(e); }
-  refreshProbeViews();
-}
-
-function refreshProbeViews() {
-  if (selected && sideTab === 'ping') renderSide();
-  if (paneTab === 'pings') renderPaneBody();
-  renderPaneTabs();
-}
-
-function jobBlock(job) {
-  if (job.status === 'done') return resultBlock(job.result);
-  const box = el('div', 'result');
-  const h = el('div', 'h');
-  h.appendChild(el('span', null, `${job.source} to ${job.target}`));
-  if (job.status === 'error') {
-    h.appendChild(el('span', 's-bad', 'failed'));
-    box.appendChild(h);
-    box.appendChild(el('div', 's-bad', job.error));
-    return box;
-  }
-  h.appendChild(el('span', 's-dim', job.target_ip || ''));
-  box.appendChild(h);
-  const st = el('div', 's-dim', job.stage);
-  st.dataset.job = String(job.t0);
-  box.appendChild(st);
-  const bar = el('div', 'meter'); const fill = el('i'); bar.appendChild(fill);
-  const pct = () => Math.min(97, (Date.now() - job.t0) / 1000 / job.eta * 100) + '%';
-  fill.style.width = pct();
-  const iv = setInterval(() => { if (!fill.isConnected) clearInterval(iv); else fill.style.width = pct(); }, 500);
-  box.appendChild(bar);
-  return box;
-}
-
-function resultBlock(res) {
-  const v = res.verdict || {};
-  const box = el('div', 'result');
-  const h = el('div', 'h');
-  h.appendChild(el('span', null, `${res.source} to ${res.target}`));
-  h.appendChild(el('span', v.level === 'ok' ? 's-ok' : v.level === 'fail' ? 's-bad' : 's-warn', v.text || ''));
-  box.appendChild(h);
-  const bits = [];
-  const p = res.ping_ip || res.ping_dns;
-  if (p) {
-    bits.push(`loss ${p.loss_pct}% (${p.received}/${p.sent})`);
-    if (p.rtt_ms && p.rtt_ms.avg != null) bits.push(`rtt ${p.rtt_ms.min}/${p.rtt_ms.avg}/${p.rtt_ms.max} ms`);
-  }
-  if (res.dns && res.dns.ok) {
-    bits.push(`${res.dns.fqdn} = ${res.dns.addresses[0]}` +
-      (res.dns.matches_manifest === false ? ' (does NOT match manifest)' : ''));
-  } else if (res.dns) {
-    bits.push('dns: ' + (res.dns.reason || 'no answer'));
-  }
-  bits.push(res.elapsed_s + ' s');
-  box.appendChild(el('div', 'm', bits.join('   ')));
-  if (p && p.packet_pattern) {
-    const pat = el('div', 'pattern');
-    [...p.packet_pattern].forEach((ch) => pat.appendChild(el('span', ch === '!' ? null : 'miss', ch)));
-    box.appendChild(pat);
-  }
-  (res.notes || []).forEach((t) => box.appendChild(el('div', 's-dim', t)));
-  return box;
-}
-
 /* =========================================================== bottom pane == */
 function showPane(k) {
   paneTab = k;
@@ -892,12 +647,10 @@ function renderPaneTabs() {
     }
     tabs.appendChild(b);
   };
-  const vis = NODES.filter((n) => shown(n) && matches(n)).length;
-  add('nodes', 'Nodes', { text: String(vis) });
   add('trace', 'Trace details', trace.job ? { text: 'running', level: 'warn' }
     : trace.result ? { text: trace.result.verdict.level === 'ok' ? 'confirmed' : trace.result.verdict.level === 'fail' ? 'failed' : 'check',
                        level: trace.result.verdict.level === 'ok' ? 'ok' : trace.result.verdict.level === 'fail' ? 'bad' : 'warn' } : null);
-  Object.entries(LAB).forEach(([k, t]) => add(k, t.title, t.badge()));
+  Object.entries(LAB).forEach(([k, t]) => { if (!t.hidden) add(k, t.title, t.badge()); });
   consoles.forEach((l) => add('con:' + l, 'Console: ' + l, null, true));
   const min = el('button', 'end', prefs.paneMin ? 'Restore' : 'Minimize');
   min.addEventListener('click', () => { prefs.paneMin = !prefs.paneMin; savePrefs(); applyPane(); renderPane(); });
@@ -909,8 +662,7 @@ function renderPaneBody() {
   const body = $('#pane-body');
   const scroll = body.scrollTop;
   body.innerHTML = '';
-  if (paneTab === 'nodes') body.appendChild(nodeTable());
-  else if (paneTab.startsWith('con:')) body.appendChild(consolePane(paneTab.slice(4)));
+  if (paneTab.startsWith('con:')) body.appendChild(consolePane(paneTab.slice(4)));
   else if (paneTab === 'trace') body.appendChild(traceDetails());
   else if (LAB[paneTab]) LAB[paneTab].draw(body);
   body.scrollTop = scroll;
@@ -921,126 +673,17 @@ function applyPane() {
   $('.center').classList.toggle('pane-min', prefs.paneMin);
 }
 
-/* ------------------------------------------------------------ node table - */
-const COLS = [
-  ['label', 'Node', (n) => n.label],
-  ['state', 'State', (n) => stateWord(n)[0]],
-  ['kind', 'Type', (n) => KIND_NAME[kind(n)]],
-  ['role', 'Role', (n) => n.role_title || ''],
-  ['site', 'Site', (n) => n.site || ''],
-  ['ip', 'Address', (n) => displayIp(n).text],
-  ['dns', 'DNS name', (n) => (n.dns || {}).fqdn || ''],
-  ['issues', 'Flags', (n) => flags(n).join(', ')],
-];
-
+/* ----------------------------------------------------------- node flags -- */
 function flags(n) {
   const f = [];
   if (n.ghost) f.push('absent');
   if (n.config_status === 'undeclared') f.push('undeclared');
   if (displayIp(n).drift) f.push('address drift');
-  (n.issues || []).forEach((i) => f.push('#' + i.id));
   return f;
 }
 
-function groupKey(n) {
-  return {
-    layer: () => [n.layer, n.layer_title || n.layer],
-    site:  () => [n.site || '~', n.site || 'No site (carrier / shared)'],
-    role:  () => [n.role || '~', n.role_title || 'Not declared in manifest'],
-    state: () => n.ghost ? ['c', 'Declared but absent'] : n.up ? ['a', 'Running'] : ['b', 'Stopped'],
-    none:  () => ['', ''],
-  }[prefs.groupBy]();
-}
-
-function nodeTable() {
-  const wrap = el('div');
-  const head = el('div', 'phead');
-  const gl = el('label', null, 'Group by ');
-  const gs = el('select');
-  [['layer', 'Layer'], ['site', 'Site'], ['role', 'Role'], ['state', 'State'], ['none', 'None']].forEach(([v, t]) => {
-    const o = el('option', null, t); o.value = v; gs.appendChild(o);
-  });
-  gs.value = prefs.groupBy;
-  gs.addEventListener('change', () => { prefs.groupBy = gs.value; savePrefs(); renderPaneBody(); renderNodeList(); });
-  gl.appendChild(gs);
-  head.appendChild(gl);
-  const hl = el('label');
-  const hc = el('input'); hc.type = 'checkbox'; hc.checked = prefs.hideDown;
-  hc.addEventListener('change', () => { prefs.hideDown = hc.checked; savePrefs(); refilter(); });
-  hl.appendChild(hc); hl.appendChild(document.createTextNode('Hide stopped'));
-  head.appendChild(hl);
-  head.appendChild(el('span', 'd', 'Double-click a row for its console log. Right-click for actions.'));
-  wrap.appendChild(head);
-
-  const vis = NODES.filter((n) => shown(n) && matches(n));
-  if (!vis.length) { wrap.appendChild(el('div', 'pmsg', 'No nodes match the filter.')); return wrap; }
-  const col = COLS.find((c) => c[0] === prefs.sort) || COLS[0];
-  vis.sort((a, b) => (String(col[2](a)).localeCompare(String(col[2](b)), undefined, { numeric: true }) || byLabel(a, b)) * prefs.sortDir);
-
-  const t = el('table', 'g');
-  const hr = el('tr');
-  COLS.forEach(([k, title]) => {
-    const th = el('th', 'sortable' + (prefs.sort === k ? ' sorted' : ''), title + (prefs.sort === k ? (prefs.sortDir > 0 ? '  (a-z)' : '  (z-a)') : ''));
-    th.addEventListener('click', () => {
-      prefs.sortDir = prefs.sort === k ? -prefs.sortDir : 1;
-      prefs.sort = k; savePrefs(); renderPaneBody();
-    });
-    hr.appendChild(th);
-  });
-  t.appendChild(hr);
-
-  const groups = new Map();
-  vis.forEach((n) => {
-    const [k, title] = groupKey(n);
-    if (!groups.has(k)) groups.set(k, { title, nodes: [] });
-    groups.get(k).nodes.push(n);
-  });
-  const order = prefs.groupBy === 'layer'
-    ? INV.layers.map((l) => l.key).filter((k) => groups.has(k)) : [...groups.keys()].sort();
-  order.forEach((k) => {
-    const g = groups.get(k);
-    if (prefs.groupBy !== 'none') {
-      const tr = el('tr', 'grp');
-      const td = el('td', null, `${g.title}   ${g.nodes.filter((n) => n.up).length} of ${g.nodes.length} running`);
-      td.colSpan = COLS.length;
-      tr.appendChild(td);
-      t.appendChild(tr);
-    }
-    g.nodes.forEach((n) => t.appendChild(nodeRow(n)));
-  });
-  wrap.appendChild(t);
-  return wrap;
-}
-
-function nodeRow(n) {
-  const tr = el('tr', 'row' + (n.up || n.ghost ? '' : ' off') + (n.label === selected ? ' sel' : ''));
-  tr.dataset.label = n.label;
-  const c0 = el('td'); c0.appendChild(lamp(n)); c0.appendChild(document.createTextNode(n.label)); tr.appendChild(c0);
-  const [sw, sc] = stateWord(n);
-  tr.appendChild(el('td', sc, sw));
-  tr.appendChild(el('td', null, KIND_NAME[kind(n)]));
-  tr.appendChild(el('td', null, n.role_title || ''));
-  tr.appendChild(el('td', null, n.site || ''));
-  const ip = displayIp(n);
-  const ipSrc = ip.live ? null : (n.sources || {}).primary_ip;
-  tr.appendChild(el('td', 'm' + (ip.drift || ipSrc === 'manifest' ? ' s-warn' : ''),
-    ip.text + (ip.text && ipSrc === 'manifest' ? '  (manifest only)' : '')));
-  tr.appendChild(el('td', 'm', (n.dns || {}).fqdn || ''));
-  const fl = flags(n);
-  tr.appendChild(el('td', fl.includes('absent') ? 's-bad' : fl.length ? 's-warn' : null, fl.join(', ')));
-  tr.addEventListener('click', () => { if (pick) pickNode(n.label); else select(n.label); });
-  tr.addEventListener('dblclick', () => { if (!n.ghost) openConsole(n.label); });
-  tr.addEventListener('contextmenu', (e) => { e.preventDefault(); select(n.label); nodeMenu(n, e.clientX, e.clientY); });
-  tr.addEventListener('mouseenter', () => hoverPath(n.label));
-  tr.addEventListener('mouseleave', () => hoverPath(null));
-  return tr;
-}
-
-
 function refilter() {
-  renderPaneTabs(); renderNodeList();
-  if (paneTab === 'nodes') renderPaneBody();
-  renderStatus();
+  renderNodeList(); renderStatus();
 }
 
 /* ------------------------------------------------------------- console --- */
@@ -1055,7 +698,7 @@ function openConsole(label) {
 function closeConsole(label) {
   const i = consoles.indexOf(label);
   if (i >= 0) consoles.splice(i, 1);
-  if (paneTab === 'con:' + label) paneTab = consoles.length ? 'con:' + consoles[consoles.length - 1] : 'nodes';
+  if (paneTab === 'con:' + label) paneTab = consoles.length ? 'con:' + consoles[consoles.length - 1] : 'trace';
   renderPane();
 }
 async function readConsole(label) {
@@ -1221,70 +864,16 @@ LAB.dns = labCheck({
   },
 });
 
-// Read live addresses off every reachable device's console, so the canvas,
-// node table and ping targets can prefer device truth over manifest intent.
+// Read running addresses off every reachable device's console.  No tab of its
+// own: results land in each node's Addresses tab and the node list's drift
+// flags, and progress shows in the status bar.
 LAB.harvest = labCheck({
-  key: 'harvest', title: 'Live addresses', statusUrl: '/api/harvest', runUrl: '/api/harvest/run',
-  onStatus(st) { applyHarvestToNodes(st); },
-  badge() {
-    const st = this.st;
-    if (!st) return null;
-    if (st.status === 'running') return { text: `${st.done_count}/${st.total}`, level: 'warn' };
-    const read = NODES.filter((n) => n.live);
-    if (!read.length) return null;
-    const drift = read.filter((n) => n.live.error || (n.live_ip && n.live_ip !== n.primary_ip)).length;
-    return drift ? { text: drift + ' differ', level: 'warn' } : { text: 'all match', level: 'ok' };
-  },
-  render(box, st) {
-    const eta = this.eta && st.status === 'running'
-      ? el('span', 's-dim', `about ${this.eta.eta_seconds}${this.eta.eta_seconds_max ? '-' + this.eta.eta_seconds_max : ''} s`) : null;
-    box.appendChild(checkHead(this, st, 'Read every device', 'Reading...',
-      'Reads interface addresses off each device console (IOS, ASA, Linux) instead of trusting the manifest.', eta));
-    const nodes = NODES.filter((n) => n.live);
-    if (!nodes.length) return;
-    const drift = nodes.filter((n) => n.live.error || (n.live_ip && n.live_ip !== n.primary_ip));
-    box.appendChild(el('div', 'pmsg ' + (drift.length ? 'warn' : 'ok'),
-      st.status === 'done'
-        ? (drift.length ? `${drift.length} of ${nodes.length} nodes differ from, or have no match in, the manifest.`
-                        : `All ${nodes.length} nodes match their manifest primary address.`)
-        : `${nodes.length} read so far, ${drift.length} differ.`));
-    const t = gridTable(['Result', 'Node', 'Live address', 'Manifest primary']);
-    drift.concat(nodes.filter((n) => !drift.includes(n))).forEach((n) => {
-      const tr = el('tr', 'row');
-      const [txt, cls] = n.live.error ? ['read failed', 's-bad'] : n.live_ip === n.primary_ip ? ['match', 's-ok'] : ['differs', 's-warn'];
-      tr.appendChild(el('td', cls, txt));
-      tr.appendChild(el('td', 'm', n.label));
-      tr.appendChild(el('td', 'm', n.live.error || n.live_ip || '(no up interface with an address)'));
-      tr.appendChild(el('td', 'm', n.primary_ip || '-'));
-      tr.addEventListener('click', () => { sideTab = 'addresses'; select(n.label); });
-      t.appendChild(tr);
-    });
-    box.appendChild(t);
-  },
+  key: 'harvest', statusUrl: '/api/harvest', runUrl: '/api/harvest/run', hidden: true,
+  onStatus(st) { applyHarvestToNodes(st); renderStatus(); },
 });
 
-LAB.pings = {
-  key: 'pings', title: 'Ping log',
-  badge() {
-    const run = probeJobs.filter((j) => !['done', 'error'].includes(j.status)).length;
-    return run ? { text: run + ' running', level: 'warn' } : probeJobs.length ? { text: String(probeJobs.length) } : null;
-  },
-  draw(box) {
-    if (!probeJobs.length) {
-      box.appendChild(el('div', 'pmsg', 'No pings this session. Select a node, then use its Ping tab.'));
-      return;
-    }
-    probeJobs.forEach((j) => {
-      const b = jobBlock(j);
-      b.style.cursor = 'pointer';
-      b.addEventListener('click', () => { sideTab = 'ping'; select(j.target); });
-      box.appendChild(b);
-    });
-  },
-};
-
-/* Merge harvested per-node results into the in-memory NODES so the canvas,
- * node table and ping targets reflect live data without an inventory reload.
+/* Merge harvested per-node results into the in-memory NODES so the node
+ * list, sidebar and trace targets reflect live data without an inventory reload.
  * Same rule as app.py::_live_primary: the interface carrying the manifest's
  * declared primary wins over any other manifest-known address. */
 function applyHarvestToNodes(st) {
@@ -1302,7 +891,7 @@ function applyHarvestToNodes(st) {
   });
   if (changed) {
     renderPathBody(); renderNodeList();
-    if (paneTab === 'nodes') renderPaneBody();
+    renderNodeList();
     if (selected) renderSide();
   }
 }
@@ -1314,21 +903,16 @@ function renderNodeList() {
   const box = $('#nlist');
   const scroll = box.scrollTop;
   box.innerHTML = '';
-  const vis = NODES.filter((n) => shown(n) && matches(n)).sort(byLabel);
+  const vis = NODES.filter((n) => matches(n)).sort(byLabel);
   if (!vis.length) { box.appendChild(el('div', 'side-empty', 'No nodes match.')); return; }
   const groups = new Map();
   vis.forEach((n) => {
-    const [k, title] = groupKey(n);
-    if (!groups.has(k)) groups.set(k, { title, nodes: [] });
-    groups.get(k).nodes.push(n);
+    if (!groups.has(n.layer)) groups.set(n.layer, { title: n.layer_title || n.layer, nodes: [] });
+    groups.get(n.layer).nodes.push(n);
   });
-  const order = prefs.groupBy === 'layer'
-    ? INV.layers.map((l) => l.key).filter((k) => groups.has(k)) : [...groups.keys()].sort();
-  order.forEach((k) => {
+  INV.layers.map((l) => l.key).filter((k) => groups.has(k)).forEach((k) => {
     const g = groups.get(k);
-    if (prefs.groupBy !== 'none') {
-      box.appendChild(el('div', 'nl-grp', `${g.title}  ${g.nodes.filter((n) => n.up).length}/${g.nodes.length}`));
-    }
+    box.appendChild(el('div', 'nl-grp', `${g.title}  ${g.nodes.filter((n) => n.up).length}/${g.nodes.length}`));
     g.nodes.forEach((n) => box.appendChild(nodeListRow(n)));
   });
   box.scrollTop = scroll;
@@ -1376,7 +960,7 @@ function nodeListRow(n) {
  * of pings and reads CML's per-link packet counters before and after, so it
  * shows the links the packets DID cross, at layer 2 as well as layer 3.  Run
  * it, stop the active core switch in CML, run it again: the path moves. */
-const trace = { source: null, target: null, ip: null, count: 100, repeat: false,
+const trace = { source: null, target: null, ip: null, count: 100, repeat: false, dns: false,
                 job: null, stage: '', result: null, cand: null, history: [], error: null };
 let pick = null;           // null | 'source' | 'target'
 
@@ -1493,7 +1077,8 @@ async function runTrace() {
   try {
     const r = await fetch('/api/trace', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ source: trace.source, target: trace.target, target_ip: trace.ip, count: trace.count }),
+      body: JSON.stringify({ source: trace.source, target: trace.target, target_ip: trace.ip,
+                             count: trace.count, dns: trace.dns }),
     });
     const j = await r.json();
     if (!r.ok) throw new Error(j.error);
@@ -1576,6 +1161,14 @@ function renderPathHead() {
   run.disabled = !!trace.job || !trace.source || !trace.target || !trace.ip;
   run.addEventListener('click', runTrace);
   head.appendChild(run);
+  const dl = el('label');
+  const dc = el('input'); dc.type = 'checkbox'; dc.checked = trace.dns;
+  dc.disabled = !t || !(t.dns || {}).fqdn;
+  dc.addEventListener('change', () => { trace.dns = dc.checked; });
+  dl.appendChild(dc); dl.appendChild(document.createTextNode('Check DNS'));
+  dl.title = t && (t.dns || {}).fqdn ? `Also resolve ${t.dns.fqdn} and compare the answer with the address being traced`
+    : 'The destination has no internal DNS name';
+  head.appendChild(dl);
   const rl = el('label');
   const rc = el('input'); rc.type = 'checkbox'; rc.checked = trace.repeat;
   rc.addEventListener('change', () => { trace.repeat = rc.checked; if (rc.checked && !trace.job) runTrace(); });
@@ -1820,6 +1413,18 @@ function traceDetails() {
   cols.appendChild(b);
   wrap.appendChild(cols);
 
+  if (res.dns) {
+    const d = res.dns;
+    const dsec = el('div');
+    dsec.appendChild(el('div', 'tsect-h', 'DNS'));
+    dsec.appendChild(props([
+      ['Name', d.fqdn || '-'],
+      ['Asked', `${d.resolver || '-'} from ${d.vantage || '-'}${d.vantage && d.vantage !== res.source ? ' (the source has no resolver of its own)' : ''}`],
+      ['Answer', d.ok ? colored(d.addresses.join(', ') + (d.matches ? '  (matches)' : '  (does not match ' + res.target_ip + ')'), d.matches ? 's-ok' : 's-bad')
+        : colored(d.reason || 'no answer', d.offnet ? 's-warn' : 's-bad')],
+    ]));
+    wrap.appendChild(dsec);
+  }
   const hist = trace.history.filter((h) => h.source === trace.source && h.target === trace.target);
   const t3 = gridTable(['Time', 'Result', 'Path']);
   [...hist].reverse().forEach((h) => {
@@ -1844,7 +1449,7 @@ let openMenu = null;
 function menuItems(which) {
   const toggle = (label, on, fn, key) => ({ label, on, fn, key });
   if (which === 'lab') return [
-    { label: 'Read addresses from devices', fn: () => { LAB.harvest.run(); showPane('harvest'); } },
+    { label: 'Read running addresses from consoles', fn: () => LAB.harvest.run() },
     { label: 'Run baseline matrix', fn: () => { LAB.matrix.run(); showPane('matrix'); } },
     { label: 'Run DNS audit', fn: () => { LAB.dns.run(); showPane('dns'); } },
     '-',
@@ -1859,15 +1464,12 @@ function menuItems(which) {
     toggle('Light', prefs.theme === 'light', () => setTheme('light')),
     toggle('Dark', prefs.theme === 'dark', () => setTheme('dark')),
     '-',
-    { label: `Show hidden nodes (${hidden.size})`, disabled: !hidden.size, fn: unhideAll },
     toggle('Pause auto-refresh', paused, togglePause),
   ];
   return [
-    { label: 'Node table', fn: () => showPane('nodes') },
+    { label: 'Trace details', fn: () => showPane('trace') },
     { label: 'Baseline matrix', fn: () => showPane('matrix') },
     { label: 'DNS audit', fn: () => showPane('dns') },
-    { label: 'Live addresses', fn: () => showPane('harvest') },
-    { label: 'Ping log', fn: () => showPane('pings') },
   ];
 }
 
@@ -1910,7 +1512,6 @@ function nodeMenu(n, x, y) {
   buildMenu([
     { label: 'Properties', fn: () => { sideTab = 'node'; select(n.label); } },
     { label: 'Console log', disabled: n.ghost, fn: () => openConsole(n.label) },
-    { label: 'Ping this node...', disabled: n.ghost, fn: () => { sideTab = 'ping'; select(n.label); } },
     { label: 'Interfaces', fn: () => { sideTab = 'interfaces'; select(n.label); } },
     '-',
     { label: 'Copy address', disabled: !ip, fn: () => navigator.clipboard.writeText(ip) },
@@ -1920,18 +1521,11 @@ function nodeMenu(n, x, y) {
       fn: () => setTraceEnds(n.label, trace.target === n.label ? null : trace.target) },
     { label: 'Trace to here', disabled: n.ghost || trace.source === n.label,
       fn: () => setTraceEnds(trace.source, n.label) },
-    { label: 'Hide node', fn: () => hideNode(n.label) },
   ], box);
   box.hidden = false;
   const r = box.getBoundingClientRect();
   box.style.left = Math.min(x, innerWidth - r.width - 4) + 'px';
   box.style.top = Math.min(y, innerHeight - r.height - 4) + 'px';
-}
-
-function unhideAll() {
-  hidden.clear();
-  store.set(HIDE_KEY, []);
-  renderAll();
 }
 
 function togglePause() {
@@ -1952,7 +1546,6 @@ function wire() {
   siteSel.value = site;
   siteSel.addEventListener('change', () => { site = siteSel.value; store.set(SITE_KEY, site); refilter(); });
   $('#q').addEventListener('input', refilter);
-  $('#hidden-btn').addEventListener('click', unhideAll);
   $('#pause').addEventListener('click', togglePause);
 
   $('#nav-toggle').addEventListener('click', () => document.body.classList.toggle('nav-open'));

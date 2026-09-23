@@ -21,6 +21,10 @@ whole lab).  So a trace is:
                a link carrying about N carried one direction only, which is
                asymmetric routing; a link near zero was not used.
   5. TRACEROUTE from the same source, so routed hops can be named too.
+  6. DNS (optional) ask a resolver for the target's name, from the source when
+               it has a shell, else from a Linux node at the same site
+               (probes.pick_dns_vantage), and compare the answer with the
+               address being traced.
 
 The counter scale is calibrated from the source's own links rather than
 assumed: every request leaves the source on one of its links and every reply
@@ -222,12 +226,20 @@ def _run(job_id: str) -> None:
     started = time.time()
     try:
         with probe_engine._CONSOLE_SLOTS:
-            lock = probe_engine._node_lock(spec["source"]["label"])
-            with lock:
+            # lock every node this run drives, in sorted order (no deadlock)
+            drive = sorted({spec["source"]["label"]}
+                           | ({spec["vantage"]["label"]} if spec.get("vantage") else set()))
+            locks = [probe_engine._node_lock(x) for x in drive]
+            for lk in locks:
+                lk.acquire()
+            try:
                 cml = cml_api.connect()
                 _set(job_id, status="running", stage="opening console session")
                 with Console(cml) as con:
                     result = _execute(job_id, cml, con, spec)
+            finally:
+                for lk in reversed(locks):
+                    lk.release()
         result["elapsed_s"] = round(time.time() - started, 1)
         _set(job_id, status="done", stage="complete", result=result,
              ended=datetime.now(timezone.utc).isoformat())
@@ -265,8 +277,49 @@ def _execute(job_id: str, cml, con: Console, spec: dict) -> dict:
     except Exception as e:                     # noqa: BLE001
         trace = {"cmd": None, "raw": f"{type(e).__name__}: {e}", "hops": []}
 
-    return analyse(nodes, src, dst, ip, count, burst, raw_delta, base, base_dt, dt, cand, trace,
-                   spec.get("owners") or {}, pre, answering)
+    dns = _dns(job_id, con, spec) if spec.get("dns") else None
+
+    out = analyse(nodes, src, dst, ip, count, burst, raw_delta, base, base_dt, dt, cand, trace,
+                  spec.get("owners") or {}, pre, answering)
+    if dns:
+        out["dns"] = dns
+        if dns.get("ok") and not dns.get("matches"):
+            out["findings"].insert(0, f"DNS: {dns['fqdn']} resolved to {dns['addresses'][0]}, not {ip}. "
+                                      "The name and the address being traced disagree; one of them is stale.")
+            if out["verdict"]["level"] == "ok":
+                out["verdict"] = {"level": "warn", "text": out["verdict"]["text"] + " DNS answers a different address."}
+        elif not dns.get("ok"):
+            out["findings"].insert(0, f"DNS: {dns.get('fqdn') or 'the name'} did not resolve"
+                                      f" ({dns.get('reason')}).")
+            if out["verdict"]["level"] == "ok" and not dns.get("offnet"):
+                out["verdict"] = {"level": "warn", "text": out["verdict"]["text"] + " The name did not resolve."}
+    return out
+
+
+def _dns(job_id: str, con: Console, spec: dict) -> dict:
+    """Resolve the target's name the way a client would.  IOS/ASA sources
+    ship `no ip domain lookup`, so the lookup runs from a Linux vantage and
+    the result says which node asked."""
+    src, dst, ip = spec["source"], spec["target"], spec["target_ip"]
+    fqdn = (dst.get("dns") or {}).get("fqdn")
+    vantage = spec.get("vantage")
+    resolver = src.get("resolver") or dst.get("resolver")
+    base = {"fqdn": fqdn, "resolver": resolver, "vantage": vantage["label"] if vantage else None,
+            "offnet": bool(vantage and vantage.get("_offnet"))}
+    if not fqdn:
+        return {**base, "ok": False, "reason": "the target has no internal DNS name"}
+    if not vantage:
+        return {**base, "ok": False, "reason": "no running Linux node to ask from"}
+    if not resolver:
+        return {**base, "ok": False, "reason": "no resolver known for this site"}
+    _set(job_id, stage=f"resolving {fqdn} from {vantage['label']}")
+    raw = con.linux_exec(vantage["label"], f"nslookup {fqdn} {resolver}", timeout_ms=25000,
+                         line=vantage.get("console_line", 0))
+    parsed = probe_engine.parse_nslookup(raw or "")
+    known = {ip} | {a.get("value") for a in dst.get("addresses") or []}
+    parsed.update(base)
+    parsed["matches"] = bool(parsed["ok"] and parsed["addresses"][0] in known)
+    return parsed
 
 
 def analyse(nodes, src, dst, ip, count, burst, raw_delta, base, base_dt, dt, cand, trace,
@@ -355,7 +408,7 @@ def analyse(nodes, src, dst, ip, count, burst, raw_delta, base, base_dt, dt, can
         findings.append(f"{cand['paths']} equal-length paths exist between these nodes."
                         + (f" Not used this time: {', '.join(idle)}." if idle and path else ""))
     off = [x for x in path if x not in cand_nodes]
-    if off and cand["nodes"]:
+    if off and cand["nodes"] and answering:
         findings.append("Traffic left the shortest paths, through " + ", ".join(off) +
                         ". A routing preference, a blocked STP port or a failed link can cause this.")
     one_way = [r for r in used if r["use"] == "one-way"]

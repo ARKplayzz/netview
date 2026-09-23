@@ -165,18 +165,12 @@ def _inventory(force: bool = False) -> dict:
     else:
         cml_reads = {"topology": topo_error or "unreachable"}
 
-    try:
-        issues = features.issues_by_node([n["label"] for n in inv["nodes"]])
-    except Exception:                          # noqa: BLE001
-        issues = {}
-
     harvested = features.harvest_nodes()
 
     up = 0
     for n in inv["nodes"]:
         n["state"] = states.get(n["label"])
         n["up"] = n["state"] in ("STARTED", "BOOTED")
-        n["issues"] = issues.get(n["label"], [])
         # Live addresses read off the device outrank the manifest everywhere
         # they exist — the manifest says what SHOULD be, the device says what
         # IS.  Each record keeps its read time so staleness is visible.
@@ -235,89 +229,6 @@ def api_inventory():
     return jsonify(_inventory(force=request.args.get("fresh") == "1"))
 
 
-@app.get("/api/state")
-def api_state():
-    """Cheap poll: just the live states, for the auto-refresh tick."""
-    states, err = _fetch_states()
-    up = sum(1 for s in states.values() if s in ("STARTED", "BOOTED"))
-    return jsonify({
-        "states": states,
-        "error": err,
-        "counts": {"total": len(states), "up": up, "down": len(states) - up},
-        "at": datetime.now(timezone.utc).isoformat(),
-    })
-
-
-@app.post("/api/probe")
-def api_probe():
-    body = request.get_json(force=True) or {}
-    src_label = (body.get("source") or "").strip()
-    dst_label = (body.get("target") or "").strip()
-    methods = [m for m in (body.get("methods") or ["ip"]) if m in ("ip", "dns")]
-    count = max(1, min(int(body.get("count", 5)), 50))
-
-    inv = _inventory()
-    by_label = {n["label"]: n for n in inv["nodes"]}
-    source, target = by_label.get(src_label), by_label.get(dst_label)
-
-    if not source or not target:
-        return jsonify({"error": "unknown source or target node"}), 404
-    if not source["can_source_probe"]:
-        return jsonify({"error": f"{src_label} has no console this tool can drive "
-                                 f"({source['node_definition']}), so it cannot be "
-                                 f"a probe source. It can still be a target."}), 400
-    if not source["up"]:
-        return jsonify({"error": f"{src_label} is {source['state'] or 'not running'} "
-                                 f"— a probe needs a booted source."}), 409
-
-    # Target preference: what the user picked > the address the DEVICE holds
-    # right now > the manifest's declaration.  A DHCP desktop has no manifest
-    # address at all, and a renumbered device's manifest address is a stale
-    # target — the live read covers both.
-    target_ip = (body.get("target_ip") or target.get("live_ip")
-                 or target.get("primary_ip"))
-    if "ip" in methods and not target_ip:
-        return jsonify({"error": f"{dst_label} has no live-read address and none "
-                                 f"in the manifest — run an address harvest, or "
-                                 f"give an explicit target_ip."}), 400
-
-    vantage = None
-    if "dns" in methods:
-        vantage = probes.pick_dns_vantage(source, inv["nodes"], source.get("site"))
-
-    job_id = probes.submit({
-        "source": source, "target": target, "methods": methods,
-        "count": count, "target_ip": target_ip, "vantage": vantage,
-    })
-    job = probes.get(job_id)
-    return jsonify({
-        "job_id": job_id,
-        "eta_seconds": job["eta_seconds"],
-        "vantage": vantage["label"] if vantage else None,
-        "target_ip": target_ip,
-    })
-
-
-@app.get("/api/probe/<job_id>")
-def api_probe_get(job_id: str):
-    job = probes.get(job_id)
-    if not job:
-        return jsonify({"error": "unknown job"}), 404
-    # The spec holds two whole node dicts; strip them so the poll stays small.
-    out = {k: v for k, v in job.items() if k != "spec"}
-    out["source"] = job["spec"]["source"]["label"]
-    out["target"] = job["spec"]["target"]["label"]
-    return jsonify(out)
-
-
-@app.get("/api/path")
-def api_path():
-    """Predicted paths only (no console): every shortest path over running nodes."""
-    inv = _inventory()
-    return jsonify(pathtrace.candidates(inv["nodes"], request.args.get("source", ""),
-                                        request.args.get("target", "")))
-
-
 @app.post("/api/trace")
 def api_trace():
     body = request.get_json(force=True) or {}
@@ -335,9 +246,14 @@ def api_trace():
     if not target_ip:
         return jsonify({"error": f"No address known for {target['label']}."}), 400
     count = max(20, min(int(body.get("count", 100)), 500))
+    # Optional: also ask a resolver for the target's name, from the source
+    # itself when it has a shell, else from a Linux node at the same site.
+    vantage = None
+    if body.get("dns") and (target.get("dns") or {}).get("fqdn"):
+        vantage = probes.pick_dns_vantage(source, inv["nodes"], source.get("site"))
     job_id = pathtrace.submit({"source": source, "target": target, "target_ip": target_ip,
-                               "count": count, "nodes": inv["nodes"],
-                               "owners": _address_owners(inv["nodes"])})
+                               "count": count, "nodes": inv["nodes"], "dns": bool(body.get("dns")),
+                               "vantage": vantage, "owners": _address_owners(inv["nodes"])})
     job = pathtrace.get(job_id)
     return jsonify({"job_id": job_id, "eta_seconds": job["eta_seconds"], "target_ip": target_ip})
 
@@ -376,22 +292,6 @@ def api_dhcp(label: str):
         return jsonify(features.read_lease(node))
     except Exception as e:                     # noqa: BLE001
         return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
-
-
-@app.get("/api/simstats")
-def api_simstats():
-    """Live per-link packet/drop counters — 0.04s for the whole lab, no console.
-
-    The client diffs two samples to show packets-per-second per link, which is
-    the 'prefer interface counters' instrument at estate scale.
-    """
-    try:
-        cml = cml_api.connect()
-        s = cml.simulation_stats()
-        return jsonify({"links": s.get("links", {}),
-                        "at": datetime.now(timezone.utc).isoformat()})
-    except Exception as e:                     # noqa: BLE001
-        return jsonify({"error": f"{type(e).__name__}: {e}"}), 502
 
 
 @app.get("/api/console-log/<path:label>")
@@ -438,36 +338,13 @@ def api_dnsaudit_run():
     return (jsonify(r), 409) if r.get("error") else jsonify(r)
 
 
-@app.get("/api/issues")
-def api_issues():
-    sections = features.known_issues()
-    return jsonify([{k: v for k, v in s.items() if k != "body"} for s in sections])
-
-
 @app.get("/api/export.csv")
 def api_export_csv():
     inv = _inventory()
-    issues = {n["label"]: n.get("issues", []) for n in inv["nodes"]}
-    csv_text = features.inventory_csv(inv["nodes"], issues)
+    csv_text = features.inventory_csv(inv["nodes"])
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     return Response(csv_text, mimetype="text/csv", headers={
         "Content-Disposition": f'attachment; filename="p45-inventory-{stamp}.csv"'})
-
-
-@app.get("/api/probes")
-def api_probes():
-    out = []
-    for job in probes.recent():
-        out.append({
-            "id": job["id"],
-            "status": job["status"],
-            "source": job["spec"]["source"]["label"],
-            "target": job["spec"]["target"]["label"],
-            "methods": job["spec"]["methods"],
-            "created": job["created"],
-            "verdict": (job.get("result") or {}).get("verdict"),
-        })
-    return jsonify(out)
 
 
 if __name__ == "__main__":
