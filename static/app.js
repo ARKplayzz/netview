@@ -1,9 +1,9 @@
-/* NetView client — a CML-style lab workbench.
+/* NetView client - lab workbench.
  *
- * Node tree on the left, the lab canvas in the middle (nodes drawn at their
- * CML x/y, cabling from the topology), and a bottom dock holding the selected
- * node's tabs plus the lab-wide tools (baseline matrix, DNS audit, address
- * harvest, probe log).
+ * Layout follows the CML workbench: menu bar and toolbar on top, the lab
+ * canvas (nodes at their CML x/y, cabling from the topology), a properties
+ * sidebar for whatever is selected, and a bottom pane holding the node table,
+ * the lab-wide checks, the ping log and console tabs.
  *
  * The inventory is fetched once; only /api/state is polled on the tick.
  * Hidden nodes persist as an exclusion list: anything new in the lab defaults
@@ -15,26 +15,33 @@
 const REFRESH_S = 15;
 const HIDE_KEY = 'netview.hidden.v2';
 const SITE_KEY = 'netview.site.v1';
-const PREF_KEY = 'netview.workbench.v1';
+const PREF_KEY = 'netview.workbench.v2';
 const SVGNS = 'http://www.w3.org/2000/svg';
 
-let INV = null, NODES = [], LINKS = [], BY = new Map();
-let selected = null, hovered = null, countdown = REFRESH_S, paused = false;
-let dockTab = 'summary';
 const store = {
   get(k, d) { try { const v = localStorage.getItem(k); return v == null ? d : JSON.parse(v); } catch (e) { return d; } },
   set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) { /* private mode */ } },
 };
-let site = store.get(SITE_KEY, 'all');                 // all | HQ | DR | other
-if (typeof site !== 'string') site = 'all';
+
+let INV = null, NODES = [], LINKS = [];
+const BY = new Map();
+let selected = null, hovered = null, countdown = REFRESH_S, paused = false;
+let site = store.get(SITE_KEY, 'all');
+if (!['all', 'HQ', 'DR', 'other'].includes(site)) site = 'all';
 const hidden = new Set(store.get(HIDE_KEY, []));
-const prefs = Object.assign({ ip: true, iface: false, traffic: false, dockH: 280, dockMin: false,
-                              collapsed: [], theme: null }, store.get(PREF_KEY, {}));
+const prefs = Object.assign({
+  ip: true, iface: false, traffic: false, theme: null, paneH: 260, paneMin: false,
+  groupBy: 'layer', hideDown: false, sort: 'label', sortDir: 1,
+}, store.get(PREF_KEY, {}));
 const savePrefs = () => store.set(PREF_KEY, prefs);
 
-// Probe jobs live here rather than in DOM nodes, so switching tabs or
+let paneTab = 'nodes';           // nodes | matrix | dns | harvest | pings | con:<label>
+let sideTab = 'node';            // node | addresses | interfaces | dhcp | ping
+const consoles = [];             // labels with an open console tab
+const consoleText = new Map();
+// Ping jobs live here rather than in DOM nodes, so switching tabs or
 // selecting another node never loses a run in flight.
-const probeJobs = [];            // newest first: {id, source, target, target_ip, status, stage, eta, t0, result, error}
+const probeJobs = [];
 
 const $ = (s) => document.querySelector(s);
 const el = (tag, cls, text) => {
@@ -50,6 +57,7 @@ const svg = (tag, attrs, text) => {
   return n;
 };
 const getJSON = async (url, opts) => (await fetch(url, opts)).json();
+const byLabel = (a, b) => a.label.localeCompare(b.label, undefined, { numeric: true });
 
 /* ---------------------------------------------------------------- data --- */
 async function boot() {
@@ -63,14 +71,13 @@ async function boot() {
   }, g)));
   NODES.forEach((n) => BY.set(n.label, n));
   LINKS = buildLinks();
-  layoutUnplaced();
-  banners();
+  parkUnplaced();
+  infobar();
   renderAll();
   fit();
   setInterval(tickSecond, 1000);
   if (prefs.traffic) startTraffic();
-  // Pick up any lab-wide run that was already going when the page loaded.
-  ['matrix', 'dns', 'harvest'].forEach((k) => LAB[k].refresh());
+  Object.values(LAB).forEach((t) => t.refresh && t.refresh());
 }
 
 async function poll() {
@@ -82,8 +89,9 @@ async function poll() {
       if (j.states[n.label] !== undefined) n.state = j.states[n.label];
       n.up = n.state === 'STARTED' || n.state === 'BOOTED';
     });
-    renderTree(); renderCanvas(); renderStatus();
-    if (dockTab === 'summary') renderDock();
+    renderCanvas(); renderStatus();
+    if (paneTab === 'nodes') renderPaneBody();
+    if (sideTab === 'node' || !selected) renderSide();
   } catch (e) { /* one missed poll is not worth an error state */ }
 }
 
@@ -99,63 +107,57 @@ function buildLinks() {
   const seen = new Map();
   NODES.forEach((n) => (n.links || []).forEach((l) => {
     const key = l.link_id || [n.label + '|' + l.local_iface, l.peer + '|' + l.peer_iface].sort().join('<>');
-    if (seen.has(key)) return;
-    seen.set(key, { id: l.link_id, key, a: n.label, ai: l.local_iface, b: l.peer, bi: l.peer_iface,
-                    subnet: l.subnet });
+    if (!seen.has(key)) {
+      seen.set(key, { id: l.link_id, a: n.label, ai: l.local_iface, b: l.peer, bi: l.peer_iface, subnet: l.subnet });
+    }
   }));
   return [...seen.values()].filter((l) => BY.has(l.a) && BY.has(l.b));
 }
 
 /* Nodes with no canvas position (declared-but-absent ghosts, or a topology
- * without x/y) are parked in a framed column right of the lab, so they are
- * still visible without pretending to be cabled anywhere. */
-function layoutUnplaced() {
+ * without x/y) are parked in a frame right of the lab, so they stay visible
+ * without pretending to be cabled anywhere. */
+function parkUnplaced() {
   const placed = NODES.filter((n) => typeof n.x === 'number' && typeof n.y === 'number');
   const loose = NODES.filter((n) => !placed.includes(n));
   if (!loose.length) return;
   const x0 = placed.length ? Math.max(...placed.map((n) => n.x)) + 200 : 0;
   const y0 = placed.length ? Math.min(...placed.map((n) => n.y)) : 0;
-  const perCol = 6;
   loose.forEach((n, i) => {
-    n.x = x0 + Math.floor(i / perCol) * 150;
-    n.y = y0 + (i % perCol) * 100;
+    n.x = x0 + Math.floor(i / 6) * 150;
+    n.y = y0 + (i % 6) * 100;
     n.parked = true;
   });
 }
 
-/* -------------------------------------------------------------- banners -- */
-function banners() {
+function infobar() {
   const box = $('#banners');
   box.innerHTML = '';
   const m = INV.meta;
-  const add = (b) => {
-    const x = el('button', 'x', '×');
-    x.title = 'Dismiss';
-    x.addEventListener('click', () => b.remove());
-    b.prepend(x);
-    box.appendChild(b);
+  const line = (cls, text) => {
+    const d = el('div');
+    d.appendChild(el('span', cls, text));
+    const x = el('button', 'linkish', 'Dismiss');
+    x.addEventListener('click', () => { d.remove(); box.hidden = !box.children.length; fit(); });
+    d.appendChild(x);
+    box.appendChild(d);
   };
   if (m.topology_source !== 'live') {
     const age = m.snapshot && m.snapshot.age_hours;
-    const b = el('div', 'notice fail');
-    b.innerHTML = '<b>Cached snapshot</b> — ';
-    b.appendChild(document.createTextNode(
-      `${age != null ? age + 'h old' : 'age unknown'}. CML is unreachable; anything changed in the lab since then is missing here.`));
-    add(b);
+    line('bad', `CML is unreachable. Showing the cached snapshot (${age != null ? age + ' h old' : 'age unknown'}); ` +
+      'anything changed in the lab since then is missing.');
   }
   if (m.counts.undeclared) {
-    const b = el('div', 'notice');
-    b.innerHTML = `<b>${m.counts.undeclared} undeclared</b> — `;
-    b.appendChild(document.createTextNode(
-      'in the lab but not in the manifest, so they get no generated config. Dashed outline on the canvas.'));
-    add(b);
+    line(null, `${m.counts.undeclared} node(s) are in the lab but not in the manifest and get no generated config. ` +
+      'They have an orange outline on the canvas.');
   }
+  box.hidden = !box.children.length;
 }
 
 /* --------------------------------------------------------------- filter -- */
 /* "Other" = anything that is not HQ or DR: the carriers, the internet web
  * server, and the remote worker's house (site HOME).  A shared carrier has no
- * single site by design — see the manifest's note on the ISP nodes. */
+ * single site by design - see the manifest's note on the ISP nodes. */
 function siteBucket(n) {
   return n.site === 'HQ' || n.site === 'DR' ? n.site : 'other';
 }
@@ -169,41 +171,34 @@ function hay(n) {
 }
 
 /* The canvas keeps every node in place (moving the lab around under a filter
- * would be disorienting); filters DIM on the canvas and REMOVE from the tree. */
+ * would be disorienting); filters DIM on the canvas and REMOVE from the table. */
 function matches(n) {
   const q = $('#q').value.trim().toLowerCase();
   if (site !== 'all' && siteBucket(n) !== site) return false;
-  if ($('#hide-down').checked && !n.up && !n.ghost) return false;
-  if (q && !hay(n).includes(q)) return false;
-  return true;
+  if (prefs.hideDown && !n.up && !n.ghost) return false;
+  return !q || hay(n).includes(q);
 }
 const shown = (n) => !hidden.has(n.label);
 
-function groups(nodes) {
-  const mode = $('#groupby').value;
-  const key = {
-    layer: (n) => [n.layer, n.layer_title || n.layer],
-    site:  (n) => [n.site || '—', n.site || 'No site (carrier / shared)'],
-    role:  (n) => [n.role || 'zz', n.role_title || 'Not declared in manifest'],
-    state: (n) => n.ghost ? ['z-absent', 'Declared but absent']
-                          : n.up ? ['a-up', 'Running'] : ['b-down', 'Stopped'],
-  }[mode];
-  const map = new Map();
-  nodes.forEach((n) => {
-    const [k, title] = key(n);
-    if (!map.has(k)) map.set(k, { k, title, nodes: [] });
-    map.get(k).nodes.push(n);
-  });
-  const order = mode === 'layer'
-    ? INV.layers.map((l) => l.key).filter((k) => map.has(k))
-    : [...map.keys()].sort();
-  return order.map((k) => map.get(k));
+/* Live address (read off the device) outranks the manifest's declaration. */
+function displayIp(n) {
+  if (n.live_ip) return { text: n.live_ip, drift: n.live_ip !== n.primary_ip, live: true };
+  if (n.primary_ip) return { text: n.primary_ip, drift: false, live: false };
+  return { text: '', drift: false, live: false };
 }
 
+function stateWord(n) {
+  if (n.ghost) return ['absent', 's-bad'];
+  if (n.state === 'BOOTED') return ['booted', 's-ok'];
+  if (n.state === 'STARTED') return ['starting', 's-warn'];
+  return [(n.state || 'unknown').toLowerCase(), 's-dim'];
+}
+function lamp(n) { return el('span', 'lamp-i ' + (n.ghost ? 'ghost' : n.state || '')); }
+
 /* ---------------------------------------------------------------- icons -- */
-/* One glyph per device class, drawn in a 40×40 box centred on 0,0 — the same
- * visual vocabulary as the CML palette: round routers, square switches, a
- * brick firewall, tower servers, monitors for hosts, a cloud for the outside. */
+/* One glyph per device class in a 34-unit box centred on 0,0: round routers,
+ * square switches, a brick firewall, tower servers, monitors for hosts, a
+ * cloud for the outside.  Shape carries the class; colour carries state. */
 function kind(n) {
   const d = n.node_definition || '', r = n.role || '';
   if (r === 'firewall_asa' || d === 'asav') return 'firewall';
@@ -215,20 +210,17 @@ function kind(n) {
   if (r === 'trex' || d === 'trex') return 'tester';
   if (d === 'external_connector' || r === 'web_internet' || /^ext-conn|^internet-/i.test(n.label)) return 'cloud';
   if (['desktop', 'wireless-client', 'alpine'].includes(d) || /desktop|client/.test(r)) return 'host';
-  if (['dnsmasq', 'radius', 'nginx', 'splunk', 'syslog', 'server', 'win2025'].includes(d) || r.startsWith('server') || r.startsWith('dns')) return 'server';
+  if (['dnsmasq', 'radius', 'nginx', 'splunk', 'syslog', 'server', 'win2025'].includes(d) ||
+      r.startsWith('server') || r.startsWith('dns')) return 'server';
   if (d === 'iol-xe') return n.layer === 'edge' || n.layer === 'carrier' ? 'router' : 'l3switch';
   return 'unknown';
 }
-const KIND_COLOR = {
-  router: '--n-net', l3switch: '--n-net', switch: '--n-net', firewall: '--n-sec', server: '--n-srv',
-  host: '--n-host', wlc: '--n-wifi', ap: '--n-wifi', tester: '--n-host', cloud: '--n-ext', unknown: '--n-ext',
-};
 const KIND_NAME = {
-  router: 'Router', l3switch: 'L3 switch', switch: 'L2 switch', firewall: 'Firewall', server: 'Server / container',
-  host: 'Host', wlc: 'WLC', ap: 'Access point', tester: 'Traffic gen', cloud: 'External', unknown: 'Other',
+  router: 'Router', l3switch: 'L3 switch', switch: 'L2 switch', firewall: 'Firewall', server: 'Server',
+  host: 'Host', wlc: 'WLC', ap: 'Access point', tester: 'Traffic generator', cloud: 'External', unknown: 'Other',
 };
-const ARROW = (x1, y1, x2, y2) => {       // line with a small head at x2,y2
-  const a = Math.atan2(y2 - y1, x2 - x1), h = 3.6;
+const ARROW = (x1, y1, x2, y2) => {
+  const a = Math.atan2(y2 - y1, x2 - x1), h = 3.4;
   return `M${x1} ${y1}L${x2} ${y2}M${x2 - h * Math.cos(a - 0.6)} ${y2 - h * Math.sin(a - 0.6)}` +
          `L${x2} ${y2}L${x2 - h * Math.cos(a + 0.6)} ${y2 - h * Math.sin(a + 0.6)}`;
 };
@@ -248,98 +240,29 @@ const GLYPH = {
 const ROUND = new Set(['router', 'ap', 'cloud', 'unknown']);
 
 function nodeIcon(n, size) {
-  const k = kind(n);
+  const k = kind(n), s = size / 2;
   const g = svg('g');
-  const s = size / 2;
-  const fill = `var(${KIND_COLOR[k]})`;
-  if (ROUND.has(k)) g.appendChild(svg('circle', { r: s, class: 'body', fill }));
-  else g.appendChild(svg('rect', { x: -s, y: -s, width: size, height: size, rx: size * 0.16, class: 'body', fill }));
+  if (ROUND.has(k)) g.appendChild(svg('circle', { r: s, class: 'body' }));
+  else g.appendChild(svg('rect', { x: -s, y: -s, width: size, height: size, rx: 3, class: 'body' }));
   const gl = svg('g', { class: 'glyph', transform: `scale(${size / 34})` });
   GLYPH[k]().forEach((d) => gl.appendChild(svg('path', { d })));
   g.appendChild(gl);
   return g;
 }
 
-function miniIcon(n) {
-  const s = svg('svg', { viewBox: '-12 -12 24 24', class: 'ico' });
-  const g = nodeIcon(n, 22);
-  g.classList.add('node');
-  s.appendChild(g);
-  if (!n.up) s.style.opacity = '.5';
+const X_ICON = () => {
+  const s = svg('svg', { viewBox: '0 0 8 8' });
+  s.appendChild(svg('path', { d: 'M1 1L7 7M7 1L1 7' }));
   return s;
-}
-
-/* ---------------------------------------------------------------- tree --- */
-function renderTree() {
-  const box = $('#tree');
-  const scroll = box.scrollTop;
-  box.innerHTML = '';
-  const vis = NODES.filter((n) => shown(n) && matches(n))
-    .sort((a, b) => a.label.localeCompare(b.label, undefined, { numeric: true }));
-  if (!vis.length) { box.appendChild(el('div', 'empty', 'Nothing matches.')); }
-  groups(vis).forEach((g) => {
-    const det = el('details', 'tgroup');
-    det.open = !prefs.collapsed.includes(g.k);
-    const sum = el('summary', null, g.title);
-    const gup = g.nodes.filter((n) => n.up).length;
-    sum.appendChild(el('span', 'n', `${gup}/${g.nodes.length}`));
-    det.appendChild(sum);
-    det.addEventListener('toggle', () => {
-      prefs.collapsed = prefs.collapsed.filter((k) => k !== g.k);
-      if (!det.open) prefs.collapsed.push(g.k);
-      savePrefs();
-    });
-    g.nodes.forEach((n) => det.appendChild(treeItem(n)));
-    box.appendChild(det);
-  });
-  const hb = $('#hidden-btn');
-  hb.hidden = hidden.size === 0;
-  hb.textContent = `${hidden.size} hidden — show all`;
-  box.scrollTop = scroll;
-}
-
-function treeItem(n) {
-  const it = el('div', 'titem' + (n.up ? '' : ' down') + (n.label === selected ? ' sel' : ''));
-  it.appendChild(miniIcon(n));
-  const mid = el('div');
-  mid.style.minWidth = '0';
-  mid.appendChild(el('div', 'nm', n.label));
-  mid.appendChild(el('div', 'sub', displayIp(n).text || n.role_title || ''));
-  it.appendChild(mid);
-  const rt = el('div', 'rt');
-  if ((n.issues || []).length) rt.appendChild(el('span', 'tag warn', '#' + n.issues.map((i) => i.id).join(' #')));
-  if (n.config_status === 'undeclared') rt.appendChild(el('span', 'tag warn', 'undecl'));
-  const hide = el('button', 'hide-btn', 'hide');
-  hide.title = 'Hide from the tree and canvas';
-  hide.addEventListener('click', (e) => {
-    e.stopPropagation();
-    hidden.add(n.label);
-    store.set(HIDE_KEY, [...hidden]);
-    if (selected === n.label) select(null);
-    renderAll();
-  });
-  rt.appendChild(hide);
-  rt.appendChild(el('span', 'sdot ' + (n.ghost ? 'ghost' : n.state || '')));
-  it.appendChild(rt);
-  it.addEventListener('click', () => { select(n.label, true); closeNav(); });
-  it.addEventListener('mouseenter', () => { hovered = n.label; highlight(); });
-  it.addEventListener('mouseleave', () => { hovered = null; highlight(); });
-  return it;
-}
-
-/* Live address (read off the device) outranks the manifest's declaration. */
-function displayIp(n) {
-  if (n.live_ip) return { text: n.live_ip, drift: n.live_ip !== n.primary_ip };
-  if (n.primary_ip) return { text: n.primary_ip, drift: false, manifest: true };
-  return { text: '', drift: false };
-}
+};
 
 /* --------------------------------------------------------------- canvas -- */
 const view = { x: 0, y: 0, k: 1 };
-const NODE_SIZE = 38;
+const NODE_SIZE = 36;
 
 function applyView() {
   $('#viewport').setAttribute('transform', `translate(${view.x} ${view.y}) scale(${view.k})`);
+  $('#zoomread').textContent = Math.round(view.k * 100) + '%';
 }
 
 function fit() {
@@ -348,12 +271,11 @@ function fit() {
   const r = $('#canvas').getBoundingClientRect();
   const xs = pts.map((n) => n.x), ys = pts.map((n) => n.y);
   const minX = Math.min(...xs) - 70, maxX = Math.max(...xs) + 70;
-  const minY = Math.min(...ys) - 60, maxY = Math.max(...ys) + 80;
-  const pad = 30, top = 44;
-  const k = Math.min((r.width - pad * 2) / (maxX - minX), (r.height - pad - top) / (maxY - minY), 1.6);
+  const minY = Math.min(...ys) - 50, maxY = Math.max(...ys) + 60;
+  const k = Math.min((r.width - 40) / (maxX - minX), (r.height - 30) / (maxY - minY), 1.5);
   view.k = Math.max(0.15, k);
   view.x = (r.width - (maxX - minX) * view.k) / 2 - minX * view.k;
-  view.y = top + (r.height - top - (maxY - minY) * view.k) / 2 - minY * view.k;
+  view.y = (r.height - (maxY - minY) * view.k) / 2 - minY * view.k;
   applyView();
 }
 
@@ -367,10 +289,10 @@ function zoomAt(factor, cx, cy) {
   applyView();
 }
 
-function centerOn(n) {
+function centerOn(n, force) {
   const r = $('#canvas').getBoundingClientRect();
   const sx = n.x * view.k + view.x, sy = n.y * view.k + view.y;
-  if (sx > 60 && sx < r.width - 60 && sy > 60 && sy < r.height - 60) return;   // already on screen
+  if (!force && sx > 60 && sx < r.width - 60 && sy > 60 && sy < r.height - 60) return;
   view.x = r.width / 2 - n.x * view.k;
   view.y = r.height / 2 - n.y * view.k;
   applyView();
@@ -389,73 +311,61 @@ function renderCanvas() {
     const a = BY.get(l.a), b = BY.get(l.b);
     if (!shown(a) || !shown(b)) return;
     const g = svg('g', { 'data-a': l.a, 'data-b': l.b, 'data-link': l.id || '' });
-    const up = a.up && b.up;
-    g.appendChild(svg('line', { x1: a.x, y1: a.y, x2: b.x, y2: b.y, class: 'lnk' + (up ? '' : ' down') }));
-    const hit = svg('line', { x1: a.x, y1: a.y, x2: b.x, y2: b.y, class: 'lnk-hit' });
-    hit.appendChild(svg('title', {}, `${l.a} ${l.ai}  ⟷  ${l.b} ${l.bi}${l.subnet ? '\n' + l.subnet : ''}`));
+    g.appendChild(svg('line', { x1: a.x, y1: a.y, x2: b.x, y2: b.y, class: 'wire' + (a.up && b.up ? '' : ' off') }));
+    const hit = svg('line', { x1: a.x, y1: a.y, x2: b.x, y2: b.y, class: 'wire-hit' });
+    hit.appendChild(svg('title', {}, `${l.a} ${l.ai}  to  ${l.b} ${l.bi}${l.subnet ? '\n' + l.subnet : ''}`));
     g.appendChild(hit);
     if (prefs.iface) {
       [[a, b, l.ai], [b, a, l.bi]].forEach(([p, q, name]) => {
         const len = Math.hypot(q.x - p.x, q.y - p.y) || 1;
-        const t = Math.min(0.4, 42 / len);
+        const t = Math.min(0.4, 40 / len);
         g.appendChild(svg('text', { x: p.x + (q.x - p.x) * t, y: p.y + (q.y - p.y) * t + 3,
                                     class: 'iflbl', 'text-anchor': 'middle' }, shortIf(name)));
       });
     }
-    g.appendChild(svg('text', { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 - 4, class: 'pps',
-                                'text-anchor': 'middle', 'data-pps': l.id || '' }, ''));
+    g.appendChild(svg('text', { x: (a.x + b.x) / 2 + 4, y: (a.y + b.y) / 2 - 3, class: 'rate' }, ''));
     lg.appendChild(g);
   });
 
   const parked = NODES.filter((n) => n.parked && shown(n));
   if (parked.length) {
     const xs = parked.map((n) => n.x), ys = parked.map((n) => n.y);
-    const x = Math.min(...xs) - 70, y = Math.min(...ys) - 58;
-    ng.appendChild(svg('rect', { x, y, width: Math.max(...xs) - x + 70, height: Math.max(...ys) - y + 62,
-                                 rx: 8, class: 'park' }));
-    ng.appendChild(svg('text', { x: x + 10, y: y + 16, class: 'park-t' }, 'NOT ON THE CANVAS'));
+    const x = Math.min(...xs) - 70, y = Math.min(...ys) - 56;
+    ng.appendChild(svg('rect', { x, y, width: Math.max(...xs) - x + 70, height: Math.max(...ys) - y + 60, class: 'park' }));
+    ng.appendChild(svg('text', { x: x + 8, y: y + 15, class: 'park-t' }, 'No canvas position'));
   }
 
+  const s = NODE_SIZE / 2;
   NODES.filter(shown).forEach((n) => {
     const cls = ['node'];
-    if (!n.up) cls.push('down');
-    if (n.config_status === 'undeclared' || n.ghost) cls.push('undeclared');
+    if (!n.up) cls.push('off');
+    if (n.ghost) cls.push('ghost');
+    if (n.config_status === 'undeclared') cls.push('undecl');
     if (n.label === selected) cls.push('sel');
     const g = svg('g', { class: cls.join(' '), transform: `translate(${n.x} ${n.y})`, 'data-label': n.label });
-    const s = NODE_SIZE / 2;
-    g.appendChild(svg('rect', { x: -s - 5, y: -s - 5, width: NODE_SIZE + 10, height: NODE_SIZE + 10,
-                                rx: ROUND.has(kind(n)) ? s + 5 : 9, class: 'ring' }));
+    g.appendChild(svg('rect', { x: -s - 4, y: -s - 4, width: NODE_SIZE + 8, height: NODE_SIZE + 8, class: 'sel-box' }));
     g.appendChild(nodeIcon(n, NODE_SIZE));
-
-    // state badge, top-right — green check booted, amber booting, grey stopped
-    const bx = s - 2, by = -s + 2;
-    const stateFill = n.ghost ? 'var(--fail)' : n.state === 'BOOTED' ? 'var(--ok)'
-      : n.state === 'STARTED' ? 'var(--amber)' : 'var(--ink3)';
-    g.appendChild(svg('circle', { cx: bx, cy: by, r: 7, class: 'badge-bg', fill: stateFill }));
-    g.appendChild(svg('path', {
-      d: n.ghost ? `M${bx - 3} ${by - 3}l6 6m0-6l-6 6`
-        : n.state === 'BOOTED' ? `M${bx - 3.2} ${by}l2.2 2.3l4-4.4`
-        : n.state === 'STARTED' ? `M${bx - 2} ${by - 3.2}v6.4l5-3.2z`
-        : `M${bx - 2.6} ${by - 2.6}h5.2v5.2h-5.2z`,
-      fill: n.state === 'STARTED' || !n.up && !n.ghost ? '#fff' : 'none',
-      stroke: '#fff', 'stroke-width': 1.6, 'stroke-linecap': 'round', 'stroke-linejoin': 'round',
-    }));
-    // open-issue count, top-left
+    // state lamp, bottom-right: the same square used in the node table
+    if (!n.ghost) {
+      const c = n.state === 'BOOTED' ? 'var(--ok)' : n.state === 'STARTED' ? 'var(--warn)' : 'var(--devoff)';
+      g.appendChild(svg('rect', { x: s - 5, y: s - 5, width: 9, height: 9, fill: c, class: 'lamp' }));
+    }
+    // open known-issues count, top-left
     if ((n.issues || []).length) {
-      g.appendChild(svg('circle', { cx: -s + 2, cy: -s + 2, r: 7, class: 'badge-bg', fill: 'var(--warn)' }));
-      g.appendChild(svg('text', { x: -s + 2, y: -s + 5, class: 'badge-t' }, String(n.issues.length)));
+      g.appendChild(svg('rect', { x: -s - 4, y: -s - 4, width: 12, height: 12, fill: 'var(--warn)', class: 'lamp' }));
+      g.appendChild(svg('text', { x: -s + 2, y: -s + 5, class: 'iss' }, String(n.issues.length)));
     }
     g.appendChild(svg('text', { y: s + 15, class: 'lbl' }, n.label));
     if (prefs.ip) {
       const ip = displayIp(n);
-      const txt = n.ghost ? 'absent from lab' : ip.text ? ip.text + (ip.drift ? ' ⚠' : '') : '';
-      if (txt) g.appendChild(svg('text', { y: s + 28, class: 'ipl' + (ip.drift || n.ghost ? ' drift' : '') }, txt));
+      const txt = n.ghost ? 'not in lab' : ip.text ? ip.text + (ip.drift ? ' (drift)' : '') : '';
+      if (txt) g.appendChild(svg('text', { y: s + 27, class: 'ipl' + (ip.drift || n.ghost ? ' drift' : '') }, txt));
     }
-    g.appendChild(svg('title', {}, `${n.label}\n${n.role_title || ''}\n${n.ghost ? 'absent' : n.state || 'unknown'}`));
+    g.appendChild(svg('title', {}, `${n.label}\n${KIND_NAME[kind(n)]}, ${stateWord(n)[0]}`));
     ng.appendChild(g);
   });
 
-  renderProbeOverlay();
+  renderPathOverlay();
   highlight();
   paintTraffic();
 }
@@ -463,53 +373,38 @@ function renderCanvas() {
 /* Dim anything the filters exclude; light up the focused node's cabling. */
 function highlight() {
   const focus = hovered || selected;
-  document.querySelectorAll('#nodes .node').forEach((g) => {
-    const n = BY.get(g.dataset.label);
-    g.classList.toggle('dim', !matches(n));
-  });
+  document.querySelectorAll('#nodes .node').forEach((g) => g.classList.toggle('dim', !matches(BY.get(g.dataset.label))));
   document.querySelectorAll('#links > g').forEach((g) => {
-    const ln = g.querySelector('.lnk');
-    const on = focus && (g.dataset.a === focus || g.dataset.b === focus);
-    ln.classList.toggle('hl', !!on);
-    ln.classList.toggle('dim', !matches(BY.get(g.dataset.a)) || !matches(BY.get(g.dataset.b)));
+    const w = g.querySelector('.wire');
+    w.classList.toggle('hl', !!focus && (g.dataset.a === focus || g.dataset.b === focus));
+    w.classList.toggle('dim', !matches(BY.get(g.dataset.a)) || !matches(BY.get(g.dataset.b)));
   });
 }
 
-/* A dashed path from source to target for the selected node's latest probe:
- * marching while it runs, then coloured by the verdict. */
-function renderProbeOverlay() {
+/* A curved line from source to target: dashed while a ping runs, then drawn
+ * in the verdict's colour.  Also used when hovering a baseline-matrix row. */
+function drawPath(src, dst, level) {
   const ov = $('#overlay');
   ov.innerHTML = '';
-  const job = probeJobs.find((j) => selected && (j.target === selected || j.source === selected));
-  if (!job) return;
-  const a = BY.get(job.source), b = BY.get(job.target);
+  const a = BY.get(src), b = BY.get(dst);
   if (!a || !b || !shown(a) || !shown(b)) return;
   const mx = (a.x + b.x) / 2, my = (a.y + b.y) / 2;
-  const dx = b.x - a.x, dy = b.y - a.y, len = Math.hypot(dx, dy) || 1;
-  const bend = Math.min(90, len * 0.25);
-  const cx = mx - (dy / len) * bend, cy = my + (dx / len) * bend;
-  const lvl = job.status === 'done' ? ((job.result.verdict || {}).level || 'warn') : job.status === 'error' ? 'fail' : 'run';
-  ov.appendChild(svg('path', { d: `M${a.x} ${a.y}Q${cx} ${cy} ${b.x} ${b.y}`,
-                               class: 'probe-line ' + (lvl === 'ok' ? 'ok' : lvl === 'fail' ? 'fail' : lvl === 'run' ? 'run' : 'warn') }));
+  const dx = b.x - a.x, dy = b.y - a.y, len = Math.hypot(dx, dy) || 1, bend = Math.min(80, len * 0.22);
+  ov.appendChild(svg('path', { d: `M${a.x} ${a.y}Q${mx - dy / len * bend} ${my + dx / len * bend} ${b.x} ${b.y}`,
+                               class: 'path ' + level }));
 }
-
-/* Legend: only the device classes actually in this lab. */
-function renderLegend() {
-  const box = $('#legend');
-  box.innerHTML = '';
-  const kinds = new Set(NODES.map(kind));
-  Object.keys(KIND_NAME).filter((k) => kinds.has(k)).forEach((k) => {
-    const s = el('span');
-    const i = el('i'); i.style.background = `var(${KIND_COLOR[k]})`;
-    if (ROUND.has(k)) i.style.borderRadius = '50%';
-    s.appendChild(i); s.appendChild(document.createTextNode(KIND_NAME[k]));
-    box.appendChild(s);
-  });
+function renderPathOverlay() {
+  $('#overlay').innerHTML = '';
+  const job = probeJobs.find((j) => selected && (j.target === selected || j.source === selected));
+  if (!job) return;
+  const v = job.status === 'done' ? (job.result.verdict || {}).level : null;
+  drawPath(job.source, job.target, job.status === 'error' ? 'bad'
+    : job.status !== 'done' ? 'run' : v === 'ok' ? 'ok' : v === 'fail' ? 'bad' : 'warn');
 }
 
 /* ------------------------------------------------------- link traffic ---- */
 /* Two samples of the lab-wide link counters give live pkts/s and a cumulative
- * drop count per link — read over REST with no console attach (0.04s). */
+ * drop count per link, read over REST with no console attach (0.04s). */
 let trafficTimer = null, lastStats = null, linkRates = {};
 
 function startTraffic() {
@@ -524,8 +419,7 @@ function startTraffic() {
         linkRates = {};
         Object.entries(s.links).forEach(([id, v]) => {
           const p = lastStats.links[id];
-          if (!p) return;
-          linkRates[id] = {
+          if (p) linkRates[id] = {
             pps: Math.max(0, ((v.readpackets + v.writepackets) - (p.readpackets + p.writepackets)) / dt),
             drops: v.drops,
           };
@@ -533,7 +427,7 @@ function startTraffic() {
       }
       lastStats = { t, links: s.links };
       paintTraffic();
-      if (dockTab === 'interfaces') renderDock();
+      if (selected && sideTab === 'interfaces') renderSide();
     } catch (e) { linkRates = {}; paintTraffic(); }
   };
   sample();
@@ -546,26 +440,38 @@ function stopTraffic() {
 function paintTraffic() {
   document.querySelectorAll('#links > g').forEach((g) => {
     const r = prefs.traffic ? linkRates[g.dataset.link] : null;
-    const ln = g.querySelector('.lnk'), tx = g.querySelector('.pps');
-    ln.classList.toggle('busy', !!(r && r.pps >= 1));
-    ln.classList.toggle('drops', !!(r && r.drops > 0));
-    ln.style.strokeWidth = r && r.pps >= 1 ? String(Math.min(6, 1.6 + Math.log10(r.pps + 1) * 1.4)) : '';
-    tx.textContent = r ? (r.drops > 0 ? `${Math.round(r.pps)}/s · ${r.drops} drop` : r.pps >= 1 ? Math.round(r.pps) + '/s' : '') : '';
+    const w = g.querySelector('.wire'), tx = g.querySelector('.rate');
+    w.classList.toggle('busy', !!(r && r.pps >= 1));
+    w.classList.toggle('drops', !!(r && r.drops > 0));
+    w.style.strokeWidth = r && r.pps >= 1 ? String(Math.min(5, 1.5 + Math.log10(r.pps + 1))) : '';
+    tx.textContent = !r ? '' : r.drops > 0 ? `${Math.round(r.pps)} pps, ${r.drops} drops`
+      : r.pps >= 1 ? Math.round(r.pps) + ' pps' : '';
     tx.classList.toggle('bad', !!(r && r.drops > 0));
   });
+}
+function setTraffic(on) {
+  prefs.traffic = on; savePrefs();
+  $('#show-traffic').checked = on;
+  if (on) startTraffic(); else stopTraffic();
+  if (selected && sideTab === 'interfaces') renderSide();
 }
 
 /* ------------------------------------------------------------ selection -- */
 function select(label, center) {
   selected = label;
-  // Like CML's bottom pane: picking a node brings up that node's tabs,
-  // clearing the selection returns to the lab view.
   const n = label && BY.get(label);
-  if (dockTab.startsWith('lab:') ? !!n : !n) dockTab = 'summary';
-  if (n && ((dockTab === 'dhcp' && !n.dhcp) || (n.ghost && ['probe', 'console'].includes(dockTab)))) dockTab = 'summary';
+  if (n && ((sideTab === 'dhcp' && !n.dhcp) || (n.ghost && sideTab === 'ping'))) sideTab = 'node';
   if (n && center) centerOn(n);
-  if (n && prefs.dockMin) { prefs.dockMin = false; applyDock(); }
-  renderTree(); renderCanvas(); renderDock(); renderStatus();
+  if (n) document.body.classList.add('side-open');
+  renderCanvas(); renderSide(); renderStatus();
+  if (paneTab === 'nodes') markTableSelection();
+}
+
+function hideNode(label) {
+  hidden.add(label);
+  store.set(HIDE_KEY, [...hidden]);
+  if (selected === label) selected = null;
+  renderAll();
 }
 
 /* ----------------------------------------------------------- status bar -- */
@@ -573,480 +479,414 @@ function renderStatus() {
   const m = INV.meta;
   const src = $('#src-line');
   src.innerHTML = '';
-  src.appendChild(el('span', m.topology_source === 'live' ? 'live' : 'cached',
-    m.topology_source === 'live' ? '● live from CML' : '● CACHED SNAPSHOT'));
-  src.appendChild(document.createTextNode(' · p45.local / ' + INV.public_zone));
+  if (m.topology_source === 'live') src.textContent = 'Topology: live from CML';
+  else src.appendChild(el('span', 'snap', 'Topology: CACHED SNAPSHOT'));
 
-  // Counts follow the site selection, so "3 down" means 3 down HERE.
+  // Counts follow the site selection, so "3 stopped" means 3 stopped HERE.
   const scope = NODES.filter((n) => !n.ghost && (site === 'all' || siteBucket(n) === site));
   const up = scope.filter((n) => n.up).length;
-  const vis = NODES.filter((n) => shown(n) && matches(n)).length;
-  $('#counts').textContent = (site === 'all' ? '' : site + ': ') +
-    `${up} up · ${scope.length - up} down · ${vis} shown` +
-    (m.counts.absent ? ` · ${m.counts.absent} absent` : '');
+  $('#counts').textContent = `${site === 'all' ? '' : site === 'other' ? 'Carrier/home: ' : site + ': '}` +
+    `${up} running, ${scope.length - up} stopped` + (m.counts.absent ? `, ${m.counts.absent} absent` : '');
 
   const all = NODES.filter((n) => !n.ghost), allUp = all.filter((n) => n.up).length;
-  const pill = $('#lab-pill');
-  pill.textContent = m.topology_source === 'live' ? `${allUp}/${all.length} running` : 'snapshot';
-  pill.className = 'pill' + (m.topology_source !== 'live' ? ' fail' : allUp < all.length ? ' warn' : '');
+  $('#lab-state').textContent = m.topology_source === 'live'
+    ? `${allUp} of ${all.length} nodes running` : 'CML unreachable';
+
+  const hb = $('#hidden-btn');
+  hb.hidden = hidden.size === 0;
+  hb.textContent = `${hidden.size} hidden`;
+  hb.title = 'Show hidden nodes again: ' + [...hidden].join(', ');
 
   const n = selected && BY.get(selected);
-  $('#sel-line').textContent = n ? `selected ${n.label} · ${n.node_definition || 'absent'}` : '';
+  $('#sel-line').textContent = n ? `${n.label}  (${n.node_definition || 'not in lab'})` : '';
 }
 
-function renderAll() { renderTree(); renderCanvas(); renderLegend(); renderStatus(); renderDock(); }
+function renderAll() { renderCanvas(); renderStatus(); renderPane(); renderSide(); }
 
-/* ================================================================= dock == */
-const NODE_TABS = [
-  ['summary', 'Summary'], ['addresses', 'Addresses & DNS'], ['interfaces', 'Interfaces'],
-  ['dhcp', 'DHCP'], ['probe', 'Ping'], ['console', 'Console'],
-];
+/* ============================================================== sidebar == */
+const SIDE_TABS = [['node', 'Node'], ['addresses', 'Addresses'], ['interfaces', 'Interfaces'],
+                   ['dhcp', 'DHCP'], ['ping', 'Ping']];
 
-function renderDock() { renderDockTabs(); renderDockBody(); }
-
-function renderDockTabs() {
-  const tabs = $('#dock-tabs');
+function renderSide() {
+  const tabs = $('#side-tabs'), body = $('#side-body');
+  const n = selected && BY.get(selected);
   tabs.innerHTML = '';
-  const n = selected && BY.get(selected);
-
-  if (n) {
-    const ctx = el('div', 'ctx');
-    ctx.appendChild(miniIcon(n));
-    ctx.appendChild(document.createTextNode(n.label));
-    tabs.appendChild(ctx);
-    NODE_TABS.forEach(([k, t]) => {
-      if (k === 'dhcp' && !n.dhcp) return;
-      if ((k === 'probe' || k === 'console') && n.ghost) return;
-      const b = el('button', 'tab' + (dockTab === k ? ' on' : ''), t);
-      if (k === 'probe') {
-        const running = probeJobs.filter((j) => j.target === n.label && j.status !== 'done' && j.status !== 'error').length;
-        if (running) b.appendChild(el('span', 'cnt', '…'));
-      }
-      b.addEventListener('click', () => { dockTab = k; ensureDockOpen(); renderDock(); });
-      tabs.appendChild(b);
-    });
-    tabs.appendChild(el('div', 'sep'));
-  } else if (!dockTab.startsWith('lab:')) {
-    const b = el('button', 'tab on', 'Lab overview');
-    tabs.appendChild(b);
-  }
-
-  Object.entries(LAB).forEach(([k, def]) => {
-    const b = el('button', 'tab' + (dockTab === 'lab:' + k ? ' on' : ''), def.title);
-    const c = def.badge();
-    if (c) b.appendChild(el('span', 'cnt ' + (c.level || ''), c.text));
-    b.addEventListener('click', () => openLab(k));
-    tabs.appendChild(b);
-  });
-  tabs.appendChild(el('div', 'grow'));
-  const min = el('button', 'min', prefs.dockMin ? '▴' : '▾');
-  min.title = prefs.dockMin ? 'Expand panel' : 'Minimise panel';
-  min.addEventListener('click', () => { prefs.dockMin = !prefs.dockMin; savePrefs(); applyDock(); renderDock(); });
-  tabs.appendChild(min);
-
-  document.querySelectorAll('.top-actions [data-tab]').forEach((b) =>
-    b.classList.toggle('on', dockTab === 'lab:' + b.dataset.tab));
-}
-
-function renderDockBody() {
-  if (prefs.dockMin) return;
-  const n = selected && BY.get(selected);
-  const body = $('#dock-body');
   const scroll = body.scrollTop;
   body.innerHTML = '';
-  if (dockTab.startsWith('lab:')) { LAB[dockTab.slice(4)].draw(body); return; }
-  if (!n) { body.appendChild(overview()); return; }
-  const pane = {
-    summary: paneSummary, addresses: paneAddresses, interfaces: paneInterfaces,
-    dhcp: paneDhcp, probe: paneProbe, console: paneConsole,
-  }[dockTab] || paneSummary;
-  body.appendChild(pane(n));
+  if (!n) {
+    tabs.appendChild(el('button', 'tab on', 'Lab'));
+    body.appendChild(labSummary());
+    return;
+  }
+  SIDE_TABS.forEach(([k, t]) => {
+    if (k === 'dhcp' && !n.dhcp) return;
+    if (k === 'ping' && n.ghost) return;
+    const b = el('button', 'tab' + (sideTab === k ? ' on' : ''), t);
+    if (k === 'ping' && probeJobs.some((j) => j.target === n.label && !['done', 'error'].includes(j.status))) {
+      b.appendChild(el('span', 'n', 'running'));
+    }
+    b.addEventListener('click', () => { sideTab = k; renderSide(); });
+    tabs.appendChild(b);
+  });
+  const close = el('button', 'tab close');
+  close.title = 'Clear selection (Esc)';
+  close.appendChild(X_ICON());
+  close.style.marginLeft = 'auto';
+  close.addEventListener('click', () => { select(null); document.body.classList.remove('side-open'); });
+  tabs.appendChild(close);
+
+  const fn = { node: sideNode, addresses: sideAddresses, interfaces: sideInterfaces,
+               dhcp: sideDhcp, ping: sidePing }[sideTab] || sideNode;
+  body.appendChild(fn(n));
   body.scrollTop = scroll;
 }
 
-function ensureDockOpen() { if (prefs.dockMin) { prefs.dockMin = false; savePrefs(); applyDock(); } }
-function openLab(k) {
-  dockTab = dockTab === 'lab:' + k && !prefs.dockMin ? 'summary' : 'lab:' + k;
-  ensureDockOpen();
-  renderDock();
-  if (dockTab === 'lab:' + k) LAB[k].refresh();
-}
-function applyDock() {
-  document.documentElement.style.setProperty('--dock-h', prefs.dockH + 'px');
-  $('.main').classList.toggle('dock-min', prefs.dockMin);
+function sect(title, content) {
+  const s = el('div', 'sect');
+  if (title) s.appendChild(el('h4', null, title));
+  if (content) (Array.isArray(content) ? content : [content]).forEach((c) => c && s.appendChild(c));
+  return s;
 }
 
-/* Nothing selected: what a CML lab page shows — counts by class and state. */
-function overview() {
-  const d = el('div');
-  d.appendChild(el('div', 'note', 'Select a node on the canvas or in the tree to open its tabs. ' +
-    'Drag to pan, scroll to zoom, F to fit, / to filter.'));
-  const cols = el('div', 'cols');
-  const byKind = new Map();
-  NODES.forEach((n) => {
-    const k = kind(n);
-    if (!byKind.has(k)) byKind.set(k, { up: 0, all: 0 });
-    const r = byKind.get(k); r.all++; if (n.up) r.up++;
-  });
-  const left = el('div');
-  left.appendChild(el('h3', null, 'Nodes by class'));
-  left.appendChild(table([...byKind.entries()].map(([k, r]) => [KIND_NAME[k], `${r.up}/${r.all} running`])));
-  cols.appendChild(left);
-  const right = el('div');
-  right.appendChild(el('h3', null, 'Needs attention'));
-  const rows = [];
-  NODES.filter((n) => n.ghost).forEach((n) => rows.push([n.label, clickable(n.label, 'declared in manifest, absent from lab')]));
-  NODES.filter((n) => n.config_status === 'undeclared').forEach((n) => rows.push([n.label, clickable(n.label, 'in lab, not in manifest')]));
-  NODES.filter((n) => n.live_ip && n.live_ip !== n.primary_ip).forEach((n) => rows.push([n.label, clickable(n.label, `address drift: ${n.live_ip} vs ${n.primary_ip || '—'}`)]));
-  NODES.filter((n) => (n.issues || []).length).forEach((n) => rows.push([n.label, clickable(n.label, n.issues.map((i) => `#${i.id} ${i.title}`).join('; '))]));
-  right.appendChild(rows.length ? table(rows) : el('div', 'note ok', 'Nothing flagged.'));
-  cols.appendChild(right);
-  d.appendChild(cols);
-  return d;
-}
-function clickable(label, text) {
-  const a = el('a', null, text);
-  a.href = '#';
-  a.style.color = 'inherit';
-  a.addEventListener('click', (e) => { e.preventDefault(); select(label, true); });
-  return a;
-}
-
-/* ------------------------------------------------------------ helpers ---- */
-function table(rows, head) {
-  const t = el('table', 't');
-  if (head) {
-    const hr = el('tr');
-    head.forEach((h) => hr.appendChild(el('th', null, h)));
-    t.appendChild(hr);
-  }
-  rows.forEach((row) => {
-    const tr = el('tr');
-    row.forEach((v, i) => {
-      const td = el('td', i > 0 || head ? 'm' : null);
-      if (v && v.nodeType) td.appendChild(v); else td.textContent = v == null || v === '' ? '—' : v;
-      tr.appendChild(td);
-    });
+function props(rows) {
+  const t = el('table', 'p');
+  rows.forEach(([k, v, cls]) => {
+    const tr = el('tr', cls || null);
+    tr.appendChild(el('td', null, k));
+    const td = el('td');
+    if (v && v.nodeType) td.appendChild(v); else td.textContent = v == null || v === '' ? '-' : v;
+    tr.appendChild(td);
     t.appendChild(tr);
   });
   return t;
 }
 
-function copyable(text) {
-  if (!text) return '—';
-  const s = el('span', null, text);
+function copyable(text, mono = true) {
+  if (!text) return '-';
+  const s = el('span', mono ? 'm' : null, text);
   const b = el('button', 'copy', 'copy');
   b.addEventListener('click', (e) => {
     e.stopPropagation();
     navigator.clipboard.writeText(text).then(() => {
-      b.textContent = '✓'; setTimeout(() => (b.textContent = 'copy'), 1000);
+      b.textContent = 'copied'; setTimeout(() => (b.textContent = 'copy'), 1000);
     });
   });
   s.appendChild(b);
   return s;
 }
 
-/* ------------------------------------------------------------ summary ---- */
-function paneSummary(n) {
-  const d = el('div', 'cols');
-  const a = el('div');
-  a.appendChild(el('h3', null, 'Node'));
-  const state = n.ghost ? el('span', 'tag fail', 'absent from the lab')
-    : el('span', 'tag ' + (n.state === 'BOOTED' ? 'ok' : n.state === 'STARTED' ? 'warn' : ''), n.state || 'unknown');
-  const ip = displayIp(n);
-  a.appendChild(table([
-    ['State', state],
-    ['Role', n.role_title],
-    ['Image', n.node_definition],
-    ['Layer', (n.layer_title || n.layer) + (n.layer_inferred ? ' (guessed from label)' : '')],
-    ['Site', n.site],
-    ['Address', ip.text ? copyable(ip.text + (ip.manifest ? '' : ' (live)') + (ip.drift ? ' ⚠ manifest says ' + (n.primary_ip || '—') : '')) : '—'],
-    ['DNS', copyable((n.dns || {}).fqdn)],
-    ['Config', { managed: 'manifest + ' + (n.template || ''), undeclared: 'NOT in the manifest',
-                 absent: 'manifest entry, no node', 'no-template': 'declared, no template' }[n.config_status] || '—'],
-  ]));
-  d.appendChild(a);
+function colored(text, cls) { return el('span', cls, text); }
 
-  const b = el('div');
+/* Nothing selected: the lab's own properties, like CML's lab sidebar. */
+function labSummary() {
+  const d = el('div');
+  const m = INV.meta;
+  const all = NODES.filter((n) => !n.ghost);
+  d.appendChild(sect('Lab', props([
+    ['Topology', m.topology_source === 'live' ? 'live from CML'
+      : colored(`cached snapshot, ${m.snapshot && m.snapshot.age_hours} h old`, 's-bad')],
+    ['Zones', 'p45.local, ' + INV.public_zone],
+    ['Nodes', `${all.length} in lab, ${all.filter((n) => n.up).length} running`],
+    ['Undeclared', m.counts.undeclared ? colored(String(m.counts.undeclared), 's-warn') : '0'],
+    ['Absent', m.counts.absent ? colored(String(m.counts.absent), 's-bad') : '0'],
+  ])));
+
+  const byKind = new Map();
+  NODES.forEach((n) => {
+    const k = kind(n);
+    if (!byKind.has(k)) byKind.set(k, { up: 0, all: 0 });
+    const r = byKind.get(k); r.all++; if (n.up) r.up++;
+  });
+  d.appendChild(sect('Device types', props([...byKind.entries()]
+    .sort((a, b) => b[1].all - a[1].all)
+    .map(([k, r]) => [KIND_NAME[k], `${r.up} of ${r.all} running`]))));
+
   const rows = [];
-  (n.vlans || []).forEach((v) => rows.push(['VLAN', `${v.id}${v.name ? ' — ' + v.name : ''}`]));
-  Object.entries(n.ha || {}).forEach(([k, v]) => rows.push([k.replace(/_/g, ' '), String(v)]));
-  if (n.floor) rows.push(['Location', n.floor]);
-  if (n.parked && !n.ghost) rows.push(['Canvas', 'no x/y in topology — parked below the lab']);
-  b.appendChild(el('h3', null, 'Placement & HA'));
-  b.appendChild(rows.length ? table(rows) : el('div', 'note', 'No VLAN or HA declarations.'));
-  if ((n.issues || []).length) {
-    b.appendChild(el('h3', null, 'Open issues'));
-    n.issues.forEach((i) => b.appendChild(el('div', 'note warn', `#${i.id} — ${i.title}`)));
-  }
-  if (n.config_status === 'undeclared') {
-    b.appendChild(el('div', 'note warn', 'In the lab but not in the manifest — render_configs produces no config for it.'));
-  }
-  if (!n.ghost && !n.can_source_probe && n.no_source_reason) {
-    b.appendChild(el('div', 'note', 'Cannot source probes: ' + n.no_source_reason + '. It can still be a target.'));
-  }
-  d.appendChild(b);
+  const link = (n, text, cls) => {
+    const a = el('a', cls, text);
+    a.href = '#';
+    a.addEventListener('click', (e) => { e.preventDefault(); select(n.label, true); });
+    rows.push([n.label, a]);
+  };
+  NODES.filter((n) => n.ghost).forEach((n) => link(n, 'in manifest, not in lab', 's-bad'));
+  NODES.filter((n) => n.config_status === 'undeclared').forEach((n) => link(n, 'in lab, not in manifest', 's-warn'));
+  NODES.filter((n) => n.live_ip && n.live_ip !== n.primary_ip)
+    .forEach((n) => link(n, `address ${n.live_ip}, manifest ${n.primary_ip || 'none'}`, 's-warn'));
+  NODES.filter((n) => (n.issues || []).length)
+    .forEach((n) => link(n, n.issues.map((i) => `#${i.id} ${i.title}`).join('; ')));
+  d.appendChild(sect('Needs attention', rows.length ? props(rows) : el('div', 'side-empty', 'Nothing flagged.')));
+  d.appendChild(el('div', 'side-empty',
+    'Click a node to inspect it. Right-click for actions. Drag to pan, wheel to zoom, F to fit.'));
   return d;
 }
 
-/* ---------------------------------------------------------- addresses ---- */
-function paneAddresses(n) {
-  const d = el('div', 'cols');
-  const left = el('div');
+function sideNode(n) {
+  const d = el('div');
+  const [sw, sc] = stateWord(n);
+  const ip = displayIp(n);
+  d.appendChild(sect('General', props([
+    ['Label', n.label],
+    ['State', colored(sw, sc)],
+    ['Type', KIND_NAME[kind(n)]],
+    ['Image', n.node_definition],
+    ['Role', n.role_title],
+    ['Layer', (n.layer_title || n.layer) + (n.layer_inferred ? ' (guessed from label)' : '')],
+    ['Site', n.site],
+    ['Address', ip.text ? copyable(ip.text) : '-', ip.drift ? 'drift' : null],
+    ['Address source', ip.text ? (ip.live ? 'read from device' : 'manifest (not read yet)') : '-'],
+    ['DNS name', copyable((n.dns || {}).fqdn)],
+    ['Config', { managed: 'manifest, ' + (n.template || ''), undeclared: colored('not in the manifest', 's-warn'),
+                 absent: colored('manifest entry, no node', 's-bad'), 'no-template': 'declared, no template' }[n.config_status] || '-'],
+  ])));
+  if (ip.drift) d.appendChild(el('div', 'pmsg warn', `The device holds ${n.live_ip}; the manifest declares ${n.primary_ip || 'nothing'}.`));
+
+  const rows = [];
+  (n.vlans || []).forEach((v) => rows.push(['VLAN ' + v.id, v.name || '']));
+  Object.entries(n.ha || {}).forEach(([k, v]) => rows.push([k.replace(/_/g, ' '), String(v)]));
+  if (n.floor) rows.push(['Location', n.floor]);
+  if (rows.length) d.appendChild(sect('VLANs and HA', props(rows)));
+  if ((n.issues || []).length) {
+    d.appendChild(sect('Known issues', props(n.issues.map((i) => ['#' + i.id, i.title]))));
+  }
+  if (!n.ghost && !n.can_source_probe && n.no_source_reason) {
+    d.appendChild(el('div', 'pmsg', 'Cannot be a ping source: ' + n.no_source_reason + '. It can still be a target.'));
+  }
+
+  const acts = el('div', 'acts');
+  if (!n.ghost) {
+    const c = el('button', null, 'Console log');
+    c.addEventListener('click', () => openConsole(n.label));
+    acts.appendChild(c);
+    const p = el('button', null, 'Ping...');
+    p.addEventListener('click', () => { sideTab = 'ping'; renderSide(); });
+    acts.appendChild(p);
+  }
+  const ce = el('button', null, 'Center');
+  ce.addEventListener('click', () => centerOn(n, true));
+  acts.appendChild(ce);
+  const h = el('button', null, 'Hide');
+  h.title = 'Hide from the canvas and node table (restore from the status bar)';
+  h.addEventListener('click', () => hideNode(n.label));
+  acts.appendChild(h);
+  d.appendChild(acts);
+  return d;
+}
+
+function sideAddresses(n) {
+  const d = el('div');
   const live = n.live;
+  const manifestIps = new Set((n.addresses || []).map((a) => a.value));
   if (live && (live.addresses || []).length) {
-    left.appendChild(el('h3', null, 'Live — read from the device'));
-    const manifestIps = new Set((n.addresses || []).map((a) => a.value));
-    const t = table(live.addresses.map((a) => [a.iface, copyable(a.ip), a.method || '—', a.status + '/' + a.proto]),
-                    ['Interface', 'Address', 'Method', 'State']);
-    [...t.querySelectorAll('tr')].slice(1).forEach((tr, i) => {
-      if (!manifestIps.has(live.addresses[i].ip)) tr.classList.add('drift');
+    const t = gridTable(['Interface', 'Address', 'Method', 'State']);
+    live.addresses.forEach((a) => {
+      const tr = el('tr');
+      [a.iface, a.ip, a.method || '-', a.status + '/' + a.proto].forEach((v, i) => tr.appendChild(el('td', i < 2 ? 'm' : null, v)));
+      if (!manifestIps.has(a.ip)) tr.querySelectorAll('td').forEach((td) => { td.style.background = 'var(--infobg)'; });
+      t.appendChild(tr);
     });
-    left.appendChild(t);
+    d.appendChild(sect('Read from the device', t));
     // drift both ways: device holds what the plan doesn't, plan claims what
     // the device doesn't hold
     const liveIps = new Set(live.addresses.map((a) => a.ip));
     const extra = live.addresses.filter((a) => !manifestIps.has(a.ip));
     const missing = (n.addresses || []).filter((a) => !liveIps.has(a.value) && a.kind !== 'ha');
-    if (extra.length || missing.length) {
-      const bits = [];
-      if (extra.length) bits.push('on the device but not in the manifest: ' +
-        extra.map((a) => `${a.ip} (${a.iface})`).join(', '));
-      if (missing.length) bits.push('in the manifest but not on the device: ' +
-        missing.map((a) => `${a.value} (${a.label})`).join(', '));
-      left.appendChild(el('div', 'note warn', bits.join(' · ')));
-    }
-    left.appendChild(el('div', 'note', 'Read at ' + live.at + '. Highlighted rows are addresses the manifest does not declare (DHCP leases, transit /30s, or drift).'));
+    if (extra.length) d.appendChild(el('div', 'pmsg warn', 'Not in the manifest: ' +
+      extra.map((a) => `${a.ip} (${a.iface})`).join(', ')));
+    if (missing.length) d.appendChild(el('div', 'pmsg warn', 'In the manifest, not on the device: ' +
+      missing.map((a) => `${a.value} (${a.label})`).join(', ')));
+    d.appendChild(el('div', 'pmsg', 'Read ' + live.at + '. Shaded rows are not declared in the manifest (DHCP leases, transit /30s, or drift).'));
   } else if (live && live.error) {
-    left.appendChild(el('h3', null, 'Live'));
-    left.appendChild(el('div', 'note warn', 'Read failed at ' + live.at + ': ' + live.error));
+    d.appendChild(sect('Read from the device', el('div', 'pmsg bad', 'Read failed at ' + live.at + ': ' + live.error)));
   } else {
-    left.appendChild(el('h3', null, 'Live'));
-    const nb = el('div', 'note', 'Not read yet. ');
-    const b = el('button', null, 'Read addresses');
-    b.addEventListener('click', () => openLab('harvest'));
-    nb.appendChild(b);
-    left.appendChild(nb);
+    const box = el('div', 'acts');
+    const b = el('button', null, 'Read addresses from all devices');
+    b.addEventListener('click', () => { LAB.harvest.run(); showPane('harvest'); });
+    box.appendChild(b);
+    d.appendChild(sect('Read from the device', [el('div', 'pmsg', 'Not read yet.'), box]));
   }
-  d.appendChild(left);
 
-  const right = el('div');
-  right.appendChild(el('h3', null, 'Manifest (declared) & DNS'));
   const rows = [];
   (n.addresses || []).forEach((a) => rows.push([a.label, copyable(a.value)]));
   const dns = n.dns || {};
   if (dns.fqdn) rows.push(['Internal name', copyable(dns.fqdn)]);
   (dns.cnames || []).forEach((c) => rows.push(['Alias', copyable(c)]));
-  (dns.public || []).forEach((p) => rows.push(['Public record', copyable(p.name + ' → ' + p.ip)]));
-  if (n.resolver) rows.push(['Resolver', copyable(n.resolver + (n.resolver_note ? '  (' + n.resolver_note + ')' : ''))]);
+  (dns.public || []).forEach((p) => rows.push(['Public record', copyable(p.name + ' ' + p.ip)]));
+  if (n.resolver) rows.push(['Resolver', copyable(n.resolver)]);
+  if (n.resolver_note) rows.push(['', n.resolver_note]);
   if (n.gateway) rows.push(['Gateway', copyable(n.gateway)]);
-  right.appendChild(table(rows.length ? rows : [['(none declared)', '']]));
-  d.appendChild(right);
+  d.appendChild(sect('Manifest and DNS', rows.length ? props(rows) : el('div', 'side-empty', 'Nothing declared.')));
   return d;
 }
 
-/* --------------------------------------------------------- interfaces ---- */
-function paneInterfaces(n) {
+function sideInterfaces(n) {
   const d = el('div');
-  const head = el('div', 'pane-head');
-  head.appendChild(el('span', 'lbl', `${n.interface_count || 0} interfaces · ${(n.links || []).length} cabled`));
-  const tb = el('label', 'chk');
+  const head = el('div', 'phead');
+  head.appendChild(el('span', 'd', `${n.interface_count || 0} interfaces, ${(n.links || []).length} connected`));
+  const lab = el('label');
   const cb = el('input'); cb.type = 'checkbox'; cb.checked = prefs.traffic;
   cb.addEventListener('change', () => setTraffic(cb.checked));
-  tb.appendChild(cb); tb.appendChild(document.createTextNode(' live traffic (REST counters, no console)'));
-  head.appendChild(tb);
+  lab.appendChild(cb); lab.appendChild(document.createTextNode('Live counters'));
+  head.appendChild(lab);
   d.appendChild(head);
-  if (!(n.links || []).length) { d.appendChild(el('div', 'empty', 'No cabling.')); return d; }
-  const rows = n.links.map((l) => {
+  if (!(n.links || []).length) { d.appendChild(el('div', 'side-empty', 'No links.')); return d; }
+  const t = gridTable(['Local', 'Peer', 'Subnet', 'Rate', 'Drops']);
+  n.links.forEach((l) => {
     const r = prefs.traffic ? linkRates[l.link_id] : null;
-    const drops = r ? el('span', r.drops > 0 ? 'tag fail' : null, String(r.drops)) : '—';
-    return [shortIf(l.local_iface) + '  ' + l.local_iface, clickable(l.peer, l.peer + ' ' + l.peer_iface),
-            l.subnet || '—', r ? (r.pps >= 1 ? Math.round(r.pps) + ' pkt/s' : 'quiet') : (prefs.traffic ? '…' : '—'), drops];
+    const tr = el('tr', 'row');
+    tr.appendChild(el('td', 'm', shortIf(l.local_iface)));
+    const peer = el('td', 'm');
+    const a = el('a', null, l.peer + ' ' + shortIf(l.peer_iface));
+    a.href = '#';
+    a.addEventListener('click', (e) => { e.preventDefault(); select(l.peer, true); });
+    peer.appendChild(a);
+    tr.appendChild(peer);
+    tr.appendChild(el('td', 'm', l.subnet || '-'));
+    tr.appendChild(el('td', 'm', r ? (r.pps >= 1 ? Math.round(r.pps) + ' pps' : 'idle') : prefs.traffic ? '...' : '-'));
+    tr.appendChild(el('td', 'm ' + (r && r.drops > 0 ? 's-bad' : ''), r ? String(r.drops) : '-'));
+    t.appendChild(tr);
   });
-  d.appendChild(table(rows, ['Local', 'Peer', 'Subnet', 'Traffic', 'Drops']));
+  d.appendChild(t);
   return d;
 }
 
-function setTraffic(on) {
-  prefs.traffic = on; savePrefs();
-  $('#show-traffic').checked = on;
-  if (on) startTraffic(); else stopTraffic();
-  if (dockTab === 'interfaces') renderDock();
-}
-
-/* --------------------------------------------------------------- dhcp ---- */
-function paneDhcp(n) {
-  const box = el('div');
-  box.appendChild(el('h3', null, 'DHCP lease — design'));
-  box.appendChild(table([
+function sideDhcp(n) {
+  const d = el('div');
+  d.appendChild(sect('Design', props([
     [n.dhcp.kind === 'client' ? 'Leases on' : 'Probe SVI',
      `${n.dhcp.interface} (VLAN ${n.dhcp.vlan}${n.dhcp.vlan_name ? ' ' + n.dhcp.vlan_name : ''})`],
     ['Scope', n.dhcp.scope],
-    ['Server / length', `${n.dhcp.expected_server} · ${n.dhcp.expected_lease_secs / 3600}h`],
-  ]));
+    ['Server', n.dhcp.expected_server],
+    ['Lease length', n.dhcp.expected_lease_secs / 3600 + ' h'],
+  ])));
 
   if (n.probe_family === 'ios' && n.up) {
-    box.appendChild(el('h3', null, 'Live lease'));
-    const b = el('button', 'primary', 'Read live lease (~15s)');
     const out = el('div');
+    const acts = el('div', 'acts');
+    const b = el('button', 'default', 'Read live lease');
+    b.title = 'Runs show dhcp lease on the node; about 15 s';
     b.addEventListener('click', async () => {
-      b.disabled = true; b.textContent = 'Reading…';
+      b.disabled = true; b.textContent = 'Reading...';
       try {
         const j = await getJSON('/api/dhcp/' + encodeURIComponent(n.label));
         out.innerHTML = '';
-        if (j.error) out.appendChild(el('div', 'note warn', j.error));
+        if (j.error) out.appendChild(el('div', 'pmsg warn', j.error));
         else {
-          out.appendChild(table([
+          out.appendChild(props([
             ['Address', j.address + ' / ' + (j.mask || '')],
-            ['Server', j.server + (j.server_matches ? ' (matches design)' : ' — NOT the expected server')],
+            ['Server', j.server_matches ? j.server : colored(j.server + ' (not the expected server)', 's-bad')],
             ['State', j.state],
             ['Renews in', fmtSecs(j.renewal_secs)],
             ['Rebinds in', fmtSecs(j.rebind_secs)],
           ]));
           startLeaseTicker(out, j);
         }
-      } catch (e) { out.appendChild(el('div', 'note fail', String(e))); }
-      b.disabled = false; b.textContent = 'Read live lease (~15s)';
+      } catch (e) { out.appendChild(el('div', 'pmsg bad', String(e))); }
+      b.disabled = false; b.textContent = 'Read live lease';
     });
-    box.appendChild(b);
-    box.appendChild(out);
+    acts.appendChild(b);
+    d.appendChild(sect('Live lease', [acts, out]));
   } else if (n.dhcp.kind === 'client') {
-    box.appendChild(el('div', 'note',
-      'The live remaining time exists only on the node itself, and this image ' +
-      'has no command that reports it.'));
+    d.appendChild(el('div', 'pmsg',
+      'The remaining lease time exists only on the node itself, and this image has no command that reports it.'));
   }
-  return box;
+  return d;
 }
 
 function fmtSecs(s) {
-  if (s == null) return '—';
+  if (s == null) return '-';
   const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60);
-  return `${h}h ${m}m (${s}s)`;
+  return `${h} h ${m} min (${s} s)`;
 }
 
 /* Tick the renewal countdown client-side from the moment it was read.  The
  * number is honest: it names its read time rather than pretending to be live. */
 function startLeaseTicker(container, lease) {
   if (lease.renewal_secs == null) return;
-  const line = el('div', 'note');
+  const line = el('div', 'pmsg');
   container.appendChild(line);
   const t0 = Date.now();
   const paint = () => {
-    const gone = Math.floor((Date.now() - t0) / 1000);
-    const left = lease.renewal_secs - gone;
+    const left = lease.renewal_secs - Math.floor((Date.now() - t0) / 1000);
     line.textContent = left > 0
-      ? `Renewal in ${fmtSecs(left)} — counted from the read at ${lease.read_at}`
-      : 'Renewal time has passed — read again for the current lease.';
+      ? `Renewal in ${fmtSecs(left)}, counted from the read at ${lease.read_at}.`
+      : 'Renewal time has passed. Read again for the current lease.';
   };
   paint();
   const iv = setInterval(() => { if (!line.isConnected) clearInterval(iv); else paint(); }, 1000);
 }
 
-/* ------------------------------------------------------------ console ---- */
-/* Console scrollback with no attach.  For a container, line 0 is the service's
- * own log — dnsmasq queries, RADIUS rejections — which is direct evidence of
- * what the service did, at ~0.03s instead of a 6s console attach. */
-const consoleCache = new Map();
-
-function paneConsole(n) {
-  const box = el('div');
-  const bar = el('div', 'term-bar');
-  const btn = el('button', 'primary',
-    n.console_line === 1 ? 'Read service log (no attach)' : 'Read console scrollback');
-  bar.appendChild(btn);
-  bar.appendChild(el('span', 'lbl mono', `line ${n.console_line === 1 ? '0 — service stdout' : '0'} · last 60 lines`));
-  box.appendChild(bar);
-  const term = el('div', 'term');
-  const cached = consoleCache.get(n.label);
-  term.textContent = cached || `${n.label} — press the button to read the scrollback.\nNothing is attached; this is a REST read of the console log.`;
-  box.appendChild(term);
-  btn.addEventListener('click', async () => {
-    btn.disabled = true;
-    term.textContent = 'reading…';
-    try {
-      const j = await getJSON('/api/console-log/' + encodeURIComponent(n.label) + '?lines=60');
-      term.textContent = j.error ? '! ' + j.error : ((j.log || '').trim() || '(empty)');
-      if (!j.error) consoleCache.set(n.label, term.textContent);
-      term.scrollTop = term.scrollHeight;
-    } catch (e) { term.textContent = '! ' + String(e); }
-    btn.disabled = false;
-  });
-  requestAnimationFrame(() => { term.scrollTop = term.scrollHeight; });
-  return box;
-}
-
-/* -------------------------------------------------------------- probe ---- */
-function paneProbe(n) {
-  const box = el('div');
-  box.appendChild(el('h3', null, 'Ping ' + n.label + ' from…'));
-
-  const sources = NODES.filter((x) => x.can_source_probe && x.up && x.label !== n.label)
-    .sort((a, b) => a.label.localeCompare(b.label));
+/* ---------------------------------------------------------------- ping --- */
+function sidePing(n) {
+  const d = el('div');
+  const sources = NODES.filter((x) => x.can_source_probe && x.up && x.label !== n.label).sort(byLabel);
   if (!sources.length) {
-    box.appendChild(el('div', 'note warn', 'No running node can source a probe right now.'));
+    d.appendChild(el('div', 'pmsg warn', 'No running node can source a ping right now.'));
   } else {
-    const form = el('div', 'probe');
+    const f = el('div', 'form');
+    const l1 = el('label', null, 'From');
     const src = el('select');
     sources.forEach((x) => {
-      const o = el('option', null, x.label + (x.site ? ' (' + x.site + ')' : ''));
+      const o = el('option', null, x.label + (x.site ? '  (' + x.site + ')' : ''));
       o.value = x.label;
       src.appendChild(o);
     });
     if (n.lastSource && sources.some((x) => x.label === n.lastSource)) src.value = n.lastSource;
-    form.appendChild(src);
+    l1.appendChild(src);
+    f.appendChild(l1);
 
     // Target list: live-read addresses first (what the device actually holds
-    // right now), manifest addresses after — labelled so it's clear which is
-    // which. A live entry that matches the manifest's primary is marked so the
-    // common case still reads as one obvious default.
+    // right now), manifest addresses after, labelled so it's clear which is
+    // which.
+    const l2 = el('label', null, 'To address');
     const dst = el('select');
     const liveAddrs = ((n.live || {}).addresses || []).filter((a) => a.proto === 'up');
     const liveIps = new Set(liveAddrs.map((a) => a.ip));
     liveAddrs.forEach((a) => {
-      const isPrimary = a.ip === n.primary_ip;
-      const o = el('option', null, `${a.ip} — ${a.iface} (live${isPrimary ? ', = manifest primary' : ''})`);
+      const o = el('option', null, `${a.ip}  ${a.iface}, live${a.ip === n.primary_ip ? ', manifest primary' : ''}`);
       o.value = a.ip;
       dst.appendChild(o);
     });
     (n.addresses || []).forEach((a) => {
-      if (liveIps.has(a.value)) return;   // already listed as a live entry
-      const o = el('option', null, `${a.value} — ${a.label} (manifest${n.live ? ', not confirmed live' : ''})`);
+      if (liveIps.has(a.value)) return;
+      const o = el('option', null, `${a.value}  ${a.label}, manifest${n.live ? ', not seen live' : ''}`);
       o.value = a.value;
       dst.appendChild(o);
     });
     if (!dst.children.length) {
-      const o = el('option', null, 'no address known — run "Read addresses" or pick a source only');
+      const o = el('option', null, 'No address known. Read addresses first.');
       o.value = ''; o.disabled = true;
       dst.appendChild(o);
     }
-    form.appendChild(dst);
+    l2.appendChild(dst);
+    f.appendChild(l2);
 
-    const dnsToggle = el('label');
+    const row = el('div', 'row2');
+    const lab = el('label');
+    lab.style.display = 'flex';
     const cDns = el('input'); cDns.type = 'checkbox';
     const hasShellVantage = NODES.some((x) => x.probe_family === 'linux' && x.up);
     cDns.checked = !!(n.dns || {}).fqdn && hasShellVantage;
     cDns.disabled = !(n.dns || {}).fqdn || !hasShellVantage;
-    dnsToggle.appendChild(cDns);
-    dnsToggle.appendChild(document.createTextNode('+ DNS'));
-    form.appendChild(dnsToggle);
-
-    const go = el('button', 'primary', 'Ping');
+    lab.appendChild(cDns);
+    lab.appendChild(document.createTextNode('Also resolve the DNS name'));
+    row.appendChild(lab);
+    const go = el('button', 'default', 'Ping');
+    go.style.marginLeft = 'auto';
     go.addEventListener('click', () => {
       n.lastSource = src.value;
       runProbe(src.value, n.label, dst.value || null, cDns.checked ? ['ip', 'dns'] : ['ip']);
     });
-    form.appendChild(go);
-    box.appendChild(form);
+    row.appendChild(go);
+    f.appendChild(row);
+    d.appendChild(sect('Ping ' + n.label, f));
   }
-
   const mine = probeJobs.filter((j) => j.target === n.label).slice(0, 6);
-  if (mine.length) box.appendChild(el('h3', null, 'Results'));
-  mine.forEach((j) => box.appendChild(jobBlock(j)));
-  return box;
+  if (mine.length) d.appendChild(sect('Results', mine.map(jobBlock)));
+  return d;
 }
 
 async function runProbe(source, target, target_ip, methods) {
-  const job = { id: null, source, target, target_ip, status: 'queued', stage: 'Queuing', eta: 25, t0: Date.now() };
+  const job = { source, target, target_ip, status: 'queued', stage: 'queued', eta: 25, t0: Date.now() };
   probeJobs.unshift(job);
   refreshProbeViews();
   try {
@@ -1056,7 +896,7 @@ async function runProbe(source, target, target_ip, methods) {
     });
     const j = await r.json();
     if (!r.ok) { job.status = 'error'; job.error = j.error; refreshProbeViews(); return; }
-    Object.assign(job, { id: j.job_id, eta: j.eta_seconds || 25, target_ip: j.target_ip, status: 'running' });
+    Object.assign(job, { eta: j.eta_seconds || 25, target_ip: j.target_ip, status: 'running' });
     refreshProbeViews();
     for (;;) {
       await new Promise((ok) => setTimeout(ok, 1500));
@@ -1064,176 +904,389 @@ async function runProbe(source, target, target_ip, methods) {
       job.stage = res.stage || job.stage;
       if (res.status === 'done') { job.status = 'done'; job.result = res.result; break; }
       if (res.status === 'error') { job.status = 'error'; job.error = res.error; break; }
-      refreshProbeViews(true);
+      document.querySelectorAll(`[data-job="${job.t0}"]`).forEach((s) => { s.textContent = job.stage; });
     }
   } catch (e) { job.status = 'error'; job.error = String(e); }
   refreshProbeViews();
 }
 
-/* Progress ticks only repaint the live bits; a finished job repaints the pane. */
-function refreshProbeViews(soft) {
-  if (!soft) { renderProbeOverlay(); if (dockTab === 'probe' || dockTab === 'lab:probes') renderDock(); else renderDockTabs(); return; }
-  document.querySelectorAll('[data-job-stage]').forEach((s) => {
-    const j = probeJobs.find((x) => String(x.t0) === s.dataset.jobStage);
-    if (j) s.textContent = (j.stage || '') + '…';
-  });
+function refreshProbeViews() {
+  renderPathOverlay();
+  if (selected && sideTab === 'ping') renderSide();
+  if (paneTab === 'pings') renderPaneBody();
+  renderPaneTabs();
 }
+
 function jobBlock(job) {
   if (job.status === 'done') return resultBlock(job.result);
-  if (job.status === 'error') return el('div', 'note fail', `${job.source} → ${job.target}: probe failed — ${job.error}`);
-  const box = el('div', 'note');
-  box.appendChild(el('div', null, `${job.source} → ${job.target}${job.target_ip ? ' (' + job.target_ip + ')' : ''}`));
-  const st = el('div', 'mono', (job.stage || '') + '…');
-  st.dataset.jobStage = String(job.t0);
+  const box = el('div', 'result');
+  const h = el('div', 'h');
+  h.appendChild(el('span', null, `${job.source} to ${job.target}`));
+  if (job.status === 'error') {
+    h.appendChild(el('span', 's-bad', 'failed'));
+    box.appendChild(h);
+    box.appendChild(el('div', 's-bad', job.error));
+    return box;
+  }
+  h.appendChild(el('span', 's-dim', job.target_ip || ''));
+  box.appendChild(h);
+  const st = el('div', 's-dim', job.stage);
+  st.dataset.job = String(job.t0);
   box.appendChild(st);
-  const bar = el('div', 'progress'); const fill = el('i'); bar.appendChild(fill);
+  const bar = el('div', 'meter'); const fill = el('i'); bar.appendChild(fill);
   const pct = () => Math.min(97, (Date.now() - job.t0) / 1000 / job.eta * 100) + '%';
   fill.style.width = pct();
-  const iv = setInterval(() => { if (!fill.isConnected) clearInterval(iv); else fill.style.width = pct(); }, 1000);
+  const iv = setInterval(() => { if (!fill.isConnected) clearInterval(iv); else fill.style.width = pct(); }, 500);
   box.appendChild(bar);
   return box;
 }
 
 function resultBlock(res) {
   const v = res.verdict || {};
-  const box = el('div', 'note ' + (v.level === 'ok' ? 'ok' : v.level === 'fail' ? 'fail' : 'warn'));
-  box.appendChild(el('div', null, `${res.source} → ${res.target}: ${v.text || ''}`));
-
+  const box = el('div', 'result');
+  const h = el('div', 'h');
+  h.appendChild(el('span', null, `${res.source} to ${res.target}`));
+  h.appendChild(el('span', v.level === 'ok' ? 's-ok' : v.level === 'fail' ? 's-bad' : 's-warn', v.text || ''));
+  box.appendChild(h);
   const bits = [];
   const p = res.ping_ip || res.ping_dns;
   if (p) {
     bits.push(`loss ${p.loss_pct}% (${p.received}/${p.sent})`);
-    if (p.rtt_ms && p.rtt_ms.avg != null) bits.push(`rtt ${p.rtt_ms.min}/${p.rtt_ms.avg}/${p.rtt_ms.max}ms`);
+    if (p.rtt_ms && p.rtt_ms.avg != null) bits.push(`rtt ${p.rtt_ms.min}/${p.rtt_ms.avg}/${p.rtt_ms.max} ms`);
   }
   if (res.dns && res.dns.ok) {
-    bits.push(`dns ${res.dns.fqdn} → ${res.dns.addresses[0]}` +
-      (res.dns.matches_manifest === false ? ' (MISMATCH vs manifest)' : ''));
+    bits.push(`${res.dns.fqdn} = ${res.dns.addresses[0]}` +
+      (res.dns.matches_manifest === false ? ' (does NOT match manifest)' : ''));
   } else if (res.dns) {
     bits.push('dns: ' + (res.dns.reason || 'no answer'));
   }
-  bits.push(res.elapsed_s + 's');
-  box.appendChild(el('div', 'mono', bits.join(' · ')));
-
+  bits.push(res.elapsed_s + ' s');
+  box.appendChild(el('div', 'm', bits.join('   ')));
   if (p && p.packet_pattern) {
     const pat = el('div', 'pattern');
     [...p.packet_pattern].forEach((ch) => pat.appendChild(el('span', ch === '!' ? null : 'miss', ch)));
     box.appendChild(pat);
   }
-  (res.notes || []).forEach((t) => box.appendChild(el('div', null, t)));
+  (res.notes || []).forEach((t) => box.appendChild(el('div', 's-dim', t)));
   return box;
 }
 
-/* ===================================================== lab-wide tools ==== */
-/* Each lab tool has the same run/poll shape: a status endpoint, a run
- * endpoint, a 4s poll while running, and a pane in the dock.  The poll keeps
- * going while the tab is closed so the tab badge stays honest. */
-function labTool(def) {
+/* =========================================================== bottom pane == */
+function showPane(k) {
+  paneTab = k;
+  if (prefs.paneMin) { prefs.paneMin = false; savePrefs(); applyPane(); }
+  renderPane();
+  if (LAB[k] && LAB[k].refresh) LAB[k].refresh();
+}
+
+function renderPane() { renderPaneTabs(); renderPaneBody(); }
+
+function renderPaneTabs() {
+  const tabs = $('#pane-tabs');
+  tabs.innerHTML = '';
+  const add = (key, title, badge, closable) => {
+    const b = el('button', 'tab' + (paneTab === key ? ' on' : ''), title);
+    if (badge) b.appendChild(el('span', 'n ' + (badge.level || ''), badge.text));
+    b.addEventListener('click', () => showPane(key));
+    if (closable) {
+      const x = el('span', 'close');
+      x.title = 'Close';
+      x.appendChild(X_ICON());
+      x.addEventListener('click', (e) => { e.stopPropagation(); closeConsole(key.slice(4)); });
+      b.appendChild(x);
+    }
+    tabs.appendChild(b);
+  };
+  const vis = NODES.filter((n) => shown(n) && matches(n)).length;
+  add('nodes', 'Nodes', { text: String(vis) });
+  Object.entries(LAB).forEach(([k, t]) => add(k, t.title, t.badge()));
+  consoles.forEach((l) => add('con:' + l, 'Console: ' + l, null, true));
+  const min = el('button', 'end', prefs.paneMin ? 'Restore' : 'Minimize');
+  min.addEventListener('click', () => { prefs.paneMin = !prefs.paneMin; savePrefs(); applyPane(); renderPane(); });
+  tabs.appendChild(min);
+}
+
+function renderPaneBody() {
+  if (prefs.paneMin) return;
+  const body = $('#pane-body');
+  const scroll = body.scrollTop;
+  body.innerHTML = '';
+  if (paneTab === 'nodes') body.appendChild(nodeTable());
+  else if (paneTab.startsWith('con:')) body.appendChild(consolePane(paneTab.slice(4)));
+  else if (LAB[paneTab]) LAB[paneTab].draw(body);
+  body.scrollTop = scroll;
+}
+
+function applyPane() {
+  document.documentElement.style.setProperty('--pane-h', prefs.paneH + 'px');
+  $('.center').classList.toggle('pane-min', prefs.paneMin);
+}
+
+/* ------------------------------------------------------------ node table - */
+const COLS = [
+  ['label', 'Node', (n) => n.label],
+  ['state', 'State', (n) => stateWord(n)[0]],
+  ['kind', 'Type', (n) => KIND_NAME[kind(n)]],
+  ['role', 'Role', (n) => n.role_title || ''],
+  ['site', 'Site', (n) => n.site || ''],
+  ['ip', 'Address', (n) => displayIp(n).text],
+  ['dns', 'DNS name', (n) => (n.dns || {}).fqdn || ''],
+  ['issues', 'Flags', (n) => flags(n).join(', ')],
+];
+
+function flags(n) {
+  const f = [];
+  if (n.ghost) f.push('absent');
+  if (n.config_status === 'undeclared') f.push('undeclared');
+  if (displayIp(n).drift) f.push('address drift');
+  (n.issues || []).forEach((i) => f.push('#' + i.id));
+  return f;
+}
+
+function groupKey(n) {
+  return {
+    layer: () => [n.layer, n.layer_title || n.layer],
+    site:  () => [n.site || '~', n.site || 'No site (carrier / shared)'],
+    role:  () => [n.role || '~', n.role_title || 'Not declared in manifest'],
+    state: () => n.ghost ? ['c', 'Declared but absent'] : n.up ? ['a', 'Running'] : ['b', 'Stopped'],
+    none:  () => ['', ''],
+  }[prefs.groupBy]();
+}
+
+function nodeTable() {
+  const wrap = el('div');
+  const head = el('div', 'phead');
+  const gl = el('label', null, 'Group by ');
+  const gs = el('select');
+  [['layer', 'Layer'], ['site', 'Site'], ['role', 'Role'], ['state', 'State'], ['none', 'None']].forEach(([v, t]) => {
+    const o = el('option', null, t); o.value = v; gs.appendChild(o);
+  });
+  gs.value = prefs.groupBy;
+  gs.addEventListener('change', () => { prefs.groupBy = gs.value; savePrefs(); renderPaneBody(); });
+  gl.appendChild(gs);
+  head.appendChild(gl);
+  const hl = el('label');
+  const hc = el('input'); hc.type = 'checkbox'; hc.checked = prefs.hideDown;
+  hc.addEventListener('change', () => { prefs.hideDown = hc.checked; savePrefs(); refilter(); });
+  hl.appendChild(hc); hl.appendChild(document.createTextNode('Hide stopped'));
+  head.appendChild(hl);
+  head.appendChild(el('span', 'd', 'Double-click a row for its console log. Right-click for actions.'));
+  wrap.appendChild(head);
+
+  const vis = NODES.filter((n) => shown(n) && matches(n));
+  if (!vis.length) { wrap.appendChild(el('div', 'pmsg', 'No nodes match the filter.')); return wrap; }
+  const col = COLS.find((c) => c[0] === prefs.sort) || COLS[0];
+  vis.sort((a, b) => (String(col[2](a)).localeCompare(String(col[2](b)), undefined, { numeric: true }) || byLabel(a, b)) * prefs.sortDir);
+
+  const t = el('table', 'g');
+  const hr = el('tr');
+  COLS.forEach(([k, title]) => {
+    const th = el('th', 'sortable' + (prefs.sort === k ? ' sorted' : ''), title + (prefs.sort === k ? (prefs.sortDir > 0 ? '  (a-z)' : '  (z-a)') : ''));
+    th.addEventListener('click', () => {
+      prefs.sortDir = prefs.sort === k ? -prefs.sortDir : 1;
+      prefs.sort = k; savePrefs(); renderPaneBody();
+    });
+    hr.appendChild(th);
+  });
+  t.appendChild(hr);
+
+  const groups = new Map();
+  vis.forEach((n) => {
+    const [k, title] = groupKey(n);
+    if (!groups.has(k)) groups.set(k, { title, nodes: [] });
+    groups.get(k).nodes.push(n);
+  });
+  const order = prefs.groupBy === 'layer'
+    ? INV.layers.map((l) => l.key).filter((k) => groups.has(k)) : [...groups.keys()].sort();
+  order.forEach((k) => {
+    const g = groups.get(k);
+    if (prefs.groupBy !== 'none') {
+      const tr = el('tr', 'grp');
+      const td = el('td', null, `${g.title}   ${g.nodes.filter((n) => n.up).length} of ${g.nodes.length} running`);
+      td.colSpan = COLS.length;
+      tr.appendChild(td);
+      t.appendChild(tr);
+    }
+    g.nodes.forEach((n) => t.appendChild(nodeRow(n)));
+  });
+  wrap.appendChild(t);
+  return wrap;
+}
+
+function nodeRow(n) {
+  const tr = el('tr', 'row' + (n.up || n.ghost ? '' : ' off') + (n.label === selected ? ' sel' : ''));
+  tr.dataset.label = n.label;
+  const c0 = el('td'); c0.appendChild(lamp(n)); c0.appendChild(document.createTextNode(n.label)); tr.appendChild(c0);
+  const [sw, sc] = stateWord(n);
+  tr.appendChild(el('td', sc, sw));
+  tr.appendChild(el('td', null, KIND_NAME[kind(n)]));
+  tr.appendChild(el('td', null, n.role_title || ''));
+  tr.appendChild(el('td', null, n.site || ''));
+  const ip = displayIp(n);
+  tr.appendChild(el('td', 'm' + (ip.drift ? ' s-warn' : ''), ip.text + (ip.text && !ip.live ? '  (manifest)' : '')));
+  tr.appendChild(el('td', 'm', (n.dns || {}).fqdn || ''));
+  const fl = flags(n);
+  tr.appendChild(el('td', fl.includes('absent') ? 's-bad' : fl.length ? 's-warn' : null, fl.join(', ')));
+  tr.addEventListener('click', () => select(n.label, true));
+  tr.addEventListener('dblclick', () => { if (!n.ghost) openConsole(n.label); });
+  tr.addEventListener('contextmenu', (e) => { e.preventDefault(); select(n.label); nodeMenu(n, e.clientX, e.clientY); });
+  tr.addEventListener('mouseenter', () => { hovered = n.label; highlight(); });
+  tr.addEventListener('mouseleave', () => { hovered = null; highlight(); });
+  return tr;
+}
+
+function markTableSelection() {
+  document.querySelectorAll('#pane-body tr.row').forEach((tr) => tr.classList.toggle('sel', tr.dataset.label === selected));
+}
+
+function refilter() {
+  renderPaneTabs();
+  if (paneTab === 'nodes') renderPaneBody();
+  highlight(); renderStatus();
+}
+
+/* ------------------------------------------------------------- console --- */
+/* Console scrollback with no attach.  For a container, line 0 is the service's
+ * own log (dnsmasq queries, RADIUS rejections), which is direct evidence of
+ * what the service did, at ~0.03s instead of a 6s console attach. */
+function openConsole(label) {
+  if (!consoles.includes(label)) consoles.push(label);
+  showPane('con:' + label);
+  if (!consoleText.has(label)) readConsole(label);
+}
+function closeConsole(label) {
+  const i = consoles.indexOf(label);
+  if (i >= 0) consoles.splice(i, 1);
+  if (paneTab === 'con:' + label) paneTab = consoles.length ? 'con:' + consoles[consoles.length - 1] : 'nodes';
+  renderPane();
+}
+async function readConsole(label) {
+  consoleText.set(label, 'reading...');
+  if (paneTab === 'con:' + label) renderPaneBody();
+  try {
+    const j = await getJSON('/api/console-log/' + encodeURIComponent(label) + '?lines=60');
+    consoleText.set(label, j.error ? 'error: ' + j.error : ((j.log || '').trim() || '(empty)'));
+  } catch (e) { consoleText.set(label, 'error: ' + e); }
+  if (paneTab === 'con:' + label) renderPaneBody();
+}
+function consolePane(label) {
+  const n = BY.get(label);
+  const wrap = el('div', 'term-wrap');
+  const head = el('div', 'phead');
+  const b = el('button', null, 'Read again');
+  b.addEventListener('click', () => readConsole(label));
+  head.appendChild(b);
+  head.appendChild(el('span', 'd', n && n.console_line === 1
+    ? 'Console line 0 (service output). Read over REST, no console attach. Last 60 lines.'
+    : 'Console line 0 scrollback. Read over REST, no console attach. Last 60 lines.'));
+  wrap.appendChild(head);
+  const sc = el('div', 'scroll');
+  sc.appendChild(el('pre', 'term', consoleText.get(label) || ''));
+  wrap.appendChild(sc);
+  requestAnimationFrame(() => { sc.scrollTop = sc.scrollHeight; });
+  return wrap;
+}
+
+/* ===================================================== lab-wide checks ==== */
+/* Each check has the same run/poll shape: a status endpoint, a run endpoint,
+ * a 4s poll while running, and a tab in the bottom pane.  The poll keeps
+ * going while the tab is closed so the tab's count stays honest. */
+function labCheck(def) {
   const t = Object.assign({ st: null, timer: null }, def);
   t.refresh = async () => {
     try { t.st = await getJSON(t.statusUrl); } catch (e) { return; }
     if (t.onStatus) t.onStatus(t.st);
     const running = t.st.status === 'running';
     if (running && !t.timer) t.timer = setInterval(t.refresh, 4000);
-    if (!running && t.timer) { clearInterval(t.timer); t.timer = null; if (t.onDone) t.onDone(t.st); }
-    if (dockTab === 'lab:' + t.key) renderDock(); else renderDockTabs();
+    if (!running && t.timer) { clearInterval(t.timer); t.timer = null; }
+    renderPaneTabs();
+    if (paneTab === t.key) renderPaneBody();
   };
-  t.run = async (body) => {
-    const r = await fetch(t.runUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: body || '{}' });
+  t.run = async () => {
+    const r = await fetch(t.runUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
     const j = await r.json();
     t.runError = j.error || null;
     t.eta = j.eta_seconds ? j : null;
     await t.refresh();
   };
   t.draw = (body) => {
-    if (!t.st) { body.appendChild(el('div', 'empty', 'Loading…')); t.refresh(); return; }
+    if (!t.st) { body.appendChild(el('div', 'pmsg', 'Loading...')); return; }
     t.render(body, t.st);
   };
   return t;
 }
 
-function paneHead(title, btn, extra) {
-  const head = el('div', 'pane-head');
-  head.appendChild(el('h2', null, title));
-  head.appendChild(btn);
-  (extra || []).forEach((x) => x && head.appendChild(x));
+function checkHead(t, st, label, runningText, desc, extra) {
+  const head = el('div', 'phead');
+  const b = el('button', 'default', st.status === 'running' ? runningText : label);
+  b.disabled = st.status === 'running';
+  b.addEventListener('click', () => t.run());
+  head.appendChild(b);
+  if (st.status === 'running') head.appendChild(el('span', 's-warn', `running, ${st.done_count} of ${st.total}`));
+  if (extra) head.appendChild(extra);
+  if (st.status === 'error') head.appendChild(el('span', 's-bad', st.error));
+  if (t.runError) head.appendChild(el('span', 's-bad', t.runError));
+  head.appendChild(el('span', 'd', desc));
   return head;
+}
+
+function gridTable(heads) {
+  const t = el('table', 'g');
+  const hr = el('tr');
+  heads.forEach((h) => hr.appendChild(el('th', null, h)));
+  t.appendChild(hr);
+  return t;
 }
 
 const LAB = {};
 
-LAB.matrix = labTool({
+const MATRIX_OK = ['pass', 'pass-arp', 'as-expected'];
+LAB.matrix = labCheck({
   key: 'matrix', title: 'Baseline matrix', statusUrl: '/api/matrix', runUrl: '/api/matrix/run',
   badge() {
     const st = this.st;
     if (!st) return null;
     if (st.status === 'running') return { text: `${st.done_count}/${st.total}`, level: 'warn' };
     if (!st.rows || !st.rows.length) return null;
-    const bad = st.rows.filter((r) => ['leak', 'dead', 'error', 'partial'].includes(r.outcome) ||
-      (!['pass', 'pass-arp', 'as-expected', 'source-down', 'target-down'].includes(r.outcome)));
-    const leak = st.rows.some((r) => r.outcome === 'leak');
-    return bad.length ? { text: String(bad.length), level: leak ? 'fail' : 'warn' } : { text: '✓', level: 'ok' };
+    const bad = st.rows.filter((r) => !MATRIX_OK.includes(r.outcome) && !['source-down', 'target-down'].includes(r.outcome));
+    if (st.rows.some((r) => r.outcome === 'leak')) return { text: 'LEAK', level: 'bad' };
+    return bad.length ? { text: bad.length + ' failed', level: 'bad' } : { text: 'all pass', level: 'ok' };
   },
   render(box, st) {
-    const btn = el('button', 'primary', st.status === 'running' ? `Running ${st.done_count}/${st.total}…` : 'Run all ' + st.total);
-    btn.disabled = st.status === 'running';
-    btn.addEventListener('click', () => LAB.matrix.run());
-    box.appendChild(paneHead('Baseline reachability', btn, [
-      this.eta && st.status === 'running' ? el('span', 'lbl', `~${Math.round(this.eta.eta_seconds / 60)} min`) : null,
-      st.status === 'done' ? el('span', 'lbl', 'finished ' + st.ended) : null,
-      st.status === 'error' ? el('span', 'tag fail', st.error) : null,
-      this.runError ? el('span', 'tag fail', this.runError) : null,
-    ]));
-    box.appendChild(el('div', 'note',
-      'The curated baseline from probe_matrix.py — every path a disaster scenario relies on. ' +
-      'Two paths are DECLARED must-fails (the perimeter denying an internet client): those ' +
-      'passing would be a leak, which is the more serious event. Click a row to show the path on the canvas.'));
+    box.appendChild(checkHead(this, st, `Run all ${st.total}`, 'Running...',
+      'Paths from probe_matrix.py. "Must fail" rows are perimeter denies; one passing is a leak. Hover a row to see it on the canvas.',
+      st.status === 'done' ? el('span', 's-dim', 'finished ' + st.ended) : null));
     const done = new Map((st.rows || []).map((r) => [r.source + '>' + r.dest, r]));
-    const t = el('table', 't');
-    const hr = el('tr');
-    ['', 'Source', 'Destination', 'What it proves', 'Loss', 'RTT'].forEach((h) => hr.appendChild(el('th', null, h)));
-    t.appendChild(hr);
+    const t = gridTable(['Result', 'Source', 'Destination', 'Checks', 'Loss', 'RTT']);
     (st.probes || []).forEach((p) => {
       const r = done.get(p.source + '>' + p.dest);
-      const tr = el('tr', 'click');
-      const tag = !r ? el('span', 'tag', p.expected_fail ? 'must fail' : 'pending')
-        : r.outcome === 'pass' ? el('span', 'tag ok', 'pass')
-        : r.outcome === 'pass-arp' ? el('span', 'tag ok', 'pass (1st pkt ARP)')
-        : r.outcome === 'as-expected' ? el('span', 'tag ok', 'denied ✓')
-        : r.outcome === 'leak' ? el('span', 'tag fail', 'LEAK')
-        : r.outcome === 'source-down' ? el('span', 'tag warn', 'src down')
-        : r.outcome === 'target-down' ? el('span', 'tag warn', 'target off')
-        : el('span', 'tag ' + (r.verdict === 'partial' ? 'warn' : 'fail'), r.verdict);
-      const td0 = el('td'); td0.appendChild(tag); tr.appendChild(td0);
+      const [txt, cls] = !r ? [p.expected_fail ? 'must fail' : 'not run', 's-dim']
+        : r.outcome === 'pass' ? ['pass', 's-ok']
+        : r.outcome === 'pass-arp' ? ['pass (1st packet ARP)', 's-ok']
+        : r.outcome === 'as-expected' ? ['denied, as expected', 's-ok']
+        : r.outcome === 'leak' ? ['LEAK', 's-bad']
+        : r.outcome === 'source-down' ? ['source stopped', 's-warn']
+        : r.outcome === 'target-down' ? ['target stopped', 's-warn']
+        : [r.verdict, r.verdict === 'partial' ? 's-warn' : 's-bad'];
+      const tr = el('tr', 'row');
+      tr.appendChild(el('td', cls, txt));
       tr.appendChild(el('td', 'm', p.source));
       tr.appendChild(el('td', 'm', p.dest));
-      tr.appendChild(el('td', null, p.description));
-      tr.appendChild(el('td', 'm', r && r.loss_pct != null ? r.loss_pct + '%' : '—'));
-      tr.appendChild(el('td', 'm', r && r.rtt_ms != null ? r.rtt_ms + 'ms' : '—'));
-      tr.addEventListener('mouseenter', () => flashPath(p.source, p.dest, r));
-      tr.addEventListener('mouseleave', () => renderProbeOverlay());
-      tr.addEventListener('click', () => { const n = BY.get(p.source); if (n) centerOn(n); flashPath(p.source, p.dest, r); });
+      tr.appendChild(el('td', 'wrap', p.description));
+      tr.appendChild(el('td', 'm', r && r.loss_pct != null ? r.loss_pct + '%' : '-'));
+      tr.appendChild(el('td', 'm', r && r.rtt_ms != null ? r.rtt_ms + ' ms' : '-'));
+      const lvl = !r ? 'run' : MATRIX_OK.includes(r.outcome) ? 'ok'
+        : r.outcome === 'leak' || ['dead', 'error'].includes(r.verdict) ? 'bad' : 'warn';
+      tr.addEventListener('mouseenter', () => drawPath(p.source, p.dest, lvl));
+      tr.addEventListener('mouseleave', renderPathOverlay);
+      tr.addEventListener('click', () => { const n = BY.get(p.source); if (n) centerOn(n); });
       t.appendChild(tr);
     });
     box.appendChild(t);
   },
 });
 
-/* Draw a matrix path on the canvas while its row is hovered.  Matrix rows name
- * nodes by label; a row naming something not on the canvas just draws nothing. */
-function flashPath(src, dst, r) {
-  const a = BY.get(src), b = BY.get(dst);
-  const ov = $('#overlay');
-  ov.innerHTML = '';
-  if (!a || !b) return;
-  const lvl = !r ? 'run' : ['pass', 'pass-arp', 'as-expected'].includes(r.outcome) ? 'ok'
-    : r.outcome === 'leak' || r.verdict === 'dead' || r.verdict === 'error' ? 'fail' : 'warn';
-  const mx = (a.x + b.x) / 2, my = (a.y + b.y) / 2;
-  const dx = b.x - a.x, dy = b.y - a.y, len = Math.hypot(dx, dy) || 1, bend = Math.min(90, len * 0.25);
-  ov.appendChild(svg('path', { d: `M${a.x} ${a.y}Q${mx - dy / len * bend} ${my + dx / len * bend} ${b.x} ${b.y}`,
-                               class: 'probe-line ' + lvl }));
-}
-
-LAB.dns = labTool({
+LAB.dns = labCheck({
   key: 'dns', title: 'DNS audit', statusUrl: '/api/dnsaudit', runUrl: '/api/dnsaudit/run',
   badge() {
     const st = this.st;
@@ -1241,53 +1294,38 @@ LAB.dns = labTool({
     if (st.status === 'running') return { text: `${st.done_count}/${st.total}`, level: 'warn' };
     if (!st.rows || !st.rows.length) return null;
     const bad = st.rows.filter((r) => !r.match).length;
-    return bad ? { text: String(bad), level: 'fail' } : { text: '✓', level: 'ok' };
+    return bad ? { text: bad + ' wrong', level: 'bad' } : { text: 'all match', level: 'ok' };
   },
   render(box, st) {
-    const btn = el('button', 'primary', st.status === 'running' ? `Auditing ${st.done_count}/${st.total}…` : 'Check every name');
-    btn.disabled = st.status === 'running';
-    btn.addEventListener('click', () => LAB.dns.run());
-    box.appendChild(paneHead('DNS audit', btn, [
-      st.status === 'error' ? el('span', 'tag fail', st.error) : null,
-      this.runError ? el('span', 'tag fail', this.runError) : null,
-    ]));
-    box.appendChild(el('div', 'note',
-      'Asks each site’s resolver for every internal name, from a desktop at that ' +
-      'site, and compares the answer to the manifest. A mismatch is a resolver ' +
-      'confidently serving a stale address — the failure no ping test can see.'));
+    box.appendChild(checkHead(this, st, 'Check every name', 'Checking...',
+      'Asks each site\'s resolver for every internal name and compares the answer with the manifest.'));
     const rows = st.rows || [];
     if (!rows.length) return;
     const bad = rows.filter((r) => !r.match);
-    box.appendChild(el('div', 'note ' + (bad.length ? 'warn' : 'ok'),
+    box.appendChild(el('div', 'pmsg ' + (bad.length ? 'bad' : 'ok'),
       st.status === 'done'
-        ? (bad.length ? `${bad.length} of ${rows.length} names do NOT match the manifest.`
-                      : `All ${rows.length} names resolve to exactly what the manifest says.`)
-        : `${rows.length} checked so far, ${bad.length} problem(s).`));
-    const t = el('table', 't');
-    const hr = el('tr');
-    ['', 'Name', 'Manifest', 'Resolver answered'].forEach((h) => hr.appendChild(el('th', null, h)));
-    t.appendChild(hr);
-    // Problems first, then a compact confirmation of the rest.
+        ? (bad.length ? `${bad.length} of ${rows.length} names do not match the manifest.`
+                      : `All ${rows.length} names resolve to what the manifest says.`)
+        : `${rows.length} checked so far, ${bad.length} wrong.`));
+    const t = gridTable(['Result', 'Name', 'Manifest', 'Resolver answered']);
+    // Problems first, then the rest.
     bad.concat(rows.filter((r) => r.match)).forEach((r) => {
-      const tr = el('tr');
-      const td0 = el('td');
-      td0.appendChild(r.match ? el('span', 'tag ok', 'ok')
-        : r.ok ? el('span', 'tag fail', 'STALE') : el('span', 'tag warn', 'no answer'));
-      tr.appendChild(td0);
+      const tr = el('tr', 'row');
+      const [txt, cls] = r.match ? ['ok', 's-ok'] : r.ok ? ['STALE', 's-bad'] : ['no answer', 's-warn'];
+      tr.appendChild(el('td', cls, txt));
       tr.appendChild(el('td', 'm', r.fqdn));
       tr.appendChild(el('td', 'm', r.expected));
-      tr.appendChild(el('td', 'm', r.answer || (r.reason || '—')));
+      tr.appendChild(el('td', 'm', r.answer || r.reason || '-'));
       t.appendChild(tr);
     });
     box.appendChild(t);
   },
 });
 
-// Read live addresses off every reachable device's console, so the whole page
-// (canvas labels, ping targets, cabling) can prefer device truth over manifest
-// intent.
-LAB.harvest = labTool({
-  key: 'harvest', title: 'Addresses', statusUrl: '/api/harvest', runUrl: '/api/harvest/run',
+// Read live addresses off every reachable device's console, so the canvas,
+// node table and ping targets can prefer device truth over manifest intent.
+LAB.harvest = labCheck({
+  key: 'harvest', title: 'Live addresses', statusUrl: '/api/harvest', runUrl: '/api/harvest/run',
   onStatus(st) { applyHarvestToNodes(st); },
   badge() {
     const st = this.st;
@@ -1296,132 +1334,198 @@ LAB.harvest = labTool({
     const read = NODES.filter((n) => n.live);
     if (!read.length) return null;
     const drift = read.filter((n) => n.live.error || (n.live_ip && n.live_ip !== n.primary_ip)).length;
-    return drift ? { text: String(drift), level: 'warn' } : { text: '✓', level: 'ok' };
+    return drift ? { text: drift + ' differ', level: 'warn' } : { text: 'all match', level: 'ok' };
   },
   render(box, st) {
-    const btn = el('button', 'primary', st.status === 'running' ? `Reading ${st.done_count}/${st.total}…` : 'Read every device');
-    btn.disabled = st.status === 'running';
-    btn.addEventListener('click', () => LAB.harvest.run());
     const eta = this.eta && st.status === 'running'
-      ? el('span', 'lbl', `~${this.eta.eta_seconds}${this.eta.eta_seconds_max ? '–' + this.eta.eta_seconds_max : ''}s`) : null;
-    box.appendChild(paneHead('Live addresses', btn, [
-      eta,
-      st.status === 'error' ? el('span', 'tag fail', st.error) : null,
-      this.runError ? el('span', 'tag fail', this.runError) : null,
-    ]));
-    box.appendChild(el('div', 'note',
-      'Reads addresses straight off each device — `show ip interface brief` (IOS), ' +
-      '`show interface ip brief` (ASA), `ip -4 -o addr show` (Linux, containers on ' +
-      'console line 1) — instead of trusting the manifest. Runs across a pool of ' +
-      'parallel console sessions (docs/cml-integration-review.md).'));
+      ? el('span', 's-dim', `about ${this.eta.eta_seconds}${this.eta.eta_seconds_max ? '-' + this.eta.eta_seconds_max : ''} s`) : null;
+    box.appendChild(checkHead(this, st, 'Read every device', 'Reading...',
+      'Reads interface addresses off each device console (IOS, ASA, Linux) instead of trusting the manifest.', eta));
     const nodes = NODES.filter((n) => n.live);
     if (!nodes.length) return;
     const drift = nodes.filter((n) => n.live.error || (n.live_ip && n.live_ip !== n.primary_ip));
-    box.appendChild(el('div', 'note ' + (drift.length ? 'warn' : 'ok'),
+    box.appendChild(el('div', 'pmsg ' + (drift.length ? 'warn' : 'ok'),
       st.status === 'done'
-        ? (drift.length ? `${drift.length} of ${nodes.length} read nodes disagree with, or lack, a manifest match.`
-                        : `All ${nodes.length} read nodes match their manifest primary address.`)
-        : `${nodes.length} read so far, ${drift.length} disagreement(s).`));
-    const t = el('table', 't');
-    const hr = el('tr');
-    ['', 'Node', 'Live address', 'Manifest primary'].forEach((h) => hr.appendChild(el('th', null, h)));
-    t.appendChild(hr);
+        ? (drift.length ? `${drift.length} of ${nodes.length} nodes differ from, or have no match in, the manifest.`
+                        : `All ${nodes.length} nodes match their manifest primary address.`)
+        : `${nodes.length} read so far, ${drift.length} differ.`));
+    const t = gridTable(['Result', 'Node', 'Live address', 'Manifest primary']);
     drift.concat(nodes.filter((n) => !drift.includes(n))).forEach((n) => {
-      const tr = el('tr', 'click');
-      const td0 = el('td');
-      td0.appendChild(n.live.error ? el('span', 'tag fail', 'read failed')
-        : n.live_ip === n.primary_ip ? el('span', 'tag ok', 'match')
-        : el('span', 'tag warn', 'DRIFT'));
-      tr.appendChild(td0);
+      const tr = el('tr', 'row');
+      const [txt, cls] = n.live.error ? ['read failed', 's-bad'] : n.live_ip === n.primary_ip ? ['match', 's-ok'] : ['differs', 's-warn'];
+      tr.appendChild(el('td', cls, txt));
       tr.appendChild(el('td', 'm', n.label));
       tr.appendChild(el('td', 'm', n.live.error || n.live_ip || '(no up interface with an address)'));
-      tr.appendChild(el('td', 'm', n.primary_ip || '—'));
-      tr.addEventListener('click', () => { select(n.label, true); dockTab = 'addresses'; renderDock(); });
+      tr.appendChild(el('td', 'm', n.primary_ip || '-'));
+      tr.addEventListener('click', () => { sideTab = 'addresses'; select(n.label, true); });
       t.appendChild(tr);
     });
     box.appendChild(t);
   },
 });
 
-LAB.probes = {
-  key: 'probes', title: 'Ping log',
+LAB.pings = {
+  key: 'pings', title: 'Ping log',
   badge() {
-    const run = probeJobs.filter((j) => j.status === 'queued' || j.status === 'running').length;
-    return run ? { text: run + '…', level: 'warn' } : probeJobs.length ? { text: String(probeJobs.length) } : null;
+    const run = probeJobs.filter((j) => !['done', 'error'].includes(j.status)).length;
+    return run ? { text: run + ' running', level: 'warn' } : probeJobs.length ? { text: String(probeJobs.length) } : null;
   },
-  refresh() {},
   draw(box) {
-    box.appendChild(paneHead('Ping log', el('span', 'lbl', 'this session · newest first')));
     if (!probeJobs.length) {
-      box.appendChild(el('div', 'empty', 'No pings yet. Select a node → Ping tab.'));
+      box.appendChild(el('div', 'pmsg', 'No pings this session. Select a node, then use its Ping tab.'));
       return;
     }
     probeJobs.forEach((j) => {
       const b = jobBlock(j);
       b.style.cursor = 'pointer';
-      b.addEventListener('click', () => { select(j.target, true); dockTab = 'probe'; renderDock(); });
+      b.addEventListener('click', () => { sideTab = 'ping'; select(j.target, true); });
       box.appendChild(b);
     });
   },
 };
 
 /* Merge harvested per-node results into the in-memory NODES so the canvas,
- * tree and ping targets reflect live data without a full inventory reload.
- * Same selection rule as app.py::_live_primary: the interface carrying the
- * manifest's declared primary wins over any other manifest-known address. */
+ * node table and ping targets reflect live data without an inventory reload.
+ * Same rule as app.py::_live_primary: the interface carrying the manifest's
+ * declared primary wins over any other manifest-known address. */
 function applyHarvestToNodes(st) {
   if (!st || !st.nodes) return;
   let changed = false;
   NODES.forEach((n) => {
     const rec = st.nodes[n.label];
-    if (!rec || rec === n.live) return;
+    if (!rec || JSON.stringify(rec) === JSON.stringify(n.live)) return;
     n.live = rec;
-    const upAddrs = (rec.addresses || []).filter((a) => a.proto === 'up');
+    const up = (rec.addresses || []).filter((a) => a.proto === 'up');
     const manifestIps = new Set((n.addresses || []).map((a) => a.value));
-    const pick = upAddrs.find((a) => a.ip === n.primary_ip)
-      || upAddrs.find((a) => manifestIps.has(a.ip)) || upAddrs[0];
+    const pick = up.find((a) => a.ip === n.primary_ip) || up.find((a) => manifestIps.has(a.ip)) || up[0];
     n.live_ip = pick ? pick.ip : null;
     changed = true;
   });
-  if (changed) { renderTree(); renderCanvas(); }
+  if (changed) {
+    renderCanvas();
+    if (paneTab === 'nodes') renderPaneBody();
+    if (selected) renderSide();
+  }
+}
+
+/* ================================================================ menus == */
+let openMenu = null;
+
+function menuItems(which) {
+  const toggle = (label, on, fn, key) => ({ label, on, fn, key });
+  if (which === 'lab') return [
+    { label: 'Read addresses from devices', fn: () => { LAB.harvest.run(); showPane('harvest'); } },
+    { label: 'Run baseline matrix', fn: () => { LAB.matrix.run(); showPane('matrix'); } },
+    { label: 'Run DNS audit', fn: () => { LAB.dns.run(); showPane('dns'); } },
+    '-',
+    { label: 'Export inventory as CSV', fn: () => { location.href = '/api/export.csv'; } },
+  ];
+  if (which === 'view') return [
+    toggle('Address labels', prefs.ip, () => { prefs.ip = !prefs.ip; $('#show-ip').checked = prefs.ip; savePrefs(); renderCanvas(); }),
+    toggle('Interface labels', prefs.iface, () => { prefs.iface = !prefs.iface; $('#show-if').checked = prefs.iface; savePrefs(); renderCanvas(); }),
+    toggle('Link traffic', prefs.traffic, () => setTraffic(!prefs.traffic)),
+    '-',
+    { label: 'Fit lab to window', key: 'F', fn: fit },
+    { label: 'Clear selection', key: 'Esc', fn: () => select(null) },
+    '-',
+    { head: 'Theme' },
+    toggle('Follow system', !prefs.theme, () => setTheme(null)),
+    toggle('Light', prefs.theme === 'light', () => setTheme('light')),
+    toggle('Dark', prefs.theme === 'dark', () => setTheme('dark')),
+    '-',
+    { label: `Show hidden nodes (${hidden.size})`, disabled: !hidden.size, fn: unhideAll },
+    toggle('Pause auto-refresh', paused, togglePause),
+  ];
+  return [
+    { label: 'Node table', fn: () => showPane('nodes') },
+    { label: 'Baseline matrix', fn: () => showPane('matrix') },
+    { label: 'DNS audit', fn: () => showPane('dns') },
+    { label: 'Live addresses', fn: () => showPane('harvest') },
+    { label: 'Ping log', fn: () => showPane('pings') },
+  ];
+}
+
+function buildMenu(items, box) {
+  items.forEach((it) => {
+    if (it === '-') { box.appendChild(el('div', 'msep')); return; }
+    if (it.head) { box.appendChild(el('div', 'mhead', it.head)); return; }
+    const b = el('button', 'mi' + (it.on ? ' on' : ''));
+    b.appendChild(el('span', null, it.label));
+    if (it.key) b.appendChild(el('span', 'k', it.key));
+    b.disabled = !!it.disabled;
+    b.addEventListener('click', (e) => { e.stopPropagation(); closeMenus(); it.fn(); });
+    box.appendChild(b);
+  });
+}
+
+function toggleMenu(m) {
+  const was = openMenu === m;
+  closeMenus();
+  if (was) return;
+  const dd = el('div', 'dropdown');
+  buildMenu(menuItems(m.dataset.menu), dd);
+  m.appendChild(dd);
+  m.classList.add('open');
+  openMenu = m;
+}
+
+function closeMenus() {
+  document.querySelectorAll('.dropdown').forEach((d) => d.remove());
+  document.querySelectorAll('.menu.open').forEach((m) => m.classList.remove('open'));
+  $('#ctxmenu').hidden = true;
+  openMenu = null;
+}
+
+function nodeMenu(n, x, y) {
+  closeMenus();
+  const box = $('#ctxmenu');
+  box.innerHTML = '';
+  const ip = displayIp(n).text, fqdn = (n.dns || {}).fqdn;
+  buildMenu([
+    { label: 'Properties', fn: () => { sideTab = 'node'; select(n.label); } },
+    { label: 'Console log', disabled: n.ghost, fn: () => openConsole(n.label) },
+    { label: 'Ping this node...', disabled: n.ghost, fn: () => { sideTab = 'ping'; select(n.label); } },
+    { label: 'Interfaces', fn: () => { sideTab = 'interfaces'; select(n.label); } },
+    '-',
+    { label: 'Copy address', disabled: !ip, fn: () => navigator.clipboard.writeText(ip) },
+    { label: 'Copy DNS name', disabled: !fqdn, fn: () => navigator.clipboard.writeText(fqdn) },
+    '-',
+    { label: 'Center in view', fn: () => centerOn(n, true) },
+    { label: 'Hide node', fn: () => hideNode(n.label) },
+  ], box);
+  box.hidden = false;
+  const r = box.getBoundingClientRect();
+  box.style.left = Math.min(x, innerWidth - r.width - 4) + 'px';
+  box.style.top = Math.min(y, innerHeight - r.height - 4) + 'px';
+}
+
+function unhideAll() {
+  hidden.clear();
+  store.set(HIDE_KEY, []);
+  renderAll();
+}
+
+function togglePause() {
+  paused = !paused;
+  $('#pause').textContent = paused ? 'Resume' : 'Pause';
+  $('#tick').textContent = paused ? 'paused' : countdown + 's';
+}
+
+function setTheme(t) { prefs.theme = t; savePrefs(); applyTheme(); }
+function applyTheme() {
+  if (prefs.theme) document.documentElement.dataset.theme = prefs.theme;
+  else delete document.documentElement.dataset.theme;
 }
 
 /* ------------------------------------------------------------- controls -- */
 function wire() {
-  // site segment
-  document.querySelectorAll('#site-seg button').forEach((b) => {
-    b.classList.toggle('on', b.dataset.site === site);
-    b.addEventListener('click', () => {
-      site = b.dataset.site;
-      store.set(SITE_KEY, site);
-      document.querySelectorAll('#site-seg button').forEach((x) =>
-        x.classList.toggle('on', x.dataset.site === site));
-      renderTree(); highlight(); renderStatus();
-    });
-  });
-  const refilter = () => { renderTree(); highlight(); renderStatus(); };
+  const siteSel = $('#site');
+  siteSel.value = site;
+  siteSel.addEventListener('change', () => { site = siteSel.value; store.set(SITE_KEY, site); refilter(); });
   $('#q').addEventListener('input', refilter);
-  $('#groupby').addEventListener('change', renderTree);
-  $('#hide-down').addEventListener('change', refilter);
-  $('#hidden-btn').addEventListener('click', () => {
-    hidden.clear();
-    store.set(HIDE_KEY, []);
-    renderAll();
-  });
+  $('#hidden-btn').addEventListener('click', unhideAll);
+  $('#pause').addEventListener('click', togglePause);
 
-  // header actions open the matching dock tab
-  document.querySelectorAll('.top-actions [data-tab]').forEach((b) =>
-    b.addEventListener('click', () => openLab(b.dataset.tab)));
-  $('#theme-btn').addEventListener('click', () => {
-    const dark = document.documentElement.dataset.theme
-      ? document.documentElement.dataset.theme === 'dark'
-      : matchMedia('(prefers-color-scheme: dark)').matches;
-    prefs.theme = dark ? 'light' : 'dark';
-    savePrefs(); applyTheme();
-  });
-  $('#nav-toggle').addEventListener('click', () => document.body.classList.toggle('nav-open'));
-
-  // canvas toggles
   $('#show-ip').checked = prefs.ip;
   $('#show-if').checked = prefs.iface;
   $('#show-traffic').checked = prefs.traffic;
@@ -1432,41 +1536,39 @@ function wire() {
   $('#zoom-out').addEventListener('click', () => zoomAt(0.8));
   $('#zoom-fit').addEventListener('click', fit);
 
+  document.querySelectorAll('.menu').forEach((m) => {
+    m.firstElementChild.addEventListener('click', (e) => { e.stopPropagation(); toggleMenu(m); });
+    m.addEventListener('mouseenter', () => { if (openMenu && openMenu !== m) toggleMenu(m); });
+  });
+  document.addEventListener('click', (e) => { if (!e.target.closest('.dropdown, .ctxmenu')) closeMenus(); });
+  window.addEventListener('blur', closeMenus);
+
   wireCanvas();
   wireSplitter();
-  applyDock();
-
-  $('#pause').addEventListener('click', () => {
-    paused = !paused;
-    $('#pause').textContent = paused ? 'Resume' : 'Pause';
-    $('#tick').textContent = paused ? '⏸' : countdown + 's';
-  });
+  applyPane();
 
   document.addEventListener('keydown', (e) => {
     const typing = /INPUT|SELECT|TEXTAREA/.test(document.activeElement.tagName);
-    if (e.key === '/' && !typing) { e.preventDefault(); closeNav(false); $('#q').focus(); }
-    if (e.key === 'Escape') { if (typing) document.activeElement.blur(); else select(null); }
-    if ((e.key === 'f' || e.key === 'F') && !typing && !e.metaKey && !e.ctrlKey) fit();
+    if (e.key === 'Escape') {
+      closeMenus();
+      if (typing) document.activeElement.blur();
+      else { select(null); document.body.classList.remove('side-open'); }
+    }
+    if (typing) return;
+    if (e.key === '/') { e.preventDefault(); $('#q').focus(); }
+    if ((e.key === 'f' || e.key === 'F') && !e.metaKey && !e.ctrlKey) fit();
   });
 }
 
-function closeNav(close = true) {
-  if (close) document.body.classList.remove('nav-open');
-  else document.body.classList.add('nav-open');
-}
-
-function applyTheme() {
-  if (prefs.theme) document.documentElement.dataset.theme = prefs.theme;
-  else delete document.documentElement.dataset.theme;
-}
-
-/* Pan by dragging the background, zoom with the wheel or a pinch, click a
- * node to select it, click empty canvas to clear the selection. */
+/* Drag the background to pan, wheel or pinch to zoom, click a node to select
+ * it, click empty canvas to clear, double-click for the console log,
+ * right-click for the node menu. */
 function wireCanvas() {
   const c = $('#canvas');
   let drag = null;
   const pointers = new Map();
   c.addEventListener('pointerdown', (e) => {
+    if (e.button === 2) return;
     pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
     const nodeEl = e.target.closest('.node');
     drag = { x: e.clientX, y: e.clientY, vx: view.x, vy: view.y, moved: false, node: nodeEl && nodeEl.dataset.label };
@@ -1474,14 +1576,14 @@ function wireCanvas() {
   });
   c.addEventListener('pointermove', (e) => {
     if (pointers.has(e.pointerId)) pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
-    if (pointers.size === 2) {            // pinch zoom
+    if (pointers.size === 2) {
       const [p, q] = [...pointers.values()];
-      const d = Math.hypot(p.x - q.x, p.y - q.y);
+      const dist = Math.hypot(p.x - q.x, p.y - q.y);
       if (drag && drag.pinch) {
         const r = c.getBoundingClientRect();
-        zoomAt(d / drag.pinch, (p.x + q.x) / 2 - r.left, (p.y + q.y) / 2 - r.top);
+        zoomAt(dist / drag.pinch, (p.x + q.x) / 2 - r.left, (p.y + q.y) / 2 - r.top);
       }
-      if (drag) { drag.pinch = d; drag.moved = true; }
+      if (drag) { drag.pinch = dist; drag.moved = true; }
       return;
     }
     if (!drag) {
@@ -1500,7 +1602,10 @@ function wireCanvas() {
   const end = (e) => {
     pointers.delete(e.pointerId);
     if (!drag) return;
-    if (!drag.moved) select(drag.node || null);
+    if (!drag.moved) {
+      select(drag.node || null);
+      if (!drag.node) document.body.classList.remove('side-open');
+    }
     if (pointers.size === 0) drag = null;
     c.classList.remove('panning');
   };
@@ -1514,7 +1619,15 @@ function wireCanvas() {
   }, { passive: false });
   c.addEventListener('dblclick', (e) => {
     const nodeEl = e.target.closest('.node');
-    if (nodeEl) { dockTab = 'probe'; select(nodeEl.dataset.label); }
+    if (nodeEl && !BY.get(nodeEl.dataset.label).ghost) openConsole(nodeEl.dataset.label);
+  });
+  c.addEventListener('contextmenu', (e) => {
+    const nodeEl = e.target.closest('.node');
+    e.preventDefault();
+    if (!nodeEl) return;
+    const n = BY.get(nodeEl.dataset.label);
+    select(n.label);
+    nodeMenu(n, e.clientX, e.clientY);
   });
   let t = null;
   window.addEventListener('resize', () => { clearTimeout(t); t = setTimeout(fit, 150); });
@@ -1524,23 +1637,21 @@ function wireSplitter() {
   const sp = $('#splitter');
   sp.addEventListener('pointerdown', (e) => {
     sp.setPointerCapture(e.pointerId);
-    sp.classList.add('drag');
-    const main = $('.main').getBoundingClientRect();
+    const box = $('.center').getBoundingClientRect();
     const move = (ev) => {
-      prefs.dockH = Math.round(Math.max(120, Math.min(main.height - 120, main.bottom - ev.clientY)));
-      prefs.dockMin = false;
-      applyDock();
+      prefs.paneH = Math.round(Math.max(100, Math.min(box.height - 120, box.bottom - ev.clientY)));
+      prefs.paneMin = false;
+      applyPane();
     };
     const up = () => {
-      sp.classList.remove('drag');
       sp.removeEventListener('pointermove', move);
       sp.removeEventListener('pointerup', up);
-      savePrefs(); renderDock();
+      savePrefs(); renderPane();
     };
     sp.addEventListener('pointermove', move);
     sp.addEventListener('pointerup', up);
   });
-  sp.addEventListener('dblclick', () => { prefs.dockMin = !prefs.dockMin; savePrefs(); applyDock(); renderDock(); });
+  sp.addEventListener('dblclick', () => { prefs.paneMin = !prefs.paneMin; savePrefs(); applyPane(); renderPane(); });
 }
 
 boot();

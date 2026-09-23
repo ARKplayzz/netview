@@ -3,72 +3,56 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>NetView — P45 lab</title>
+<title>NetView - P45</title>
 <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
 </head>
 <body>
 
-<!-- ============================================================ top bar -->
-<header class="topbar">
-  <button class="icon-btn only-narrow" id="nav-toggle" title="Nodes">☰</button>
-  <div class="brand">
-    <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="5" cy="12" r="2.4"/><circle cx="19" cy="5" r="2.4"/><circle cx="19" cy="19" r="2.4"/><path d="M7 11l10-5M7 13l10 5M19 7.5v9"/></svg>
-    <span>NetView</span>
-  </div>
-  <nav class="crumbs">
-    <span>Labs</span><i>›</i><b>P45 estate</b>
-    <span class="pill" id="lab-pill">loading…</span>
-  </nav>
-  <div class="top-actions">
-    <button id="harvest-btn" data-tab="harvest">Read addresses</button>
-    <button id="matrix-btn" data-tab="matrix">Baseline matrix</button>
-    <button id="dns-btn" data-tab="dns">DNS audit</button>
-    <a class="btn" href="/api/export.csv">Export CSV</a>
-    <button class="icon-btn" id="theme-btn" title="Toggle light / dark"><svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><circle cx="12" cy="12" r="8" fill="none" stroke="currentColor" stroke-width="2"/><path d="M12 4a8 8 0 0 1 0 16z" fill="currentColor"/></svg></button>
-  </div>
-</header>
+<!-- menu bar -->
+<div class="menubar" id="menubar">
+  <span class="appname">NetView</span>
+  <div class="menu" data-menu="lab"><button>Lab</button></div>
+  <div class="menu" data-menu="view"><button>View</button></div>
+  <div class="menu" data-menu="tools"><button>Tools</button></div>
+  <span class="labname">P45 estate</span>
+  <span class="grow"></span>
+  <span class="menu-note" id="lab-state">loading</span>
+</div>
 
-<div class="workspace">
+<!-- toolbar -->
+<div class="toolbar">
+  <button id="zoom-fit" title="Fit lab to window (F)">Fit</button>
+  <button id="zoom-in" title="Zoom in">Zoom in</button>
+  <button id="zoom-out" title="Zoom out">Zoom out</button>
+  <span class="tsep"></span>
+  <span class="tlabel">Show</span>
+  <label><input type="checkbox" id="show-ip" checked>Addresses</label>
+  <label><input type="checkbox" id="show-if">Interfaces</label>
+  <label><input type="checkbox" id="show-traffic">Link traffic</label>
+  <span class="grow"></span>
+  <label class="tlabel" for="site">Site</label>
+  <select id="site">
+    <option value="all">All</option>
+    <option value="HQ">HQ</option>
+    <option value="DR">DR</option>
+    <option value="other">Carrier / home</option>
+  </select>
+  <input type="search" id="q" placeholder="Find node, IP, name, VLAN (/)">
+</div>
 
-  <!-- ========================================================== sidebar -->
-  <aside class="sidebar" id="sidebar">
-    <div class="side-head">
-      <input type="search" id="q" placeholder="Filter nodes, IPs, DNS, VLANs…  /">
-      <div class="seg" id="site-seg">
-        <button data-site="all" class="on">All</button>
-        <button data-site="HQ">HQ</button>
-        <button data-site="DR">DR</button>
-        <button data-site="other">Other</button>
-      </div>
-      <div class="side-opts">
-        <select id="groupby" title="Group nodes">
-          <option value="layer">By layer</option>
-          <option value="site">By site</option>
-          <option value="role">By role</option>
-          <option value="state">By state</option>
-        </select>
-        <label><input type="checkbox" id="hide-down"> Hide stopped</label>
-      </div>
-    </div>
-    <div class="tree" id="tree"></div>
-    <button class="hidden-reset" id="hidden-btn" hidden></button>
-  </aside>
+<div class="infobar" id="banners" hidden></div>
 
-  <!-- ============================================================= main -->
-  <section class="main">
-    <div class="canvas-wrap" id="canvas-wrap">
-      <div class="notices" id="banners"></div>
-
-      <div class="canvas-tools left">
-        <label class="chk"><input type="checkbox" id="show-ip" checked> Addresses</label>
-        <label class="chk"><input type="checkbox" id="show-if"> Interfaces</label>
-        <label class="chk"><input type="checkbox" id="show-traffic"> Link traffic</label>
-      </div>
-
+<div class="work">
+  <div class="center">
+    <div class="canvas-wrap">
       <svg id="canvas" class="canvas" tabindex="0" aria-label="Lab topology">
         <defs>
-          <pattern id="grid" width="20" height="20" patternUnits="userSpaceOnUse">
-            <circle cx="1" cy="1" r="1" class="grid-dot"/>
+          <pattern id="grid-s" width="20" height="20" patternUnits="userSpaceOnUse">
+            <path d="M20 0H0V20" class="grid-s"/>
+          </pattern>
+          <pattern id="grid" width="100" height="100" patternUnits="userSpaceOnUse">
+            <rect width="100" height="100" fill="url(#grid-s)"/>
+            <path d="M100 0H0V100" class="grid-l"/>
           </pattern>
         </defs>
         <rect class="canvas-bg" width="100%" height="100%" fill="url(#grid)"/>
@@ -78,35 +62,34 @@
           <g id="nodes"></g>
         </g>
       </svg>
-
-      <div class="canvas-tools right">
-        <button class="icon-btn" id="zoom-in" title="Zoom in">+</button>
-        <button class="icon-btn" id="zoom-out" title="Zoom out">−</button>
-        <button class="icon-btn" id="zoom-fit" title="Fit lab (F)">⤢</button>
-      </div>
-
-      <div class="legend" id="legend"></div>
+      <div class="zoomread" id="zoomread"></div>
     </div>
 
-    <div class="splitter" id="splitter" title="Drag to resize"></div>
+    <div class="splitter" id="splitter"></div>
 
-    <!-- ========================================================= dock -->
-    <section class="dock" id="dock">
-      <div class="dock-tabs" id="dock-tabs"></div>
-      <div class="dock-body" id="dock-body"></div>
+    <section class="pane" id="pane">
+      <div class="pane-tabs" id="pane-tabs"></div>
+      <div class="pane-body" id="pane-body"></div>
     </section>
-  </section>
+  </div>
+
+  <aside class="side" id="side">
+    <div class="side-tabs" id="side-tabs"></div>
+    <div class="side-body" id="side-body"></div>
+  </aside>
 </div>
 
-<!-- ============================================================ status -->
-<footer class="statusbar">
-  <span id="src-line">–</span>
-  <span id="counts">–</span>
+<div class="statusbar">
+  <span id="src-line"></span>
+  <span id="counts"></span>
+  <button class="linkish" id="hidden-btn" hidden></button>
   <span class="grow"></span>
   <span id="sel-line"></span>
-  <span>refresh <b id="tick">–</b></span>
-  <button id="pause">Pause</button>
-</footer>
+  <span>Next refresh <span id="tick"></span></span>
+  <button class="linkish" id="pause">Pause</button>
+</div>
+
+<div class="ctxmenu" id="ctxmenu" hidden></div>
 
 <script src="{{ url_for('static', filename='app.js') }}"></script>
 </body>
