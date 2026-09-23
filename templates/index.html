@@ -3,52 +3,110 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>NetView — P45 estate</title>
+<title>NetView — P45 lab</title>
 <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
 </head>
 <body>
 
-<header>
-  <div>
-    <h1>NetView</h1>
-    <span class="lbl" id="src-line">loading…</span>
+<!-- ============================================================ top bar -->
+<header class="topbar">
+  <button class="icon-btn only-narrow" id="nav-toggle" title="Nodes">☰</button>
+  <div class="brand">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="5" cy="12" r="2.4"/><circle cx="19" cy="5" r="2.4"/><circle cx="19" cy="19" r="2.4"/><path d="M7 11l10-5M7 13l10 5M19 7.5v9"/></svg>
+    <span>NetView</span>
   </div>
-  <div class="right">
-    <span class="n" id="counts">–</span>
-    <span class="n" id="tick">–</span>
-    <button id="pause">Pause</button>
-    <button id="harvest-btn">Read addresses</button>
-    <button id="matrix-btn">Baseline matrix</button>
-    <button id="dns-btn">DNS audit</button>
-    <a href="/api/export.csv"><button>CSV</button></a>
+  <nav class="crumbs">
+    <span>Labs</span><i>›</i><b>P45 estate</b>
+    <span class="pill" id="lab-pill">loading…</span>
+  </nav>
+  <div class="top-actions">
+    <button id="harvest-btn" data-tab="harvest">Read addresses</button>
+    <button id="matrix-btn" data-tab="matrix">Baseline matrix</button>
+    <button id="dns-btn" data-tab="dns">DNS audit</button>
+    <a class="btn" href="/api/export.csv">Export CSV</a>
+    <button class="icon-btn" id="theme-btn" title="Toggle light / dark"><svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><circle cx="12" cy="12" r="8" fill="none" stroke="currentColor" stroke-width="2"/><path d="M12 4a8 8 0 0 1 0 16z" fill="currentColor"/></svg></button>
   </div>
 </header>
 
-<div class="bar">
-  <div class="seg" id="site-seg">
-    <button data-site="all" class="on">All</button>
-    <button data-site="HQ">HQ</button>
-    <button data-site="DR">DR</button>
-    <button data-site="other">Other</button>
-  </div>
-  <input type="search" id="q" placeholder="filter: name, IP, DNS, role, VLAN…  ( / )">
-  <select id="groupby">
-    <option value="layer">By layer</option>
-    <option value="site">By site</option>
-    <option value="role">By role</option>
-    <option value="state">By state</option>
-  </select>
-  <label><input type="checkbox" id="hide-down"> hide stopped</label>
-  <button id="hidden-btn" hidden></button>
+<div class="workspace">
+
+  <!-- ========================================================== sidebar -->
+  <aside class="sidebar" id="sidebar">
+    <div class="side-head">
+      <input type="search" id="q" placeholder="Filter nodes, IPs, DNS, VLANs…  /">
+      <div class="seg" id="site-seg">
+        <button data-site="all" class="on">All</button>
+        <button data-site="HQ">HQ</button>
+        <button data-site="DR">DR</button>
+        <button data-site="other">Other</button>
+      </div>
+      <div class="side-opts">
+        <select id="groupby" title="Group nodes">
+          <option value="layer">By layer</option>
+          <option value="site">By site</option>
+          <option value="role">By role</option>
+          <option value="state">By state</option>
+        </select>
+        <label><input type="checkbox" id="hide-down"> Hide stopped</label>
+      </div>
+    </div>
+    <div class="tree" id="tree"></div>
+    <button class="hidden-reset" id="hidden-btn" hidden></button>
+  </aside>
+
+  <!-- ============================================================= main -->
+  <section class="main">
+    <div class="canvas-wrap" id="canvas-wrap">
+      <div class="notices" id="banners"></div>
+
+      <div class="canvas-tools left">
+        <label class="chk"><input type="checkbox" id="show-ip" checked> Addresses</label>
+        <label class="chk"><input type="checkbox" id="show-if"> Interfaces</label>
+        <label class="chk"><input type="checkbox" id="show-traffic"> Link traffic</label>
+      </div>
+
+      <svg id="canvas" class="canvas" tabindex="0" aria-label="Lab topology">
+        <defs>
+          <pattern id="grid" width="20" height="20" patternUnits="userSpaceOnUse">
+            <circle cx="1" cy="1" r="1" class="grid-dot"/>
+          </pattern>
+        </defs>
+        <rect class="canvas-bg" width="100%" height="100%" fill="url(#grid)"/>
+        <g id="viewport">
+          <g id="links"></g>
+          <g id="overlay"></g>
+          <g id="nodes"></g>
+        </g>
+      </svg>
+
+      <div class="canvas-tools right">
+        <button class="icon-btn" id="zoom-in" title="Zoom in">+</button>
+        <button class="icon-btn" id="zoom-out" title="Zoom out">−</button>
+        <button class="icon-btn" id="zoom-fit" title="Fit lab (F)">⤢</button>
+      </div>
+
+      <div class="legend" id="legend"></div>
+    </div>
+
+    <div class="splitter" id="splitter" title="Drag to resize"></div>
+
+    <!-- ========================================================= dock -->
+    <section class="dock" id="dock">
+      <div class="dock-tabs" id="dock-tabs"></div>
+      <div class="dock-body" id="dock-body"></div>
+    </section>
+  </section>
 </div>
 
-<main>
-  <div id="banners"></div>
-  <div id="harvest" hidden></div>
-  <div id="matrix" hidden></div>
-  <div id="dnsaudit" hidden></div>
-  <div id="groups"></div>
-</main>
+<!-- ============================================================ status -->
+<footer class="statusbar">
+  <span id="src-line">–</span>
+  <span id="counts">–</span>
+  <span class="grow"></span>
+  <span id="sel-line"></span>
+  <span>refresh <b id="tick">–</b></span>
+  <button id="pause">Pause</button>
+</footer>
 
 <script src="{{ url_for('static', filename='app.js') }}"></script>
 </body>

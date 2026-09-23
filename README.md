@@ -23,14 +23,30 @@ app is not used.
 
 ## UI
 
-One column. Search (`/`), a group-by select (layer / site / role / state), a
-hide-stopped toggle, and a per-row **hide** button (hover) with a one-click
-"n hidden — show" reset. Click a row to expand it in place: addresses, DNS,
-VLANs, HA, open issues, cabling, DHCP lease, and the probe controls. No sidebar,
-no drawer.
+Laid out like a CML workbench:
+
+- **Top bar** — lab name, running count, and the lab-wide tools (Read addresses,
+  Baseline matrix, DNS audit, CSV export), plus a light/dark toggle.
+- **Node tree** (left) — filter (`/`), site segment, group-by (layer / site /
+  role / state), hide-stopped, and a per-row **hide** (hover) with a one-click
+  "n hidden — show all" reset.
+- **Canvas** (centre) — every node drawn at its CML x/y with the lab's real
+  cabling, a CML-style device icon per class and a state badge (green check
+  booted, amber booting, grey stopped, red × absent). Drag to pan, scroll or
+  pinch to zoom, `F` to fit. Toggles for address labels, interface labels and
+  live link traffic (REST counters, no console). Filters dim the canvas rather
+  than moving nodes. Nodes with no x/y (declared-but-absent ghosts) sit in a
+  dashed "not on the canvas" frame.
+- **Dock** (bottom, drag to resize, double-click the divider to minimise) —
+  the selected node's tabs (Summary, Addresses & DNS, Interfaces, DHCP, Ping,
+  Console) next to the lab tabs (Baseline matrix, DNS audit, Addresses, Ping
+  log). Tab badges show problem counts. Hovering a matrix row draws that path
+  on the canvas; a running ping draws a marching line from source to target,
+  coloured by the verdict when it lands.
 
 Hidden nodes persist as an **exclusion** list — anything new in the lab defaults
-to visible.
+to visible. Canvas toggles, dock height and collapsed groups are remembered per
+browser.
 
 ## Where the data comes from
 
