@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NetView — P45 estate</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+
+<header>
+  <div>
+    <h1>NetView</h1>
+    <span class="lbl" id="src-line">loading…</span>
+  </div>
+  <div class="right">
+    <span class="n" id="counts">–</span>
+    <span class="n" id="tick">–</span>
+    <button id="pause">Pause</button>
+    <button id="harvest-btn">Read addresses</button>
+    <button id="matrix-btn">Baseline matrix</button>
+    <button id="dns-btn">DNS audit</button>
+    <a href="/api/export.csv"><button>CSV</button></a>
+  </div>
+</header>
+
+<div class="bar">
+  <div class="seg" id="site-seg">
+    <button data-site="all" class="on">All</button>
+    <button data-site="HQ">HQ</button>
+    <button data-site="DR">DR</button>
+    <button data-site="other">Other</button>
+  </div>
+  <input type="search" id="q" placeholder="filter: name, IP, DNS, role, VLAN…  ( / )">
+  <select id="groupby">
+    <option value="layer">By layer</option>
+    <option value="site">By site</option>
+    <option value="role">By role</option>
+    <option value="state">By state</option>
+  </select>
+  <label><input type="checkbox" id="hide-down"> hide stopped</label>
+  <button id="hidden-btn" hidden></button>
+</div>
+
+<main>
+  <div id="banners"></div>
+  <div id="harvest" hidden></div>
+  <div id="matrix" hidden></div>
+  <div id="dnsaudit" hidden></div>
+  <div id="groups"></div>
+</main>
+
+<script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>
