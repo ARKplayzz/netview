@@ -274,6 +274,33 @@ table.p tr.drift td { background: var(--infobg); }
              white-space: nowrap; overflow: hidden; }
 .statusbar .snap { color: var(--bad); font-weight: 700; }
 
+/* path trace */
+.pickbar { background: var(--selbg); border-bottom: 1px solid var(--sel); flex: none; padding: 4px 10px;
+           display: flex; gap: 12px; align-items: baseline; }
+.pickbar .t { font-weight: 700; color: var(--sel); }
+.canvas.picking, .canvas.picking .node { cursor: crosshair; }
+.node.t-nopick { opacity: .25; }
+.node.t-dim, .wire.t-dim { opacity: .1; }
+.node.t-idle { opacity: .45; }
+.node.t-end .sel-box { stroke: var(--sel); stroke-width: 2; stroke-dasharray: none; }
+.node.t-stop .sel-box { stroke: var(--bad); stroke-width: 2.5; stroke-dasharray: none; }
+.t-tag { font: 700 9.5px var(--sans); fill: var(--sel); text-anchor: middle; letter-spacing: .04em;
+         paint-order: stroke; stroke: var(--canvas); stroke-width: 3px; }
+.wire.t-cand { stroke: var(--sel); stroke-dasharray: 5 4; stroke-width: 1.6; }
+.wire.t-both { stroke: var(--ok); stroke-width: 4; }
+.wire.t-one { stroke: var(--warn); stroke-width: 4; stroke-dasharray: 9 3; }
+.wire.t-fwd { stroke: var(--bad); stroke-width: 4; }
+.tdiag { padding: 8px; overflow-x: auto; border-bottom: 1px solid var(--line2); background: var(--canvas); }
+.tdiag svg { display: block; }
+.tdiag .lbl { font-size: 10.5px; }
+.tkey { display: flex; gap: 16px; color: var(--ink2); padding-top: 4px; flex-wrap: wrap; }
+.tkey span { display: flex; gap: 6px; align-items: center; }
+.tcols { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(420px, 100%), 1fr)); gap: 0 1px;
+         background: var(--line2); }
+.tcols > div { background: var(--panel); }
+.tsect-h { padding: 5px 8px; font-weight: 600; background: var(--tool); border-bottom: 1px solid var(--line2); }
+.src { color: var(--ink3); font-size: 11px; margin-left: 6px; white-space: nowrap; }
+
 /* narrow screens: sidebar becomes a sheet over the canvas */
 @media (max-width: 900px) {
   .work { grid-template-columns: minmax(0, 1fr); }

@@ -63,15 +63,7 @@ const byLabel = (a, b) => a.label.localeCompare(b.label, undefined, { numeric: t
 async function boot() {
   applyTheme();
   wire();
-  INV = await getJSON('/api/inventory');
-  NODES = INV.nodes.concat(INV.ghosts.map((g) => Object.assign({
-    ghost: true, up: false, dns: {}, links: [], vlans: [], addresses: [],
-    ha: {}, issues: [], interfaces: [], probe_family: 'none',
-    can_source_probe: false, addressing: 'unaddressed',
-  }, g)));
-  NODES.forEach((n) => BY.set(n.label, n));
-  LINKS = buildLinks();
-  parkUnplaced();
+  await loadInventory(false);
   infobar();
   renderAll();
   fit();
@@ -80,25 +72,41 @@ async function boot() {
   Object.values(LAB).forEach((t) => t.refresh && t.refresh());
 }
 
-async function poll() {
+/* The whole inventory is re-read from the server on every refresh, and the
+ * server re-reads CML (topology, states, addresses, configs) for it, so a
+ * node added, moved, re-cabled or re-addressed in CML appears here on the
+ * next tick.  Only per-session state (pings, consoles, the trace) is kept. */
+async function loadInventory(fresh) {
+  const inv = await getJSON('/api/inventory' + (fresh ? '?fresh=1' : ''));
+  const keep = new Map(NODES.map((n) => [n.label, { lastSource: n.lastSource }]));
+  INV = inv;
+  NODES = INV.nodes.concat(INV.ghosts.map((g) => Object.assign({
+    ghost: true, up: false, dns: {}, links: [], vlans: [], addresses: [],
+    ha: {}, issues: [], interfaces: [], probe_family: 'none',
+    can_source_probe: false, addressing: 'unaddressed',
+  }, g)));
+  BY.clear();
+  NODES.forEach((n) => { Object.assign(n, keep.get(n.label) || {}); BY.set(n.label, n); });
+  LINKS = buildLinks();
+  parkUnplaced();
+  if (selected && !BY.has(selected)) selected = null;
+}
+
+async function poll(fresh) {
   try {
-    const j = await getJSON('/api/state');
-    if (!j.states) return;
-    NODES.forEach((n) => {
-      if (n.ghost) return;
-      if (j.states[n.label] !== undefined) n.state = j.states[n.label];
-      n.up = n.state === 'STARTED' || n.state === 'BOOTED';
-    });
-    renderCanvas(); renderStatus();
+    await loadInventory(fresh);
+    countdown = REFRESH_S;
+    renderCanvas(); renderStatus(); renderPaneTabs();
     if (paneTab === 'nodes') renderPaneBody();
-    if (sideTab === 'node' || !selected) renderSide();
+    if (!selected || ['node', 'addresses', 'interfaces'].includes(sideTab)) renderSide();
+    if (fresh) infobar();
   } catch (e) { /* one missed poll is not worth an error state */ }
 }
 
 function tickSecond() {
   if (paused) return;
   countdown -= 1;
-  if (countdown <= 0) { countdown = REFRESH_S; poll(); }
+  if (countdown <= 0) { countdown = REFRESH_S; poll(false); }
   $('#tick').textContent = countdown + 's';
 }
 
@@ -368,10 +376,12 @@ function renderCanvas() {
   renderPathOverlay();
   highlight();
   paintTraffic();
+  paintTrace();
 }
 
 /* Dim anything the filters exclude; light up the focused node's cabling. */
 function highlight() {
+  if (traceShown()) { paintTrace(); return; }
   const focus = hovered || selected;
   document.querySelectorAll('#nodes .node').forEach((g) => g.classList.toggle('dim', !matches(BY.get(g.dataset.label))));
   document.querySelectorAll('#links > g').forEach((g) => {
@@ -479,8 +489,16 @@ function renderStatus() {
   const m = INV.meta;
   const src = $('#src-line');
   src.innerHTML = '';
-  if (m.topology_source === 'live') src.textContent = 'Topology: live from CML';
-  else src.appendChild(el('span', 'snap', 'Topology: CACHED SNAPSHOT'));
+  if (m.topology_source === 'live') {
+    const t = m.lab_read_at ? new Date(m.lab_read_at).toLocaleTimeString() : '';
+    src.textContent = 'Read from CML ' + t;
+    const bad = Object.entries(m.cml_reads || {}).filter(([, v]) => v).map(([k]) => k);
+    if (bad.length) {
+      const w = el('span', 's-warn', '  (not answered: ' + bad.join(', ') + ')');
+      w.title = Object.entries(m.cml_reads).filter(([, v]) => v).map(([k, v]) => k + ': ' + v).join('\n');
+      src.appendChild(w);
+    }
+  } else src.appendChild(el('span', 'snap', 'CML UNREACHABLE: cached snapshot'));
 
   // Counts follow the site selection, so "3 stopped" means 3 stopped HERE.
   const scope = NODES.filter((n) => !n.ghost && (site === 'all' || siteBucket(n) === site));
@@ -589,6 +607,9 @@ function labSummary() {
     ['Nodes', `${all.length} in lab, ${all.filter((n) => n.up).length} running`],
     ['Undeclared', m.counts.undeclared ? colored(String(m.counts.undeclared), 's-warn') : '0'],
     ['Absent', m.counts.absent ? colored(String(m.counts.absent), 's-bad') : '0'],
+    ['Last read', m.lab_read_at ? new Date(m.lab_read_at).toLocaleTimeString() : '-'],
+    ...Object.entries(m.cml_reads || {}).map(([k, v]) => ['  ' + k.replace(/_/g, ' '), v ? colored('failed: ' + v, 's-bad') : colored('ok', 's-ok')]),
+    ['Manifest', m.manifest ? 'loaded, used for comparison' : 'not found (nothing to compare)'],
   ])));
 
   const byKind = new Map();
@@ -620,36 +641,70 @@ function labSummary() {
   return d;
 }
 
+const SRC_NAME = { cml: 'CML', 'cml-l3': 'seen by CML', 'cml-config': 'CML config', device: 'device',
+                   manifest: 'manifest', label: 'from label' };
+/* A value plus where it came from, so the sidebar never passes the plan
+ * off as the lab. */
+function withSrc(value, src) {
+  const box = el('span');
+  if (value && value.nodeType) box.appendChild(value); else box.appendChild(document.createTextNode(value == null || value === '' ? '-' : value));
+  if (src) {
+    const t = el('span', 'src' + (src === 'manifest' || src === 'label' ? ' s-warn' : ''), SRC_NAME[src] || src);
+    t.title = src === 'manifest' ? 'CML did not provide this; shown from the manifest'
+      : src === 'label' ? 'Guessed from the node label' : 'Read from the CML API on the last refresh';
+    box.appendChild(t);
+  }
+  return box;
+}
+
 function sideNode(n) {
   const d = el('div');
   const [sw, sc] = stateWord(n);
   const ip = displayIp(n);
+  const src = n.sources || {};
   d.appendChild(sect('General', props([
-    ['Label', n.label],
-    ['State', colored(sw, sc)],
+    ['Label', withSrc(n.label, n.ghost ? 'manifest' : 'cml')],
+    ['State', withSrc(colored(sw, sc), n.ghost ? null : 'cml')],
     ['Type', KIND_NAME[kind(n)]],
-    ['Image', n.node_definition],
-    ['Role', n.role_title],
-    ['Layer', (n.layer_title || n.layer) + (n.layer_inferred ? ' (guessed from label)' : '')],
-    ['Site', n.site],
-    ['Address', ip.text ? copyable(ip.text) : '-', ip.drift ? 'drift' : null],
-    ['Address source', ip.text ? (ip.live ? 'read from device' : 'manifest (not read yet)') : '-'],
-    ['DNS name', copyable((n.dns || {}).fqdn)],
-    ['Config', { managed: 'manifest, ' + (n.template || ''), undeclared: colored('not in the manifest', 's-warn'),
-                 absent: colored('manifest entry, no node', 's-bad'), 'no-template': 'declared, no template' }[n.config_status] || '-'],
+    ['Image', withSrc(n.image || n.node_definition, n.ghost ? null : 'cml')],
+    ['Resources', n.cpus || n.ram ? `${n.cpus || '?'} vCPU, ${n.ram || '?'} MB` : '-'],
+    ['Tags', (n.tags || []).length ? withSrc(n.tags.join(', '), 'cml') : '-'],
+    ['Role', withSrc(n.role_title, src.role)],
+    ['Layer', withSrc(n.layer_title || n.layer, src.layer)],
+    ['Site', withSrc(n.site, src.site)],
+    ['Address', ip.text ? withSrc(copyable(ip.text), ip.live ? 'device' : src.primary_ip) : '-', ip.drift ? 'drift' : null],
+    ['DNS name', withSrc(copyable((n.dns || {}).fqdn), src.dns)],
+    ['Gateway', withSrc(n.gateway, n.gateway ? src.gateway : null)],
+    ['Resolver', withSrc(n.resolver, n.resolver ? src.resolver : null)],
+    ['In manifest', { managed: 'yes, ' + (n.template || ''), undeclared: colored('no', 's-warn'),
+                      absent: colored('yes, but not in the lab', 's-bad'), 'no-template': 'yes, no template' }[n.config_status] || '-'],
   ])));
   if (ip.drift) d.appendChild(el('div', 'pmsg warn', `The device holds ${n.live_ip}; the manifest declares ${n.primary_ip || 'nothing'}.`));
 
   const rows = [];
-  (n.vlans || []).forEach((v) => rows.push(['VLAN ' + v.id, v.name || '']));
-  Object.entries(n.ha || {}).forEach(([k, v]) => rows.push([k.replace(/_/g, ' '), String(v)]));
-  if (n.floor) rows.push(['Location', n.floor]);
-  if (rows.length) d.appendChild(sect('VLANs and HA', props(rows)));
+  (n.vlans || []).forEach((v) => rows.push(['VLAN ' + v.id, withSrc(`${v.name || ''}${v.iface ? '  (' + v.iface + ')' : ''}`, src.vlans)]));
+  Object.entries(n.ha || {}).forEach(([k, v]) => rows.push([k.replace(/_/g, ' '), withSrc(String(v), src.ha)]));
+  if (n.floor) rows.push(['Location', withSrc(n.floor, 'manifest')]);
+  if (rows.length) d.appendChild(sect('VLANs and redundancy', props(rows)));
+
+  // plan against lab: only the fields where they disagree
+  const dec = n.declared;
+  if (dec) {
+    const diff = [];
+    if (dec.site && dec.site !== n.site) diff.push(['Site', `manifest ${dec.site}, CML ${n.site || '-'}`]);
+    if (dec.role && dec.role !== n.role) diff.push(['Role', `manifest ${dec.role}, CML ${n.role || '-'}`]);
+    if (dec.primary_ip && dec.primary_ip !== n.primary_ip) diff.push(['Address', `manifest ${dec.primary_ip}, lab ${n.primary_ip || 'none'}`]);
+    const labIps = new Set((n.addresses || []).filter((a) => a.source !== 'manifest').map((a) => a.value));
+    const gone = (dec.addresses || []).filter((a) => a.kind !== 'ha' && !labIps.has(a.value));
+    if (gone.length && labIps.size) diff.push(['Not in the lab', gone.map((a) => `${a.value} (${a.label})`).join(', ')]);
+    d.appendChild(sect('Lab against manifest', diff.length ? props(diff.map(([k, v]) => [k, colored(v, 's-warn')]))
+      : el('div', 'side-empty', 'No differences in site, role or addresses.')));
+  }
   if ((n.issues || []).length) {
     d.appendChild(sect('Known issues', props(n.issues.map((i) => ['#' + i.id, i.title]))));
   }
   if (!n.ghost && !n.can_source_probe && n.no_source_reason) {
-    d.appendChild(el('div', 'pmsg', 'Cannot be a ping source: ' + n.no_source_reason + '. It can still be a target.'));
+    d.appendChild(el('div', 'pmsg', 'Cannot send test traffic: ' + n.no_source_reason + '. It can still be a target.'));
   }
 
   const acts = el('div', 'acts');
@@ -660,6 +715,11 @@ function sideNode(n) {
     const p = el('button', null, 'Ping...');
     p.addEventListener('click', () => { sideTab = 'ping'; renderSide(); });
     acts.appendChild(p);
+    if (n.can_source_probe && n.up) {
+      const t = el('button', null, 'Trace from here...');
+      t.addEventListener('click', () => startPick(n.label));
+      acts.appendChild(t);
+    }
   }
   const ce = el('button', null, 'Center');
   ce.addEventListener('click', () => centerOn(n, true));
@@ -674,75 +734,89 @@ function sideNode(n) {
 
 function sideAddresses(n) {
   const d = el('div');
-  const live = n.live;
-  const manifestIps = new Set((n.addresses || []).map((a) => a.value));
-  if (live && (live.addresses || []).length) {
-    const t = gridTable(['Interface', 'Address', 'Method', 'State']);
-    live.addresses.forEach((a) => {
+  // one table, every source side by side: seen on the wire by CML, in the
+  // config CML holds, read off the console, declared in the manifest
+  const rows = new Map();
+  (n.addresses || []).forEach((a) => {
+    const r = rows.get(a.value) || { ip: a.value, iface: a.iface, kind: a.kind, label: a.label, src: new Set() };
+    r.src.add(a.source);
+    if (!r.iface && a.iface) r.iface = a.iface;
+    rows.set(a.value, r);
+  });
+  ((n.live || {}).addresses || []).forEach((a) => {
+    const r = rows.get(a.ip) || { ip: a.ip, iface: a.iface, src: new Set() };
+    r.src.add('device');
+    if (!r.iface) r.iface = a.iface;
+    rows.set(a.ip, r);
+  });
+  if (rows.size) {
+    const t = gridTable(['Address', 'Interface', 'Found in']);
+    [...rows.values()].forEach((r) => {
       const tr = el('tr');
-      [a.iface, a.ip, a.method || '-', a.status + '/' + a.proto].forEach((v, i) => tr.appendChild(el('td', i < 2 ? 'm' : null, v)));
-      if (!manifestIps.has(a.ip)) tr.querySelectorAll('td').forEach((td) => { td.style.background = 'var(--infobg)'; });
+      tr.appendChild(el('td', 'm', r.ip));
+      tr.appendChild(el('td', 'm', (r.iface || r.label || '-') + (r.kind && r.kind !== 'mgmt' && r.kind !== 'service' ? '  ' + r.kind : '')));
+      const only = r.src.size === 1 && r.src.has('manifest');
+      tr.appendChild(el('td', only ? 's-warn' : null, [...r.src].map((x) => SRC_NAME[x] || x).join(', ') +
+        (only ? '  (not found in the lab)' : '')));
       t.appendChild(tr);
     });
-    d.appendChild(sect('Read from the device', t));
-    // drift both ways: device holds what the plan doesn't, plan claims what
-    // the device doesn't hold
-    const liveIps = new Set(live.addresses.map((a) => a.ip));
-    const extra = live.addresses.filter((a) => !manifestIps.has(a.ip));
-    const missing = (n.addresses || []).filter((a) => !liveIps.has(a.value) && a.kind !== 'ha');
-    if (extra.length) d.appendChild(el('div', 'pmsg warn', 'Not in the manifest: ' +
-      extra.map((a) => `${a.ip} (${a.iface})`).join(', ')));
-    if (missing.length) d.appendChild(el('div', 'pmsg warn', 'In the manifest, not on the device: ' +
-      missing.map((a) => `${a.value} (${a.label})`).join(', ')));
-    d.appendChild(el('div', 'pmsg', 'Read ' + live.at + '. Shaded rows are not declared in the manifest (DHCP leases, transit /30s, or drift).'));
-  } else if (live && live.error) {
-    d.appendChild(sect('Read from the device', el('div', 'pmsg bad', 'Read failed at ' + live.at + ': ' + live.error)));
+    d.appendChild(sect('Addresses', t));
   } else {
-    const box = el('div', 'acts');
-    const b = el('button', null, 'Read addresses from all devices');
-    b.addEventListener('click', () => { LAB.harvest.run(); showPane('harvest'); });
-    box.appendChild(b);
-    d.appendChild(sect('Read from the device', [el('div', 'pmsg', 'Not read yet.'), box]));
+    d.appendChild(sect('Addresses', el('div', 'side-empty', 'CML reports no addresses for this node, and its config sets none.')));
   }
+  const live = n.live;
+  if (live && live.error) d.appendChild(el('div', 'pmsg bad', 'Console read failed at ' + live.at + ': ' + live.error));
+  else if (live) d.appendChild(el('div', 'pmsg', 'Console read at ' + new Date(live.at).toLocaleString() + '.'));
+  const acts = el('div', 'acts');
+  const b = el('button', null, live ? 'Read consoles again' : 'Read running addresses from consoles');
+  b.title = '"Seen by CML" and "CML config" refresh on their own. This reads the running state off each device console (about 40 s for the lab).';
+  b.addEventListener('click', () => { LAB.harvest.run(); showPane('harvest'); });
+  acts.appendChild(b);
+  d.appendChild(acts);
 
-  const rows = [];
-  (n.addresses || []).forEach((a) => rows.push([a.label, copyable(a.value)]));
   const dns = n.dns || {};
-  if (dns.fqdn) rows.push(['Internal name', copyable(dns.fqdn)]);
-  (dns.cnames || []).forEach((c) => rows.push(['Alias', copyable(c)]));
-  (dns.public || []).forEach((p) => rows.push(['Public record', copyable(p.name + ' ' + p.ip)]));
-  if (n.resolver) rows.push(['Resolver', copyable(n.resolver)]);
-  if (n.resolver_note) rows.push(['', n.resolver_note]);
-  if (n.gateway) rows.push(['Gateway', copyable(n.gateway)]);
-  d.appendChild(sect('Manifest and DNS', rows.length ? props(rows) : el('div', 'side-empty', 'Nothing declared.')));
+  const drows = [];
+  if (dns.fqdn) drows.push(['Internal name', withSrc(copyable(dns.fqdn), (n.sources || {}).dns)]);
+  (dns.cnames || []).forEach((c) => drows.push(['Alias', copyable(c)]));
+  (dns.public || []).forEach((p) => drows.push(['Public record', copyable(p.name + ' ' + p.ip)]));
+  if (drows.length) d.appendChild(sect('DNS', props(drows)));
   return d;
 }
 
 function sideInterfaces(n) {
   const d = el('div');
   const head = el('div', 'phead');
-  head.appendChild(el('span', 'd', `${n.interface_count || 0} interfaces, ${(n.links || []).length} connected`));
+  head.appendChild(el('span', 'd', `${(n.iface_detail || []).length || n.interface_count || 0} interfaces, ${(n.links || []).length} connected`));
   const lab = el('label');
   const cb = el('input'); cb.type = 'checkbox'; cb.checked = prefs.traffic;
   cb.addEventListener('change', () => setTraffic(cb.checked));
   lab.appendChild(cb); lab.appendChild(document.createTextNode('Live counters'));
   head.appendChild(lab);
   d.appendChild(head);
-  if (!(n.links || []).length) { d.appendChild(el('div', 'side-empty', 'No links.')); return d; }
-  const t = gridTable(['Local', 'Peer', 'Subnet', 'Rate', 'Drops']);
-  n.links.forEach((l) => {
-    const r = prefs.traffic ? linkRates[l.link_id] : null;
-    const tr = el('tr', 'row');
-    tr.appendChild(el('td', 'm', shortIf(l.local_iface)));
+  const links = new Map((n.links || []).map((l) => [l.local_iface, l]));
+  const ifs = (n.iface_detail || []).length ? n.iface_detail
+    : (n.links || []).map((l) => ({ name: l.local_iface, connected: true, ip4: [] }));
+  if (!ifs.length) { d.appendChild(el('div', 'side-empty', 'No interfaces.')); return d; }
+  const t = gridTable(['Interface', 'Peer', 'Address', 'Rate']);
+  ifs.forEach((f) => {
+    const l = links.get(f.name);
+    const r = l && prefs.traffic ? linkRates[l.link_id] : null;
+    const tr = el('tr', 'row' + (l ? '' : ' off'));
+    const c0 = el('td', 'm', shortIf(f.name));
+    c0.title = [f.name, f.mac && 'MAC ' + f.mac, f.desc, f.vlan && 'access VLAN ' + f.vlan, f.shutdown && 'shutdown in config']
+      .filter(Boolean).join('\n');
+    tr.appendChild(c0);
     const peer = el('td', 'm');
-    const a = el('a', null, l.peer + ' ' + shortIf(l.peer_iface));
-    a.href = '#';
-    a.addEventListener('click', (e) => { e.preventDefault(); select(l.peer, true); });
-    peer.appendChild(a);
+    if (l) {
+      const a = el('a', l.state === 'STOPPED' ? 's-dim' : null, l.peer + ' ' + shortIf(l.peer_iface));
+      a.href = '#';
+      a.addEventListener('click', (e) => { e.preventDefault(); select(l.peer, true); });
+      peer.appendChild(a);
+      if (l.state === 'STOPPED') peer.appendChild(el('span', 'src', 'link stopped'));
+    } else peer.textContent = '-';
     tr.appendChild(peer);
-    tr.appendChild(el('td', 'm', l.subnet || '-'));
-    tr.appendChild(el('td', 'm', r ? (r.pps >= 1 ? Math.round(r.pps) + ' pps' : 'idle') : prefs.traffic ? '...' : '-'));
-    tr.appendChild(el('td', 'm ' + (r && r.drops > 0 ? 's-bad' : ''), r ? String(r.drops) : '-'));
+    tr.appendChild(el('td', 'm', (f.ip4 || []).concat(f.config_ip && !(f.ip4 || []).includes(f.config_ip) ? [f.config_ip] : []).join(', ') || (l && l.subnet) || '-'));
+    tr.appendChild(el('td', 'm' + (r && r.drops > 0 ? ' s-bad' : ''), r ? (r.pps >= 1 ? Math.round(r.pps) + ' pps' : 'idle') + (r.drops ? `, ${r.drops} drops` : '') : '-'));
     t.appendChild(tr);
   });
   d.appendChild(t);
@@ -973,7 +1047,9 @@ function resultBlock(res) {
 
 /* =========================================================== bottom pane == */
 function showPane(k) {
+  const was = paneTab;
   paneTab = k;
+  if ((was === 'trace') !== (k === 'trace')) setTimeout(() => { renderCanvas(); }, 0);
   if (prefs.paneMin) { prefs.paneMin = false; savePrefs(); applyPane(); }
   renderPane();
   if (LAB[k] && LAB[k].refresh) LAB[k].refresh();
@@ -999,6 +1075,9 @@ function renderPaneTabs() {
   };
   const vis = NODES.filter((n) => shown(n) && matches(n)).length;
   add('nodes', 'Nodes', { text: String(vis) });
+  add('trace', 'Path trace', trace.job ? { text: 'running', level: 'warn' }
+    : trace.result ? { text: trace.result.verdict.level === 'ok' ? 'confirmed' : trace.result.verdict.level === 'fail' ? 'failed' : 'check',
+                       level: trace.result.verdict.level === 'ok' ? 'ok' : trace.result.verdict.level === 'fail' ? 'bad' : 'warn' } : null);
   Object.entries(LAB).forEach(([k, t]) => add(k, t.title, t.badge()));
   consoles.forEach((l) => add('con:' + l, 'Console: ' + l, null, true));
   const min = el('button', 'end', prefs.paneMin ? 'Restore' : 'Minimize');
@@ -1013,6 +1092,7 @@ function renderPaneBody() {
   body.innerHTML = '';
   if (paneTab === 'nodes') body.appendChild(nodeTable());
   else if (paneTab.startsWith('con:')) body.appendChild(consolePane(paneTab.slice(4)));
+  else if (paneTab === 'trace') body.appendChild(tracePane());
   else if (LAB[paneTab]) LAB[paneTab].draw(body);
   body.scrollTop = scroll;
 }
@@ -1123,11 +1203,13 @@ function nodeRow(n) {
   tr.appendChild(el('td', null, n.role_title || ''));
   tr.appendChild(el('td', null, n.site || ''));
   const ip = displayIp(n);
-  tr.appendChild(el('td', 'm' + (ip.drift ? ' s-warn' : ''), ip.text + (ip.text && !ip.live ? '  (manifest)' : '')));
+  const ipSrc = ip.live ? null : (n.sources || {}).primary_ip;
+  tr.appendChild(el('td', 'm' + (ip.drift || ipSrc === 'manifest' ? ' s-warn' : ''),
+    ip.text + (ip.text && ipSrc === 'manifest' ? '  (manifest only)' : '')));
   tr.appendChild(el('td', 'm', (n.dns || {}).fqdn || ''));
   const fl = flags(n);
   tr.appendChild(el('td', fl.includes('absent') ? 's-bad' : fl.length ? 's-warn' : null, fl.join(', ')));
-  tr.addEventListener('click', () => select(n.label, true));
+  tr.addEventListener('click', () => { if (pick) pickNode(n.label); else select(n.label, true); });
   tr.addEventListener('dblclick', () => { if (!n.ghost) openConsole(n.label); });
   tr.addEventListener('contextmenu', (e) => { e.preventDefault(); select(n.label); nodeMenu(n, e.clientX, e.clientY); });
   tr.addEventListener('mouseenter', () => { hovered = n.label; highlight(); });
@@ -1408,6 +1490,443 @@ function applyHarvestToNodes(st) {
   }
 }
 
+/* =========================================================== path trace == */
+/* Pick a source and a destination; the canvas narrows to the nodes between
+ * them.  Before a run it shows every shortest path over the running part of
+ * the lab (the routes the packets COULD take).  A run sends a burst of pings
+ * and reads CML's per-link packet counters before and after, so it shows the
+ * links the packets DID cross, at layer 2 as well as layer 3.  Run it, stop
+ * the active core switch in CML, run it again: the path moves. */
+const trace = { source: null, target: null, ip: null, count: 100, repeat: false,
+                job: null, stage: '', result: null, cand: null, history: [], error: null };
+let pick = null;           // null | 'source' | 'target'
+
+function traceShown() { return !!pick || (paneTab === 'trace' && !!trace.source && !!trace.target); }
+
+function startPick(src) {
+  if (src) { trace.source = src; pick = 'target'; } else { pick = 'source'; }
+  pickBar();
+  renderCanvas();
+}
+function cancelPick() { pick = null; pickBar(); renderCanvas(); }
+
+function pickNode(label) {
+  const n = BY.get(label);
+  if (!n) return;
+  if (pick === 'source') {
+    if (!n.can_source_probe || !n.up) {
+      pickBar(`${label} cannot send the test traffic (${!n.up ? 'not running' : 'no console this tool can drive'}). Pick another.`);
+      return;
+    }
+    trace.source = label;
+    pick = 'target';
+    pickBar();
+    renderCanvas();
+    return;
+  }
+  if (label === trace.source || n.ghost) return;
+  pick = null;
+  pickBar();
+  setTraceEnds(trace.source, label);
+  showPane('trace');
+}
+
+function pickBar(msg) {
+  const bar = $('#pickbar');
+  bar.hidden = !pick;
+  $('#canvas').classList.toggle('picking', !!pick);
+  if (!pick) return;
+  bar.innerHTML = '';
+  bar.appendChild(el('span', 't', 'Trace path'));
+  bar.appendChild(el('span', null, msg || (pick === 'source'
+    ? 'Click the node to send from. It must be running and have a console (router, switch, firewall or Linux host).'
+    : `From ${trace.source}. Now click the destination.`)));
+  const c = el('button', 'linkish', 'Cancel');
+  c.addEventListener('click', cancelPick);
+  bar.appendChild(c);
+}
+
+function setTraceEnds(src, dst) {
+  const changed = src !== trace.source || dst !== trace.target;
+  trace.source = src;
+  trace.target = dst;
+  const t = BY.get(dst);
+  if (changed || !trace.ip) trace.ip = t ? (t.live_ip || t.primary_ip) : null;
+  if (changed) {
+    trace.result = [...trace.history].reverse().find((h) => h.source === src && h.target === dst) || null;
+    trace.error = null;
+  }
+  trace.cand = candidates(src, dst);
+  renderPane();
+  renderCanvas();
+}
+
+/* Every node and link on SOME shortest path, over running nodes and started
+ * links: the set of routes the traffic could take. */
+function candidates(src, dst) {
+  const up = (n) => n && (n.up || n.label === src);
+  const adj = new Map();
+  NODES.forEach((n) => {
+    if (!up(n)) return;
+    adj.set(n.label, (n.links || []).filter((l) => up(BY.get(l.peer)) && l.state !== 'STOPPED'));
+  });
+  const bfs = (start) => {
+    const d = new Map([[start, 0]]);
+    const q = [start];
+    while (q.length) {
+      const u = q.shift();
+      (adj.get(u) || []).forEach((l) => { if (!d.has(l.peer)) { d.set(l.peer, d.get(u) + 1); q.push(l.peer); } });
+    }
+    return d;
+  };
+  if (!adj.has(src) || !adj.has(dst)) return { nodes: [], links: [], paths: 0, hops: null, depth: {} };
+  const ds = bfs(src), dt = bfs(dst);
+  if (!ds.has(dst)) return { nodes: [], links: [], paths: 0, hops: null, depth: {} };
+  const D = ds.get(dst);
+  const on = [...adj.keys()].filter((u) => ds.has(u) && dt.has(u) && ds.get(u) + dt.get(u) === D);
+  const onSet = new Set(on);
+  const links = new Set();
+  const ways = new Map([[src, 1]]);
+  on.sort((a, b) => ds.get(a) - ds.get(b)).forEach((u) => {
+    adj.get(u).forEach((l) => {
+      if (onSet.has(l.peer) && ds.get(l.peer) === ds.get(u) + 1) {
+        if (l.link_id) links.add(l.link_id);
+        ways.set(l.peer, (ways.get(l.peer) || 0) + (ways.get(u) || 0));
+      }
+    });
+  });
+  const depth = {};
+  on.forEach((u) => { depth[u] = ds.get(u); });
+  return { nodes: on, links: [...links], paths: ways.get(dst) || 0, hops: D, depth };
+}
+
+async function runTrace() {
+  if (!trace.source || !trace.target || trace.job) return;
+  trace.error = null;
+  trace.job = { t0: Date.now(), eta: 30 };
+  trace.stage = 'starting';
+  renderPane();
+  try {
+    const r = await fetch('/api/trace', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ source: trace.source, target: trace.target, target_ip: trace.ip, count: trace.count }),
+    });
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.error);
+    trace.job.eta = j.eta_seconds || 30;
+    for (;;) {
+      await new Promise((ok) => setTimeout(ok, 1200));
+      const st = await getJSON('/api/trace/' + j.job_id);
+      trace.stage = st.stage;
+      const s = document.querySelector('[data-trace-stage]');
+      if (s) s.textContent = st.stage;
+      if (st.status === 'error') throw new Error(st.error);
+      if (st.status === 'done') {
+        const res = st.result;
+        const prev = [...trace.history].reverse().find((h) => h.source === res.source && h.target === res.target);
+        res.changed = prev && prev.path.join('>') !== res.path.join('>')
+          ? { from: prev.path, at: prev.at } : null;
+        trace.history.push(res);
+        if (res.source === trace.source && res.target === trace.target) trace.result = res;
+        break;
+      }
+    }
+  } catch (e) { trace.error = String(e.message || e); }
+  trace.job = null;
+  await poll(false);           // the lab may have changed; refresh before drawing
+  trace.cand = candidates(trace.source, trace.target);
+  renderPane(); renderCanvas();
+  if (trace.repeat && !trace.error) setTimeout(() => { if (trace.repeat && !trace.job) runTrace(); }, 5000);
+}
+
+function resultFor() {
+  const r = trace.result;
+  return r && r.source === trace.source && r.target === trace.target ? r : null;
+}
+
+/* Narrow the canvas to the trace: everything off the candidate and observed
+ * paths fades, candidate links are dashed, used links are drawn solid with
+ * the packet count the counters measured. */
+function paintTrace() {
+  const nodesEl = document.querySelectorAll('#nodes .node');
+  const linkEl = document.querySelectorAll('#links > g');
+  document.querySelectorAll('#nodes .t-tag').forEach((t) => t.remove());
+  nodesEl.forEach((g) => g.classList.remove('t-dim', 't-end', 't-stop', 't-idle', 't-nopick'));
+  linkEl.forEach((g) => g.querySelector('.wire').classList.remove('t-cand', 't-both', 't-one', 't-fwd', 't-dim'));
+  if (!traceShown()) return;
+  nodesEl.forEach((g) => g.classList.remove('dim'));
+  linkEl.forEach((g) => g.querySelector('.wire').classList.remove('dim', 'hl'));
+  const tag = (label, text) => {
+    const g = document.querySelector(`#nodes .node[data-label="${CSS.escape(label)}"]`);
+    if (!g) return;
+    g.classList.add('t-end');
+    g.appendChild(svg('text', { y: -NODE_SIZE / 2 - 9, class: 't-tag' }, text));
+  };
+  if (pick) {
+    if (pick === 'source') nodesEl.forEach((g) => {
+      const n = BY.get(g.dataset.label);
+      if (!n.can_source_probe || !n.up) g.classList.add('t-nopick');
+    });
+    if (trace.source) tag(trace.source, 'FROM');
+    return;
+  }
+  const cand = trace.cand || { nodes: [], links: [] };
+  const res = resultFor();
+  const inSet = new Set(cand.nodes);
+  const used = new Map();
+  if (res) {
+    res.path.forEach((x) => inSet.add(x));
+    res.links.filter((l) => l.use !== 'none').forEach((l) => { used.set(l.id, l); inSet.add(l.a); inSet.add(l.b); });
+  }
+  const onPath = new Set(res ? res.path : []);
+  nodesEl.forEach((g) => {
+    const l = g.dataset.label;
+    if (!inSet.has(l)) g.classList.add('t-dim');
+    else if (res && !onPath.has(l) && ![...used.values()].some((u) => u.a === l || u.b === l)) g.classList.add('t-idle');
+    if (res && res.stop_at === l) g.classList.add('t-stop');
+  });
+  const candLinks = new Set(cand.links);
+  linkEl.forEach((g) => {
+    const w = g.querySelector('.wire'), tx = g.querySelector('.rate');
+    const u = used.get(g.dataset.link);
+    if (u) {
+      w.classList.add(u.use === 'both' ? 't-both' : u.use === 'forward' ? 't-fwd' : 't-one');
+      tx.textContent = u.packets != null ? u.packets + ' pkts' : '';
+      tx.classList.toggle('bad', u.use === 'forward');
+    } else if (candLinks.has(g.dataset.link)) {
+      w.classList.add('t-cand');
+    } else {
+      w.classList.add('t-dim');
+    }
+  });
+  tag(trace.source, 'FROM');
+  tag(trace.target, 'TO');
+}
+
+/* ------------------------------------------------------------ the pane --- */
+function tracePane() {
+  const wrap = el('div');
+  const head = el('div', 'phead');
+  const sel = (items, value, onChange, empty) => {
+    const s = el('select');
+    if (empty) { const o = el('option', null, empty); o.value = ''; s.appendChild(o); }
+    items.forEach(([v, t]) => { const o = el('option', null, t); o.value = v; s.appendChild(o); });
+    s.value = value || '';
+    s.addEventListener('change', () => onChange(s.value));
+    return s;
+  };
+  const sources = NODES.filter((n) => n.can_source_probe && n.up).sort(byLabel).map((n) => [n.label, n.label]);
+  const targets = NODES.filter((n) => !n.ghost && n.label !== trace.source).sort(byLabel).map((n) => [n.label, n.label]);
+  const lf = el('label', null, 'From ');
+  lf.appendChild(sel(sources, trace.source, (v) => setTraceEnds(v || null, trace.target), 'choose'));
+  head.appendChild(lf);
+  const lt = el('label', null, 'To ');
+  lt.appendChild(sel(targets, trace.target, (v) => setTraceEnds(trace.source, v || null), 'choose'));
+  head.appendChild(lt);
+  const t = BY.get(trace.target);
+  if (t) {
+    const ips = [];
+    const seen = new Set();
+    [t.live_ip, t.primary_ip, ...(t.addresses || []).filter((a) => !/virtual/.test(a.kind || '')).map((a) => a.value)]
+      .forEach((ip) => { if (ip && !seen.has(ip)) { seen.add(ip); ips.push([ip, ip]); } });
+    const la = el('label', null, 'Address ');
+    la.appendChild(sel(ips, trace.ip, (v) => { trace.ip = v; }));
+    head.appendChild(la);
+  }
+  const lc = el('label', null, 'Packets ');
+  const cnt = el('input');
+  cnt.type = 'number'; cnt.min = 20; cnt.max = 500; cnt.step = 20; cnt.value = trace.count;
+  cnt.style.width = '64px';
+  cnt.addEventListener('change', () => { trace.count = Math.max(20, Math.min(500, +cnt.value || 100)); });
+  lc.appendChild(cnt);
+  head.appendChild(lc);
+  const run = el('button', 'default', trace.job ? 'Tracing...' : 'Run trace');
+  run.disabled = !!trace.job || !trace.source || !trace.target;
+  run.addEventListener('click', runTrace);
+  head.appendChild(run);
+  const rl = el('label');
+  const rc = el('input'); rc.type = 'checkbox'; rc.checked = trace.repeat;
+  rc.addEventListener('change', () => { trace.repeat = rc.checked; if (rc.checked && !trace.job) runTrace(); });
+  rl.appendChild(rc); rl.appendChild(document.createTextNode('Repeat'));
+  rl.title = 'Run again 5 s after each trace finishes. Leave it running while you stop and start nodes in CML to watch the path move.';
+  head.appendChild(rl);
+  const pk = el('button', null, 'Pick on canvas');
+  pk.addEventListener('click', () => startPick());
+  head.appendChild(pk);
+  wrap.appendChild(head);
+
+  if (!trace.source || !trace.target) {
+    wrap.appendChild(el('div', 'pmsg', 'Choose From and To above, or use Pick on canvas (T). Right-click a node for "Trace path from here".'));
+    return wrap;
+  }
+  if (trace.job) {
+    const box = el('div', 'result');
+    const st = el('div', 's-dim', trace.stage);
+    st.dataset.traceStage = '1';
+    box.appendChild(st);
+    const bar = el('div', 'meter'); const fill = el('i'); bar.appendChild(fill);
+    const pct = () => Math.min(97, (Date.now() - trace.job.t0) / 1000 / trace.job.eta * 100) + '%';
+    fill.style.width = pct();
+    const iv = setInterval(() => { if (!fill.isConnected || !trace.job) clearInterval(iv); else fill.style.width = pct(); }, 500);
+    box.appendChild(bar);
+    wrap.appendChild(box);
+  }
+  if (trace.error) wrap.appendChild(el('div', 'pmsg bad', 'Trace failed: ' + trace.error));
+
+  const res = resultFor();
+  const cand = trace.cand || { nodes: [], paths: 0 };
+  if (!res) {
+    wrap.appendChild(el('div', 'pmsg', cand.paths
+      ? `Predicted: ${cand.paths} shortest path${cand.paths > 1 ? 's' : ''} of ${cand.hops} hops over the running lab (dashed). Run the trace to see which links the packets actually cross.`
+      : 'No path between these nodes over the running part of the lab.'));
+  } else {
+    const v = res.verdict;
+    wrap.appendChild(el('div', 'pmsg ' + (v.level === 'ok' ? 'ok' : v.level === 'fail' ? 'bad' : 'warn'),
+      v.text + `  (${new Date(res.at).toLocaleTimeString()}, ${res.sent} sent, ` +
+      `${res.received == null ? 'replies not counted' : res.received + ' answered'}, ${res.elapsed_s} s)`));
+    if (res.changed) {
+      const was = res.changed.from.filter((x) => !res.path.includes(x));
+      const now = res.path.filter((x) => !res.changed.from.includes(x));
+      wrap.appendChild(el('div', 'pmsg warn', `Path changed since ${new Date(res.changed.at).toLocaleTimeString()}: ` +
+        (was.length ? `no longer through ${was.join(', ')}` : '') + (was.length && now.length ? '; ' : '') +
+        (now.length ? `now through ${now.join(', ')}` : '') + '.'));
+    }
+  }
+  wrap.appendChild(traceDiagram(res, cand));
+  if (res) {
+    res.findings.forEach((f) => wrap.appendChild(el('div', 'pmsg', f)));
+    const cols = el('div', 'tcols');
+    const used = res.links.filter((l) => l.use !== 'none');
+    const t1 = gridTable(['Link', 'Packets', 'Direction', 'Shortest path']);
+    used.sort((a, b) => res.path.indexOf(a.a) - res.path.indexOf(b.a)).forEach((l) => {
+      const tr = el('tr', 'row');
+      tr.appendChild(el('td', 'm', `${l.a} ${shortIf(l.ai)}  to  ${l.b} ${shortIf(l.bi)}`));
+      tr.appendChild(el('td', 'm', l.packets == null ? '-' : String(l.packets)));
+      tr.appendChild(el('td', l.use === 'both' ? 's-ok' : 's-warn',
+        { both: 'both ways', 'one-way': 'one way only', forward: 'requests only' }[l.use]));
+      tr.appendChild(el('td', l.candidate ? null : 's-warn', l.candidate ? 'yes' : 'no'));
+      t1.appendChild(tr);
+    });
+    const a = el('div'); a.appendChild(t1); cols.appendChild(a);
+    const t2 = gridTable(['Hop', 'Address', 'Node', 'RTT']);
+    res.trace.hops.forEach((h) => {
+      const tr = el('tr', 'row');
+      [String(h.ttl), h.ip || '*', h.node || (h.ip ? 'unknown' : ''), h.rtt_ms != null ? h.rtt_ms + ' ms' : ''].forEach((v, i) =>
+        tr.appendChild(el('td', i === 1 ? 'm' : i === 2 && !h.node && h.ip ? 's-warn' : null, v)));
+      t2.appendChild(tr);
+    });
+    const b = el('div');
+    b.appendChild(t2);
+    if (!res.trace.hops.length) b.appendChild(el('div', 'pmsg', 'Traceroute returned no hops.'));
+    cols.appendChild(b);
+    wrap.appendChild(cols);
+  }
+  const hist = trace.history.filter((h) => h.source === trace.source && h.target === trace.target);
+  if (hist.length > 1) {
+    const t3 = gridTable(['Time', 'Result', 'Path']);
+    [...hist].reverse().forEach((h) => {
+      const tr = el('tr', 'row');
+      tr.appendChild(el('td', null, new Date(h.at).toLocaleTimeString()));
+      tr.appendChild(el('td', h.verdict.level === 'ok' ? 's-ok' : h.verdict.level === 'fail' ? 's-bad' : 's-warn',
+        h.verdict.level === 'ok' ? 'reached' : h.verdict.level === 'fail' ? 'failed' : 'check'));
+      tr.appendChild(el('td', 'wrap' + (h.changed ? ' s-warn' : ''), h.path.join(' > ') + (h.changed ? '   (changed)' : '')));
+      tr.addEventListener('click', () => { trace.result = h; renderPane(); renderCanvas(); });
+      t3.appendChild(tr);
+    });
+    const hs = el('div', 'tsect');
+    hs.appendChild(el('div', 'tsect-h', 'Runs this session (click one to show it)'));
+    hs.appendChild(t3);
+    wrap.appendChild(hs);
+  }
+  return wrap;
+}
+
+/* The nodes between the two ends, laid out left to right by hop count from
+ * the source.  Parallel boxes in one column are redundant alternatives. */
+function traceDiagram(res, cand) {
+  const set = new Set(cand.nodes || []);
+  const used = res ? res.links.filter((l) => l.use !== 'none') : [];
+  if (res) { res.path.forEach((x) => set.add(x)); used.forEach((l) => { set.add(l.a); set.add(l.b); }); }
+  set.add(trace.source); set.add(trace.target);
+  const usedBy = new Map(used.map((l) => [l.id, l]));
+  const candLinks = new Set(cand.links || []);
+  const edges = [];
+  const seen = new Set();
+  [...set].forEach((u) => (BY.get(u) ? BY.get(u).links || [] : []).forEach((l) => {
+    if (!set.has(l.peer) || seen.has(l.link_id)) return;
+    if (!usedBy.has(l.link_id) && !candLinks.has(l.link_id)) return;
+    seen.add(l.link_id);
+    edges.push({ a: u, b: l.peer, id: l.link_id, ai: l.local_iface, bi: l.peer_iface });
+  }));
+  // hop depth over the drawn edges
+  const depth = new Map([[trace.source, 0]]);
+  const q = [trace.source];
+  while (q.length) {
+    const u = q.shift();
+    edges.forEach((e) => {
+      const v = e.a === u ? e.b : e.b === u ? e.a : null;
+      if (v && !depth.has(v)) { depth.set(v, depth.get(u) + 1); q.push(v); }
+    });
+  }
+  let maxD = Math.max(0, ...depth.values());
+  [...set].forEach((u) => { if (!depth.has(u)) depth.set(u, ++maxD); });
+  const cols = [];
+  depth.forEach((d, u) => { (cols[d] = cols[d] || []).push(u); });
+  const onPath = new Set(res ? res.path : []);
+  cols.forEach((c) => c.sort((a, b) => (onPath.has(b) - onPath.has(a)) || a.localeCompare(b, undefined, { numeric: true })));
+  const avail = ($('#pane-body').clientWidth || 1000) - 140;
+  const colW = Math.max(110, Math.min(140, avail / Math.max(1, cols.length - 1))), rowH = 70, padX = 60, padY = 34;
+  const rows = Math.max(1, ...cols.map((c) => (c ? c.length : 0)));
+  const W = padX * 2 + (cols.length - 1) * colW, H = padY + rows * rowH;
+  const pos = new Map();
+  cols.forEach((c, d) => (c || []).forEach((u, i) => pos.set(u, {
+    x: padX + d * colW, y: padY + i * rowH + (rows - c.length) * rowH / 2,
+  })));
+
+  const box = el('div', 'tdiag');
+  const s = svg('svg', { viewBox: `0 0 ${W} ${H}`, width: W, height: H });
+  edges.forEach((e) => {
+    const a = pos.get(e.a), b = pos.get(e.b);
+    const u = usedBy.get(e.id);
+    const cls = 'wire ' + (u ? (u.use === 'both' ? 't-both' : u.use === 'forward' ? 't-fwd' : 't-one') : 't-cand');
+    s.appendChild(svg('line', { x1: a.x, y1: a.y, x2: b.x, y2: b.y, class: cls }));
+    if (u && u.packets != null) {
+      s.appendChild(svg('text', { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 - 5, class: 'rate' + (u.use === 'forward' ? ' bad' : ''),
+                                  'text-anchor': 'middle' }, String(u.packets)));
+    }
+  });
+  pos.forEach((p, u) => {
+    const n = BY.get(u);
+    if (!n) return;
+    const cls = ['node'];
+    if (!n.up) cls.push('off');
+    if (res && !onPath.has(u) && !used.some((l) => l.a === u || l.b === u)) cls.push('t-idle');
+    if (u === trace.source || u === trace.target) cls.push('t-end');
+    if (res && res.stop_at === u) cls.push('t-stop');
+    const g = svg('g', { class: cls.join(' '), transform: `translate(${p.x} ${p.y})` });
+    g.appendChild(svg('rect', { x: -17, y: -17, width: 34, height: 34, class: 'sel-box' }));
+    g.appendChild(nodeIcon(n, 26));
+    g.appendChild(svg('text', { y: 27, class: 'lbl' }, u));
+    const ip = displayIp(n).text;
+    if (ip) g.appendChild(svg('text', { y: 38, class: 'ipl' }, ip));
+    g.appendChild(svg('title', {}, `${u}\n${KIND_NAME[kind(n)]}${res && !onPath.has(u) ? '\nnot used this run' : ''}`));
+    g.addEventListener('click', () => select(u));
+    s.appendChild(g);
+  });
+  box.appendChild(s);
+  const key = el('div', 'tkey');
+  [['t-both', 'used, both ways'], ['t-one', 'used, one way'], ['t-fwd', 'requests only'], ['t-cand', 'possible, not used']]
+    .forEach(([c, t]) => {
+      const k = el('span');
+      const ks = svg('svg', { width: 26, height: 8 });
+      ks.appendChild(svg('line', { x1: 0, y1: 4, x2: 26, y2: 4, class: 'wire ' + c }));
+      k.appendChild(ks); k.appendChild(document.createTextNode(t));
+      key.appendChild(k);
+    });
+  box.appendChild(key);
+  return box;
+}
+
 /* ================================================================ menus == */
 let openMenu = null;
 
@@ -1418,6 +1937,9 @@ function menuItems(which) {
     { label: 'Run baseline matrix', fn: () => { LAB.matrix.run(); showPane('matrix'); } },
     { label: 'Run DNS audit', fn: () => { LAB.dns.run(); showPane('dns'); } },
     '-',
+    { label: 'Trace a path...', key: 'T', fn: startPick },
+    '-',
+    { label: 'Refresh from CML now', key: 'R', fn: () => poll(true) },
     { label: 'Export inventory as CSV', fn: () => { location.href = '/api/export.csv'; } },
   ];
   if (which === 'view') return [
@@ -1490,6 +2012,11 @@ function nodeMenu(n, x, y) {
     { label: 'Copy address', disabled: !ip, fn: () => navigator.clipboard.writeText(ip) },
     { label: 'Copy DNS name', disabled: !fqdn, fn: () => navigator.clipboard.writeText(fqdn) },
     '-',
+    { label: 'Trace path from here...', disabled: !n.can_source_probe || !n.up, fn: () => startPick(n.label) },
+    { label: trace.source && trace.source !== n.label ? `Trace path from ${trace.source} to here` : 'Trace path to here',
+      disabled: !trace.source || trace.source === n.label || n.ghost,
+      fn: () => { setTraceEnds(trace.source, n.label); showPane('trace'); } },
+    '-',
     { label: 'Center in view', fn: () => centerOn(n, true) },
     { label: 'Hide node', fn: () => hideNode(n.label) },
   ], box);
@@ -1535,6 +2062,8 @@ function wire() {
   $('#zoom-in').addEventListener('click', () => zoomAt(1.25));
   $('#zoom-out').addEventListener('click', () => zoomAt(0.8));
   $('#zoom-fit').addEventListener('click', fit);
+  $('#trace-btn').addEventListener('click', () => (pick ? cancelPick() : startPick()));
+  $('#refresh-btn').addEventListener('click', () => poll(true));
 
   document.querySelectorAll('.menu').forEach((m) => {
     m.firstElementChild.addEventListener('click', (e) => { e.stopPropagation(); toggleMenu(m); });
@@ -1551,11 +2080,14 @@ function wire() {
     const typing = /INPUT|SELECT|TEXTAREA/.test(document.activeElement.tagName);
     if (e.key === 'Escape') {
       closeMenus();
+      if (pick) { cancelPick(); return; }
       if (typing) document.activeElement.blur();
       else { select(null); document.body.classList.remove('side-open'); }
     }
     if (typing) return;
     if (e.key === '/') { e.preventDefault(); $('#q').focus(); }
+    if ((e.key === 't' || e.key === 'T') && !e.metaKey && !e.ctrlKey) startPick();
+    if ((e.key === 'r' || e.key === 'R') && !e.metaKey && !e.ctrlKey) poll(true);
     if ((e.key === 'f' || e.key === 'F') && !e.metaKey && !e.ctrlKey) fit();
   });
 }
@@ -1602,7 +2134,8 @@ function wireCanvas() {
   const end = (e) => {
     pointers.delete(e.pointerId);
     if (!drag) return;
-    if (!drag.moved) {
+    if (!drag.moved && pick && drag.node) { pickNode(drag.node); }
+    else if (!drag.moved) {
       select(drag.node || null);
       if (!drag.node) document.body.classList.remove('side-open');
     }

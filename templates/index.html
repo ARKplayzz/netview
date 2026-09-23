@@ -25,6 +25,9 @@
   <button id="zoom-in" title="Zoom in">Zoom in</button>
   <button id="zoom-out" title="Zoom out">Zoom out</button>
   <span class="tsep"></span>
+  <button id="trace-btn" title="Pick a source and a destination and trace the path between them (T)">Trace path</button>
+  <button id="refresh-btn" title="Re-read everything from CML now (R)">Refresh</button>
+  <span class="tsep"></span>
   <span class="tlabel">Show</span>
   <label><input type="checkbox" id="show-ip" checked>Addresses</label>
   <label><input type="checkbox" id="show-if">Interfaces</label>
@@ -41,6 +44,7 @@
 </div>
 
 <div class="infobar" id="banners" hidden></div>
+<div class="pickbar" id="pickbar" hidden></div>
 
 <div class="work">
   <div class="center">
