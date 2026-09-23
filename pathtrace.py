@@ -52,6 +52,19 @@ import probes as probe_engine
 BASELINE_S = 3.0
 BOTH_WAYS = 0.75     # share of (sent+received) above which a link carried both directions
 ONE_WAY = 0.30       # above this and below BOTH_WAYS: one direction only
+# A factor this small means the source's own links barely rose above their
+# background estimate — the src_total driving it is a few packets of noise,
+# not signal.  Measured 2026-09-24: healthy factors on this lab cluster
+# 0.3-1.3; a firewall-sourced trace (Firewall-DR-2 -> Firewall-HQ-1, ping
+# 100% successful, 1-2ms RTT) came back factor 0.006 — every one of the
+# firewall's own candidate-facing links showed the SAME 12-15 raw packets as
+# pure idle background, and the tiny leftover noise on one unrelated link
+# became the entire calibration base.  Dividing every other link's delta by
+# that near-zero number then inflated random background elsewhere into a
+# confident-looking but physically impossible path (a "satellite" hop at
+# 1-2ms RTT — real satellite RTT is hundreds of ms).  A factor below this
+# floor is treated as no calibration at all, not a smaller-but-valid one.
+MIN_FACTOR = 0.05
 
 _jobs: "OrderedDict[str, dict]" = OrderedDict()
 _jobs_lock = threading.Lock()
@@ -198,12 +211,20 @@ def _delta(a: dict, b: dict) -> dict[str, dict]:
 
 
 def _calibratable(src: dict, nodes: list[dict], raw_delta: dict, base: dict,
-                  base_dt: float, dt: float) -> bool:
+                  base_dt: float, dt: float, expected: int) -> bool:
     """Would `analyse()` get a usable factor out of this burst?  Same
     background-corrected sum over the source's own links that `analyse()`
     computes for real, checked early so a too-small burst can be retried
     with more packets before the console session closes, instead of only
-    finding out from a `factor: null` result the caller has to re-request."""
+    finding out from a `factor: null` (or, worse, a garbage-but-nonzero)
+    result the caller has to re-request.
+
+    `total > 0` alone isn't enough: a source whose own links show almost no
+    rise above background still clears it on a few stray packets of noise,
+    then `factor = total/expected` comes out implausibly tiny and every
+    other link's delta gets divided by it, inflating unrelated background
+    into a confident-looking but false path. Also require the prospective
+    factor to clear MIN_FACTOR."""
     src_links = {l.get("link_id") for n in nodes if n["label"] == src["label"]
                 for l in (n.get("links") or [])}
     total = 0.0
@@ -214,7 +235,7 @@ def _calibratable(src: dict, nodes: list[dict], raw_delta: dict, base: dict,
         b = base.get(lid) or {"read": 0, "write": 0}
         rate = (b["read"] + b["write"]) / base_dt
         total += max(0.0, d["read"] + d["write"] - rate * dt)
-    return total > 0
+    return total > 0 and expected > 0 and (total / expected) >= MIN_FACTOR
 
 
 # --------------------------------------------------------------------------
@@ -315,7 +336,8 @@ def _execute(job_id: str, cml, con: Console, spec: dict) -> dict:
         dt = t3 - t2
         raw_delta = _delta(s2, s3)
         count = attempt_count
-        if _calibratable(src, nodes, raw_delta, base, base_dt, dt):
+        expected = (burst["sent"] or attempt_count) + (burst["received"] or 0)
+        if _calibratable(src, nodes, raw_delta, base, base_dt, dt, expected):
             break
         retried = True
 
@@ -398,6 +420,13 @@ def analyse(nodes, src, dst, ip, count, burst, raw_delta, base, base_dt, dt, can
     src_links = [lid for lid, l in links.items() if src["label"] in (l["a"], l["b"])]
     src_total = sum(net.get(lid, 0) for lid in src_links)
     factor = src_total / expected if expected and src_total > 0 else None
+    # Same floor as _calibratable(): even after the retry, the source's own
+    # links may never clear background by enough to trust. Treat a factor
+    # below it as no calibration at all rather than dividing every other
+    # link's delta by a near-zero number and reporting the resulting noise
+    # as a confident path (see MIN_FACTOR's comment for the case this fixes).
+    if factor is not None and factor < MIN_FACTOR:
+        factor = None
 
     rows = []
     for lid, l in links.items():
@@ -453,8 +482,11 @@ def analyse(nodes, src, dst, ip, count, burst, raw_delta, base, base_dt, dt, can
     cand_nodes = set(cand["nodes"])
     path_set = set(path)
     if factor is None:
-        findings.append("No traffic was measured on the source's links, so the counters could not "
-                        "be calibrated. Is the source cabled, and is its link started?")
+        findings.append("The source's own links didn't rise enough above background traffic to "
+                        "calibrate the counters reliably, so no path could be attributed with "
+                        "confidence. Is the source cabled, and is its link started? If so, this "
+                        "link's background traffic may simply be too heavy for packet-counter "
+                        "tracing; the ping itself may still be healthy.")
     if cand["paths"] > 1:
         idle = sorted(cand_nodes - path_set - {src["label"], dst["label"]})
         findings.append(f"{cand['paths']} equal-length paths exist between these nodes."
