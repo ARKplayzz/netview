@@ -1,4 +1,9 @@
-"""NetView probe engine — resolve-then-ping, from one device to another.
+"""NetView console helpers: the session pool, per-node locks, ping, and the
+resolver-vantage rules shared by the path trace, the matrix and the DNS audit.
+
+The standalone point-probe job that used to live here was folded into the
+path trace (pathtrace.py), which measures reachability and the route in one
+run.  The reasoning below still governs how DNS is checked.
 
 WHAT A PROBE HERE ACTUALLY MEASURES
 -----------------------------------
@@ -27,10 +32,6 @@ from __future__ import annotations
 import re
 import sys
 import threading
-import time
-import uuid
-from collections import OrderedDict
-from datetime import datetime, timezone
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -71,10 +72,6 @@ def _node_lock(label: str) -> threading.Lock:
     with _node_locks_guard:
         return _node_locks.setdefault(label, threading.Lock())
 
-_jobs: "OrderedDict[str, dict]" = OrderedDict()
-_jobs_lock = threading.Lock()
-_MAX_JOBS = 200
-
 # Rough wall-clock cost of each stage, used for the client-side progress bar.
 # Recalibrated 2026-08-20 against measurements in docs/cml-integration-review.md:
 # connect+open is ~2s, a full one-command job ~5s serially.  Jobs sharing the
@@ -83,12 +80,6 @@ _MAX_JOBS = 200
 COST_OPEN_S = 3
 COST_ATTACH_S = 4
 COST_PER_PACKET_S = 1.4
-
-
-def estimate_seconds(methods: list[str], count: int) -> int:
-    stages = 1 + (1 if "dns" in methods else 0) + (1 if "ip" in methods else 0)
-    pings = sum(1 for m in methods if m in ("ip", "dns"))
-    return int(COST_OPEN_S + stages * COST_ATTACH_S + pings * count * COST_PER_PACKET_S)
 
 
 # --------------------------------------------------------------------------
@@ -193,188 +184,6 @@ def _dmz_resident(node: dict) -> bool:
     return any(v.get("id") == 55 for v in (node.get("vlans") or []))
 
 
-# --------------------------------------------------------------------------
-# Job management
-# --------------------------------------------------------------------------
-
-def submit(spec: dict) -> str:
-    """Queue a probe.  Returns a job id to poll with `get`."""
-    job_id = uuid.uuid4().hex[:12]
-    job = {
-        "id": job_id,
-        "spec": spec,
-        "status": "queued",
-        "stage": "waiting for the console channel",
-        "created": datetime.now(timezone.utc).isoformat(),
-        "eta_seconds": estimate_seconds(spec.get("methods", ["ip"]),
-                                        spec.get("count", 5)),
-        "result": None,
-        "error": None,
-    }
-    with _jobs_lock:
-        _jobs[job_id] = job
-        while len(_jobs) > _MAX_JOBS:
-            _jobs.popitem(last=False)
-    threading.Thread(target=_run, args=(job_id,), daemon=True).start()
-    return job_id
-
-
-def get(job_id: str) -> dict | None:
-    with _jobs_lock:
-        return _jobs.get(job_id)
-
-
-def recent(limit: int = 40) -> list[dict]:
-    with _jobs_lock:
-        return list(reversed(list(_jobs.values())))[:limit]
-
-
-def _set(job_id: str, **kw) -> None:
-    with _jobs_lock:
-        job = _jobs.get(job_id)
-        if job:
-            job.update(kw)
-
-
-def _run(job_id: str) -> None:
-    job = get(job_id)
-    if not job:
-        return
-    spec = job["spec"]
-    started = time.time()
-
-    # Per-node serialisation: the pool allows 6 concurrent sessions, but two
-    # sessions attaching the SAME node's console is untested and presumed
-    # unsafe, so a job locks every node it will drive, in sorted order to
-    # avoid deadlock.
-    drive = sorted({spec["source"]["label"]}
-                   | ({spec["vantage"]["label"]} if spec.get("vantage") else set()))
-    try:
-        with _CONSOLE_SLOTS:
-            _set(job_id, status="running", stage="opening console session",
-                 started_at=datetime.now(timezone.utc).isoformat())
-            locks = [_node_lock(x) for x in drive]
-            for lk in locks:
-                lk.acquire()
-            try:
-                cml = cml_api.connect()
-                with Console(cml) as con:
-                    result = _execute(job_id, con, spec)
-            finally:
-                for lk in reversed(locks):
-                    lk.release()
-        result["elapsed_s"] = round(time.time() - started, 1)
-        _set(job_id, status="done", stage="complete", result=result,
-             ended=datetime.now(timezone.utc).isoformat())
-    except Exception as e:                     # noqa: BLE001 - surfaced to the UI
-        _set(job_id, status="error", stage="failed",
-             error=f"{type(e).__name__}: {e}",
-             ended=datetime.now(timezone.utc).isoformat())
-
-
-def _execute(job_id: str, con: Console, spec: dict) -> dict:
-    source = spec["source"]                 # full node dict
-    target = spec["target"]                 # full node dict
-    methods = spec.get("methods", ["ip"])
-    count = int(spec.get("count", 5))
-    target_ip = spec.get("target_ip")
-    vantage = spec.get("vantage")           # node dict or None
-
-    out: dict = {
-        "source": source["label"],
-        "target": target["label"],
-        "methods": methods,
-        "count": count,
-        "dns": None,
-        "ping_ip": None,
-        "ping_dns": None,
-        "notes": [],
-    }
-
-    # ------------------------------------------------------------ 1. resolve
-    resolved_ip = None
-    if "dns" in methods:
-        fqdn = (target.get("dns") or {}).get("fqdn")
-        resolver = source.get("resolver") or target.get("resolver")
-        if not fqdn:
-            out["dns"] = {"ok": False, "reason":
-                          "this node has no name in the internal zone (no site "
-                          "or no address in the manifest)"}
-        elif not vantage:
-            out["dns"] = {"ok": False, "reason":
-                          "no running Linux node available to ask a resolver "
-                          "from — start a desktop or a dnsmasq node"}
-        elif not resolver:
-            out["dns"] = {"ok": False, "reason":
-                          "no resolver is defined for this source's site"}
-        else:
-            _set(job_id, stage=f"resolving {fqdn} from {vantage['label']}")
-            raw = con.linux_exec(vantage["label"],
-                                 f"nslookup {fqdn} {resolver}", timeout_ms=25000,
-                                 line=vantage.get("console_line", 0))
-            parsed = parse_nslookup(raw)
-            expected = (target.get("dns") or {}).get("a_record")
-            parsed.update({
-                "fqdn": fqdn,
-                "resolver": resolver,
-                "vantage": vantage["label"],
-                "vantage_is_source": vantage["label"] == source["label"],
-                "expected": expected,
-                "raw": raw,
-            })
-            if parsed["ok"]:
-                resolved_ip = parsed["addresses"][0]
-                parsed["matches_manifest"] = (
-                    expected is not None and resolved_ip == expected)
-            parsed["offnet_vantage"] = bool(vantage.get("_offnet"))
-            out["dns"] = parsed
-
-            # An off-net vantage failing to reach an internal resolver is the
-            # design working, not a fault, and must never be reported as one.
-            if vantage.get("_offnet"):
-                out["notes"].append(
-                    f"{vantage['label']} sits OUTSIDE the enterprise perimeter, and "
-                    f"it was the only node with a usable shell that was running. An "
-                    f"internal resolver is not supposed to answer it, so a failed "
-                    f"lookup here is expected behaviour rather than evidence of a "
-                    f"DNS fault. Start a desktop inside the estate for a real test.")
-                if not parsed["ok"]:
-                    parsed["inconclusive"] = True
-
-            if not parsed.get("vantage_is_source"):
-                out["notes"].append(
-                    f"{source['label']} is an IOS/ASA device and ships "
-                    f"`no ip domain lookup`, so it cannot resolve a name itself. "
-                    f"The lookup was run from {vantage['label']} against the same "
-                    f"resolver ({resolver}); the ping below still comes from "
-                    f"{source['label']}.")
-
-    # ------------------------------------------------------------ 2. ping by IP
-    if "ip" in methods and target_ip:
-        _set(job_id, stage=f"pinging {target_ip} from {source['label']}")
-        out["ping_ip"] = _ping(con, source, target_ip, count)
-        out["ping_ip"]["dest"] = target_ip
-        out["ping_ip"]["via"] = "manifest address"
-
-    # ------------------------------------------------------- 3. ping resolved
-    if resolved_ip:
-        if target_ip and resolved_ip == target_ip and out.get("ping_ip"):
-            # Same address by both paths: DNS is correct and one measurement
-            # covers both.  Re-pinging would double the run time to produce a
-            # second sample of the identical path, which is not more evidence.
-            out["ping_dns"] = dict(out["ping_ip"])
-            out["ping_dns"]["via"] = "resolved address (identical to manifest)"
-            out["ping_dns"]["reused"] = True
-        else:
-            _set(job_id, stage=f"pinging resolved {resolved_ip} from {source['label']}")
-            out["ping_dns"] = _ping(con, source, resolved_ip, count)
-            out["ping_dns"]["dest"] = resolved_ip
-            out["ping_dns"]["via"] = "resolved address"
-
-    out["verdict"] = _verdict(out)
-    return out
-
-
 def _ping(con: Console, source: dict, dest: str, count: int) -> dict:
     if source.get("probe_family") == "linux":
         # console_line 1 for containers — line 0 is the service's stdout, and
@@ -382,54 +191,3 @@ def _ping(con: Console, source: dict, dest: str, count: int) -> dict:
         return con.linux_ping(source["label"], dest, count=count,
                               line=source.get("console_line", 0))
     return con.ping(source["label"], dest, count=count)
-
-
-def _verdict(out: dict) -> dict:
-    """A single sentence that says what was and was not established."""
-    ip_r, dns_r, dns = out.get("ping_ip"), out.get("ping_dns"), out.get("dns")
-
-    best = None
-    for r in (ip_r, dns_r):
-        if r and r.get("loss_pct") is not None:
-            best = r if best is None else min(best, r, key=lambda x: x["loss_pct"])
-
-    if best is None:
-        return {"level": "unknown",
-                "text": "No ping summary came back — the source console did not "
-                        "return a parseable result. Treat this as an untested "
-                        "path, not a failure."}
-
-    loss = best["loss_pct"]
-    rtt = (best.get("rtt_ms") or {}).get("avg")
-    rtt_txt = f", {rtt} ms average" if rtt is not None else ""
-
-    if dns and dns.get("ok") and dns.get("matches_manifest") is False:
-        return {"level": "warn",
-                "text": f"Reachable ({100 - loss}% of packets{rtt_txt}), but DNS "
-                        f"answered {dns['addresses'][0]} where the manifest says "
-                        f"{dns.get('expected')}. The name and the address plan "
-                        f"disagree — one of them is stale."}
-
-    # A working ping with a failed lookup is not a pass.  Reporting only the ping
-    # would say "reachable" about a service that nothing can find by name.
-    if dns and not dns.get("ok") and not dns.get("inconclusive"):
-        return {"level": "warn",
-                "text": f"ICMP got through ({100 - loss}% of packets{rtt_txt}) but "
-                        f"the name did not resolve: {dns.get('reason')}. The address "
-                        f"works; the name does not."}
-    if dns and dns.get("inconclusive"):
-        return {"level": "warn",
-                "text": f"Reachable ({100 - loss}% of packets{rtt_txt}). DNS was NOT "
-                        f"established — the only available vantage was outside the "
-                        f"perimeter, where an internal name is not meant to resolve."}
-    if loss == 0:
-        return {"level": "ok",
-                "text": f"Reachable — no packet loss{rtt_txt}."}
-    if loss < 100:
-        gap = best.get("longest_gap_s")
-        gap_txt = f" Longest unanswered run: {gap}s." if gap else ""
-        return {"level": "warn",
-                "text": f"Partial: {loss}% loss{rtt_txt}.{gap_txt}"}
-    return {"level": "fail",
-            "text": "Unreachable — every packet was lost. This says nothing about "
-                    "why; check the path, not the endpoint."}

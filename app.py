@@ -29,14 +29,17 @@ if str(SKILL_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SKILL_SCRIPTS))
 
 import cml_api          # noqa: E402
+import cmlsource        # noqa: E402
 import features         # noqa: E402
 import model            # noqa: E402
+import pathtrace        # noqa: E402
 import probes           # noqa: E402
 
 app = Flask(__name__)
 
 PORT = 5057
-TOPOLOGY_TTL_S = 120     # how long a live topology pull is reused
+TOPOLOGY_TTL_S = 5       # how long a live topology pull is reused; short, so a
+                         # change made in CML shows on the page's next refresh
 STATE_TTL_S = 4          # how long node states are reused
 
 _cache: dict = {"topology": None, "topology_at": 0, "topology_source": None,
@@ -48,7 +51,7 @@ def _now() -> float:
     return time.time()
 
 
-def _fetch_topology() -> tuple[dict, str, str | None]:
+def _fetch_topology(force: bool = False) -> tuple[dict, str, str | None]:
     """Live topology if the lab is reachable, else the cached snapshot.
 
     The cached file under data/ is what render_configs builds from, and it is
@@ -58,7 +61,7 @@ def _fetch_topology() -> tuple[dict, str, str | None]:
     So the source is always reported alongside the data.
     """
     with _cache_lock:
-        if _cache["topology"] and _now() - _cache["topology_at"] < TOPOLOGY_TTL_S:
+        if not force and _cache["topology"] and _now() - _cache["topology_at"] < TOPOLOGY_TTL_S:
             return _cache["topology"], _cache["topology_source"], _cache["error"]
 
     topo, source, error = None, None, None
@@ -82,10 +85,10 @@ def _fetch_topology() -> tuple[dict, str, str | None]:
     return topo, source, error
 
 
-def _fetch_states() -> tuple[dict[str, str], str | None]:
+def _fetch_states(force: bool = False) -> tuple[dict[str, str], str | None]:
     """label -> state, from the live lab.  Empty dict if the lab is unreachable."""
     with _cache_lock:
-        if _cache["states"] is not None and _now() - _cache["states_at"] < STATE_TTL_S:
+        if not force and _cache["states"] is not None and _now() - _cache["states_at"] < STATE_TTL_S:
             return _cache["states"], None
     try:
         cml = cml_api.connect()
@@ -139,15 +142,28 @@ def _live_primary(n: dict) -> str | None:
     return addrs[0]["ip"]
 
 
-def _inventory() -> dict:
-    topo, source, topo_error = _fetch_topology()
-    states, state_error = _fetch_states()
+def _inventory(force: bool = False) -> dict:
+    topo, source, topo_error = _fetch_topology(force)
+    states, state_error = _fetch_states(force)
     inv = model.build_inventory(topology=topo)
 
-    try:
-        issues = features.issues_by_node([n["label"] for n in inv["nodes"]])
-    except Exception:                          # noqa: BLE001
-        issues = {}
+    # CML is the source of truth for what each node is and holds; the
+    # manifest values survive only as `declared`, for comparison.
+    cml_reads: dict = {}
+    lab_at = None
+    if source == "live":
+        try:
+            cml = cml_api.connect()
+            lab = cmlsource.fetch(cml, force)
+            configs, cfg_err = cmlsource.node_configs(cml, topo.get("nodes", []), force)
+            cml_reads = dict(lab["reads"], topology=None, configs=cfg_err)
+            lab_at = lab["at"]
+            cmlsource.apply(inv, topo, lab, configs, model.ROLE_LAYER, model.LAYER_TITLE,
+                            model.ROLE_TITLE)
+        except Exception as e:                 # noqa: BLE001
+            cml_reads = {"topology": None, "detail": f"{type(e).__name__}: {e}"}
+    else:
+        cml_reads = {"topology": topo_error or "unreachable"}
 
     harvested = features.harvest_nodes()
 
@@ -155,7 +171,6 @@ def _inventory() -> dict:
     for n in inv["nodes"]:
         n["state"] = states.get(n["label"])
         n["up"] = n["state"] in ("STARTED", "BOOTED")
-        n["issues"] = issues.get(n["label"], [])
         # Live addresses read off the device outrank the manifest everywhere
         # they exist — the manifest says what SHOULD be, the device says what
         # IS.  Each record keeps its read time so staleness is visible.
@@ -179,8 +194,25 @@ def _inventory() -> dict:
             "absent": len(inv["ghosts"]),
         },
         "refresh_seconds": STATE_TTL_S,
+        "cml_reads": cml_reads,
+        "lab_read_at": lab_at,
+        "manifest": model.MANIFEST.exists(),
     }
     return inv
+
+
+def _address_owners(nodes: list[dict]) -> dict[str, str]:
+    """ip -> node label, from every address the inventory knows (CML, config,
+    device reads, manifest).  Used to name traceroute hops."""
+    out: dict[str, str] = {}
+    for n in nodes:
+        for a in (n.get("live") or {}).get("addresses") or []:
+            out.setdefault(a["ip"], n["label"])
+        for a in n.get("addresses") or []:
+            if a.get("kind") and "virtual" in str(a.get("kind")):
+                continue          # an HSRP VIP belongs to whichever peer is active
+            out.setdefault(a["value"], n["label"])
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -194,82 +226,44 @@ def index():
 
 @app.get("/api/inventory")
 def api_inventory():
-    return jsonify(_inventory())
+    return jsonify(_inventory(force=request.args.get("fresh") == "1"))
 
 
-@app.get("/api/state")
-def api_state():
-    """Cheap poll: just the live states, for the auto-refresh tick."""
-    states, err = _fetch_states()
-    up = sum(1 for s in states.values() if s in ("STARTED", "BOOTED"))
-    return jsonify({
-        "states": states,
-        "error": err,
-        "counts": {"total": len(states), "up": up, "down": len(states) - up},
-        "at": datetime.now(timezone.utc).isoformat(),
-    })
-
-
-@app.post("/api/probe")
-def api_probe():
+@app.post("/api/trace")
+def api_trace():
     body = request.get_json(force=True) or {}
-    src_label = (body.get("source") or "").strip()
-    dst_label = (body.get("target") or "").strip()
-    methods = [m for m in (body.get("methods") or ["ip"]) if m in ("ip", "dns")]
-    count = max(1, min(int(body.get("count", 5)), 50))
-
-    inv = _inventory()
+    inv = _inventory(force=True)       # trace against the lab as it is right now
     by_label = {n["label"]: n for n in inv["nodes"]}
-    source, target = by_label.get(src_label), by_label.get(dst_label)
-
+    source, target = by_label.get(body.get("source", "")), by_label.get(body.get("target", ""))
     if not source or not target:
         return jsonify({"error": "unknown source or target node"}), 404
     if not source["can_source_probe"]:
-        return jsonify({"error": f"{src_label} has no console this tool can drive "
-                                 f"({source['node_definition']}), so it cannot be "
-                                 f"a probe source. It can still be a target."}), 400
+        return jsonify({"error": f"{source['label']} has no console this tool can drive, "
+                                 f"so it cannot send the test traffic."}), 400
     if not source["up"]:
-        return jsonify({"error": f"{src_label} is {source['state'] or 'not running'} "
-                                 f"— a probe needs a booted source."}), 409
-
-    # Target preference: what the user picked > the address the DEVICE holds
-    # right now > the manifest's declaration.  A DHCP desktop has no manifest
-    # address at all, and a renumbered device's manifest address is a stale
-    # target — the live read covers both.
-    target_ip = (body.get("target_ip") or target.get("live_ip")
-                 or target.get("primary_ip"))
-    if "ip" in methods and not target_ip:
-        return jsonify({"error": f"{dst_label} has no live-read address and none "
-                                 f"in the manifest — run an address harvest, or "
-                                 f"give an explicit target_ip."}), 400
-
+        return jsonify({"error": f"{source['label']} is {source['state'] or 'not running'}."}), 409
+    target_ip = body.get("target_ip") or target.get("live_ip") or target.get("primary_ip")
+    if not target_ip:
+        return jsonify({"error": f"No address known for {target['label']}."}), 400
+    count = max(20, min(int(body.get("count", 100)), 500))
+    # Optional: also ask a resolver for the target's name, from the source
+    # itself when it has a shell, else from a Linux node at the same site.
     vantage = None
-    if "dns" in methods:
+    if body.get("dns") and (target.get("dns") or {}).get("fqdn"):
         vantage = probes.pick_dns_vantage(source, inv["nodes"], source.get("site"))
-
-    job_id = probes.submit({
-        "source": source, "target": target, "methods": methods,
-        "count": count, "target_ip": target_ip, "vantage": vantage,
-    })
-    job = probes.get(job_id)
-    return jsonify({
-        "job_id": job_id,
-        "eta_seconds": job["eta_seconds"],
-        "vantage": vantage["label"] if vantage else None,
-        "target_ip": target_ip,
-    })
+    job_id = pathtrace.submit({"source": source, "target": target, "target_ip": target_ip,
+                               "count": count, "nodes": inv["nodes"], "dns": bool(body.get("dns")),
+                               "vantage": vantage, "owners": _address_owners(inv["nodes"])})
+    job = pathtrace.get(job_id)
+    return jsonify({"job_id": job_id, "eta_seconds": job["eta_seconds"], "target_ip": target_ip})
 
 
-@app.get("/api/probe/<job_id>")
-def api_probe_get(job_id: str):
-    job = probes.get(job_id)
+@app.get("/api/trace/<job_id>")
+def api_trace_get(job_id: str):
+    job = pathtrace.get(job_id)
     if not job:
         return jsonify({"error": "unknown job"}), 404
-    # The spec holds two whole node dicts; strip them so the poll stays small.
-    out = {k: v for k, v in job.items() if k != "spec"}
-    out["source"] = job["spec"]["source"]["label"]
-    out["target"] = job["spec"]["target"]["label"]
-    return jsonify(out)
+    return jsonify({k: v for k, v in job.items() if k != "spec"})
 
 
 @app.get("/api/matrix")
@@ -298,22 +292,6 @@ def api_dhcp(label: str):
         return jsonify(features.read_lease(node))
     except Exception as e:                     # noqa: BLE001
         return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
-
-
-@app.get("/api/simstats")
-def api_simstats():
-    """Live per-link packet/drop counters — 0.04s for the whole lab, no console.
-
-    The client diffs two samples to show packets-per-second per link, which is
-    the 'prefer interface counters' instrument at estate scale.
-    """
-    try:
-        cml = cml_api.connect()
-        s = cml.simulation_stats()
-        return jsonify({"links": s.get("links", {}),
-                        "at": datetime.now(timezone.utc).isoformat()})
-    except Exception as e:                     # noqa: BLE001
-        return jsonify({"error": f"{type(e).__name__}: {e}"}), 502
 
 
 @app.get("/api/console-log/<path:label>")
@@ -360,36 +338,13 @@ def api_dnsaudit_run():
     return (jsonify(r), 409) if r.get("error") else jsonify(r)
 
 
-@app.get("/api/issues")
-def api_issues():
-    sections = features.known_issues()
-    return jsonify([{k: v for k, v in s.items() if k != "body"} for s in sections])
-
-
 @app.get("/api/export.csv")
 def api_export_csv():
     inv = _inventory()
-    issues = {n["label"]: n.get("issues", []) for n in inv["nodes"]}
-    csv_text = features.inventory_csv(inv["nodes"], issues)
+    csv_text = features.inventory_csv(inv["nodes"])
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     return Response(csv_text, mimetype="text/csv", headers={
         "Content-Disposition": f'attachment; filename="p45-inventory-{stamp}.csv"'})
-
-
-@app.get("/api/probes")
-def api_probes():
-    out = []
-    for job in probes.recent():
-        out.append({
-            "id": job["id"],
-            "status": job["status"],
-            "source": job["spec"]["source"]["label"],
-            "target": job["spec"]["target"]["label"],
-            "methods": job["spec"]["methods"],
-            "created": job["created"],
-            "verdict": (job.get("result") or {}).get("verdict"),
-        })
-    return jsonify(out)
 
 
 if __name__ == "__main__":

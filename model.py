@@ -224,7 +224,11 @@ def console_line(node_definition: str) -> int:
 # --------------------------------------------------------------------------
 
 def load_manifest() -> dict:
-    return yaml.safe_load(MANIFEST.read_text(encoding="utf-8"))
+    """The plan.  Optional: without it, everything comes from CML and there is
+    simply nothing to compare against."""
+    if not MANIFEST.exists():
+        return {}
+    return yaml.safe_load(MANIFEST.read_text(encoding="utf-8")) or {}
 
 
 def load_topology() -> dict:

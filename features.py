@@ -1,4 +1,4 @@
-"""NetView extras: baseline matrix, live DHCP lease, known-issue index, CSV.
+"""NetView extras: baseline matrix, live DHCP lease, DNS audit, address harvest, CSV.
 
 Each of these reuses something the repo already owns rather than inventing a
 parallel version of it:
@@ -6,7 +6,6 @@ parallel version of it:
     matrix        probe_matrix.PROBES — the curated baseline path list, including
                   its EXPECTED-FAIL convention
     dhcp          dhcp_check.parse_lease — the tested `show dhcp lease` regexes
-    issues        docs/known-issues.md — parsed, not duplicated
 """
 from __future__ import annotations
 
@@ -632,66 +631,7 @@ def _harvest_one(con: Console, n: dict) -> dict:
 
 
 # ==========================================================================
-# 3. Known-issue index
-# ==========================================================================
-
-_H = re.compile(r"^##\s+(?P<status>FIXED|OPEN|Historical\w*)[^\n]*?—\s*(?P<rest>.+)$")
-_NUM = re.compile(r"^(?P<num>\d+[a-z]?)\.\s*(?P<title>.+)$")
-
-
-def known_issues() -> list[dict]:
-    """Parse docs/known-issues.md into sections, keeping OPEN ones separate."""
-    path = REPO / "docs" / "known-issues.md"
-    if not path.exists():
-        return []
-    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-
-    sections, current = [], None
-    for i, line in enumerate(lines):
-        m = _H.match(line.strip())
-        if m:
-            if current:
-                sections.append(current)
-            rest = m.group("rest").strip()
-            nm = _NUM.match(rest)
-            current = {
-                "status": m.group("status").upper(),
-                "id": nm.group("num") if nm else None,
-                "title": nm.group("title") if nm else rest,
-                "line": i + 1,
-                "body": [],
-            }
-        elif current:
-            current["body"].append(line)
-    if current:
-        sections.append(current)
-    return sections
-
-
-def issues_by_node(labels: list[str]) -> dict[str, list[dict]]:
-    """label -> the OPEN issues whose section names that node.
-
-    Only OPEN sections produce a badge.  A fixed issue that once named a device
-    is history, and badging it would put a permanent warning on hardware that is
-    working — which trains people to ignore the badge.
-    """
-    sections = [s for s in known_issues() if s["status"] == "OPEN"]
-    out: dict[str, list[dict]] = {}
-    for s in sections:
-        text = "\n".join(s["body"])
-        for label in labels:
-            # Word-boundary match so `AP-HQ-1` does not also hit `AP-HQ-10`, and
-            # so a bare `DNS` in prose does not tag every resolver.
-            if len(label) < 4:
-                continue
-            if re.search(r"(?<![\w-])" + re.escape(label) + r"(?![\w-])", text):
-                out.setdefault(label, []).append(
-                    {"id": s["id"], "title": s["title"], "line": s["line"]})
-    return out
-
-
-# ==========================================================================
-# 4. CSV export
+# 3. CSV export
 # ==========================================================================
 
 CSV_COLUMNS = [
@@ -699,11 +639,11 @@ CSV_COLUMNS = [
     "node_definition", "primary_ip", "fqdn", "a_record", "cnames",
     "resolver", "gateway", "addressing", "dhcp_vlan", "dhcp_scope",
     "vlans", "config_status", "template", "interface_count", "link_count",
-    "hsrp", "failover", "wlc_ha", "open_issues",
+    "hsrp", "failover", "wlc_ha",
 ]
 
 
-def inventory_csv(nodes: list[dict], issues: dict[str, list[dict]]) -> str:
+def inventory_csv(nodes: list[dict]) -> str:
     buf = io.StringIO()
     w = csv.writer(buf, lineterminator="\n")
     w.writerow(CSV_COLUMNS)
@@ -722,6 +662,5 @@ def inventory_csv(nodes: list[dict], issues: dict[str, list[dict]]) -> str:
             n.get("config_status"), n.get("template"),
             n.get("interface_count"), len(n.get("links") or []),
             ha.get("hsrp_role"), ha.get("failover_role"), ha.get("wlc_role"),
-            " ".join(f"#{i['id']}" for i in issues.get(n.get("label"), [])),
         ])
     return buf.getvalue()
