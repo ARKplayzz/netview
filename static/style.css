@@ -1,8 +1,9 @@
 /* NetView - lab workbench.
  *
  * Built like a desktop network tool rather than a web dashboard: menu bar,
- * toolbar, a gridded canvas, a properties sidebar for the selection and a
- * bottom pane for the node table, lab checks and consoles.  Square corners,
+ * node list on the left, the path view in the middle, a properties sidebar
+ * for the selection and a bottom pane for the node table, lab checks and
+ * consoles.  Square corners,
  * hairline borders, no shadows except on menus, one accent colour.  State is
  * carried by plain coloured text and small square lamps.  System fonts so the
  * page still renders when the network is the thing that is broken.
@@ -102,56 +103,74 @@ a { color: var(--sel); }
 .msep { height: 1px; background: var(--line2); margin: 3px 0; }
 .mhead { padding: 4px 14px 2px; color: var(--ink3); }
 
-/* ------------------------------------------------------------- toolbar -- */
-.toolbar { height: 34px; display: flex; align-items: center; gap: 6px; padding: 0 8px;
-           background: var(--tool); border-bottom: 1px solid var(--line); flex: none; }
-.toolbar label { white-space: nowrap; display: flex; align-items: center; margin-right: 6px; color: var(--ink); cursor: pointer; }
-.toolbar .tlabel { color: var(--ink3); margin-right: 2px; }
-.tsep { width: 1px; height: 18px; background: var(--line); margin: 0 6px; }
-#q { width: 230px; }
-
 .infobar { background: var(--infobg); border-bottom: 1px solid var(--infoln); flex: none;
            padding: 4px 10px; display: flex; flex-direction: column; gap: 2px; }
 .infobar div { display: flex; gap: 10px; align-items: baseline; }
 .infobar .bad { color: var(--bad); font-weight: 600; }
 
 /* ---------------------------------------------------------- work area -- */
-.work { flex: 1; min-height: 0; display: grid; grid-template-columns: minmax(0, 1fr) var(--side-w); }
-.center { display: grid; grid-template-rows: minmax(0, 1fr) 4px var(--pane-h); min-width: 0; min-height: 0; }
+.work { flex: 1; min-height: 0; display: grid; grid-template-columns: 240px minmax(0, 1fr) var(--side-w); }
+.center { display: grid; grid-template-rows: minmax(0, 1fr) 4px var(--pane-h); grid-template-columns: minmax(0, 1fr);
+          min-width: 0; min-height: 0; }
 .center.pane-min { grid-template-rows: minmax(0, 1fr) 4px 26px; }
 
-.canvas-wrap { position: relative; overflow: hidden; background: var(--canvas); min-height: 0; }
-.canvas { width: 100%; height: 100%; display: block; outline: none; user-select: none; cursor: default; }
-.canvas.panning { cursor: move; }
-.grid-s { fill: none; stroke: var(--grid-s); stroke-width: 1; }
-.grid-l { fill: none; stroke: var(--grid-l); stroke-width: 1; }
-.zoomread { position: absolute; right: 8px; bottom: 6px; color: var(--ink3); font: 11px var(--mono);
-            pointer-events: none; }
+/* path view: the main area */
+.pathview { display: flex; flex-direction: column; min-height: 0; background: var(--canvas); }
+.path-head { display: flex; align-items: center; gap: 12px; padding: 0 10px; height: 38px; flex: none;
+             background: var(--tool); border-bottom: 1px solid var(--line); white-space: nowrap; overflow-x: auto; }
+.path-head label { display: flex; align-items: center; gap: 5px; color: var(--ink2); }
+.path-head select { max-width: 200px; }
+.path-body { flex: 1; min-height: 0; overflow: auto; }
+.path-status { padding: 8px 14px 0; display: flex; gap: 6px; align-items: baseline; flex-wrap: wrap; }
+.path-status .meter { flex-basis: 100%; max-width: 420px; }
+.path-changed { margin: 6px 14px 0; padding: 4px 8px; background: var(--infobg); border: 1px solid var(--infoln);
+                color: var(--warn); display: inline-block; }
+.path-findings { padding: 4px 14px 12px; color: var(--ink2); display: grid; gap: 3px; }
+.path-empty { padding: 48px 24px; max-width: 560px; color: var(--ink2); }
+.path-empty .pe-t { font-size: 15px; color: var(--ink); margin-bottom: 8px; }
+.pdiag { padding: 6px 4px 8px; }
+.pdiag svg { display: block; }
+.pdiag .node.hov .sel-box { stroke: var(--ink3); stroke-width: 1; stroke-dasharray: 2 2; }
+.pdiag .lbl { font-size: 12px; }
+.pdiag .ipl { font-size: 10.5px; }
+.pdiag .rate { font-size: 10px; }
 
-/* topology */
-.wire { stroke: var(--wire); stroke-width: 1.5; fill: none; }
-.wire.off { stroke-dasharray: 3 3; }
-.wire.hl { stroke: var(--sel); stroke-width: 2.5; }
-.wire.dim { opacity: .15; }
-.wire.busy { stroke: var(--ok); }
-.wire.drops { stroke: var(--bad); }
-.wire-hit { stroke: transparent; stroke-width: 9; fill: none; }
-.iflbl, .rate { font: 9.5px var(--mono); fill: var(--ink2); paint-order: stroke;
-                stroke: var(--canvas); stroke-width: 3px; pointer-events: none; }
-.rate { fill: var(--ok); }
+/* node list (left) */
+.nodes { background: var(--panel); border-right: 1px solid var(--line); display: flex; flex-direction: column;
+         min-height: 0; min-width: 0; }
+.nl-head { display: grid; gap: 6px; padding: 8px; border-bottom: 1px solid var(--line); background: var(--tool); }
+.nl-head input, .nl-head select { width: 100%; }
+.nlist { overflow-y: auto; flex: 1; }
+.nl-grp { padding: 6px 8px 3px; color: var(--ink3); background: var(--tool); border-bottom: 1px solid var(--line2);
+          position: sticky; top: 0; z-index: 1; }
+.nl-row { display: grid; grid-template-columns: 14px minmax(0, 1fr) auto; gap: 4px; align-items: center;
+          padding: 3px 8px; border-bottom: 1px solid var(--line2); cursor: default; }
+.nl-row:hover { background: var(--hover); }
+.nl-row.sel { background: var(--selbg); }
+.nl-row.off .nl-name { color: var(--ink3); }
+.nl-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.nl-sub { font: 10.5px var(--mono); color: var(--ink3); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.nl-acts { display: flex; gap: 8px; }
+.nl-acts .linkish { visibility: hidden; font-size: 11px; }
+.nl-row:hover .nl-acts .linkish, .nl-row.sel .nl-acts .linkish { visibility: visible; }
+.nl-acts .linkish:disabled { color: var(--ink3); text-decoration: none; }
+.nl-end { font: 700 10px var(--sans); color: var(--sel); }
+.nl-row.is-from, .nl-row.is-to { box-shadow: inset 3px 0 0 var(--sel); }
+.menu-btn { border: 0; border-left: 1px solid var(--line); border-radius: 0; background: none; padding: 0 12px; }
+.navbtn { border: 0; border-right: 1px solid var(--line); border-radius: 0; background: none; padding: 0 10px; }
+
+/* topology marks, shared by the path diagram */
+.wire { stroke: var(--wire); stroke-width: 1.5; fill: none; stroke-linejoin: round; }
+.rate { font: 9.5px var(--mono); fill: var(--ok); paint-order: stroke; stroke: var(--canvas); stroke-width: 3px; }
 .rate.bad { fill: var(--bad); }
-
 .node { cursor: pointer; }
 .node .body { fill: var(--dev); }
 .node.off .body { fill: var(--devoff); }
 .node.ghost .body { fill: none; stroke: var(--bad); stroke-width: 1.5; stroke-dasharray: 3 2; }
-.node.ghost .glyph { stroke: var(--bad); }
 .node .glyph { stroke: #fff; fill: none; stroke-width: 1.6; stroke-linecap: square; }
 .node .sel-box { fill: none; stroke: none; }
-.node:hover .sel-box { stroke: var(--ink3); stroke-width: 1; stroke-dasharray: 2 2; }
 .node.sel .sel-box { stroke: var(--sel); stroke-width: 1.5; stroke-dasharray: none; }
 .node.undecl .sel-box { stroke: var(--warn); stroke-width: 1.2; stroke-dasharray: 4 2; }
-.node.dim { opacity: .18; }
 .node .lamp { stroke: var(--canvas); stroke-width: 1.5; }
 .node .lbl { font: 11px var(--sans); fill: var(--ink); text-anchor: middle;
              paint-order: stroke; stroke: var(--canvas); stroke-width: 4px; }
@@ -160,14 +179,6 @@ a { color: var(--sel); }
 .node .ipl { font: 9.5px var(--mono); fill: var(--ink2); text-anchor: middle;
              paint-order: stroke; stroke: var(--canvas); stroke-width: 4px; }
 .node .ipl.drift { fill: var(--warn); }
-.node .iss { font: 700 9px var(--sans); fill: #fff; text-anchor: middle; }
-.park { fill: none; stroke: var(--line); stroke-width: 1; }
-.park-t { font: 10.5px var(--sans); fill: var(--ink3); }
-.path { fill: none; stroke-width: 2; }
-.path.run { stroke: var(--sel); stroke-dasharray: 6 4; }
-.path.ok { stroke: var(--ok); }
-.path.warn { stroke: var(--warn); stroke-dasharray: 6 4; }
-.path.bad { stroke: var(--bad); stroke-dasharray: 2 3; }
 
 .splitter { background: var(--bar); border-top: 1px solid var(--line); cursor: row-resize; }
 .splitter:hover { background: var(--line); }
@@ -278,10 +289,9 @@ table.p tr.drift td { background: var(--infobg); }
 .pickbar { background: var(--selbg); border-bottom: 1px solid var(--sel); flex: none; padding: 4px 10px;
            display: flex; gap: 12px; align-items: baseline; }
 .pickbar .t { font-weight: 700; color: var(--sel); }
-.canvas.picking, .canvas.picking .node { cursor: crosshair; }
-.node.t-nopick { opacity: .25; }
-.node.t-dim, .wire.t-dim { opacity: .1; }
 .node.t-idle { opacity: .45; }
+.node.t-was { opacity: .55; }
+.wire.t-prev { stroke: var(--ink3); stroke-dasharray: 2 4; stroke-width: 2; }
 .node.t-end .sel-box { stroke: var(--sel); stroke-width: 2; stroke-dasharray: none; }
 .node.t-stop .sel-box { stroke: var(--bad); stroke-width: 2.5; stroke-dasharray: none; }
 .t-tag { font: 700 9.5px var(--sans); fill: var(--sel); text-anchor: middle; letter-spacing: .04em;
@@ -290,26 +300,29 @@ table.p tr.drift td { background: var(--infobg); }
 .wire.t-both { stroke: var(--ok); stroke-width: 4; }
 .wire.t-one { stroke: var(--warn); stroke-width: 4; stroke-dasharray: 9 3; }
 .wire.t-fwd { stroke: var(--bad); stroke-width: 4; }
-.tdiag { padding: 8px; overflow-x: auto; border-bottom: 1px solid var(--line2); background: var(--canvas); }
-.tdiag svg { display: block; }
-.tdiag .lbl { font-size: 10.5px; }
-.tkey { display: flex; gap: 16px; color: var(--ink2); padding-top: 4px; flex-wrap: wrap; }
+.tkey { display: flex; gap: 16px; color: var(--ink2); padding: 4px 10px 0; flex-wrap: wrap; }
 .tkey span { display: flex; gap: 6px; align-items: center; }
 .tcols { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(420px, 100%), 1fr)); gap: 0 1px;
          background: var(--line2); }
-.tcols > div { background: var(--panel); }
+.tcols > div { background: var(--panel); min-width: 0; overflow-x: auto; }
 .tsect-h { padding: 5px 8px; font-weight: 600; background: var(--tool); border-bottom: 1px solid var(--line2); }
 .src { color: var(--ink3); font-size: 11px; margin-left: 6px; white-space: nowrap; }
 
-/* narrow screens: sidebar becomes a sheet over the canvas */
+/* narrow screens: node list and sidebar become sheets */
+.only-narrow { display: none; }
+@media (max-width: 1100px) {
+  :root { --side-w: 290px; }
+  .work { grid-template-columns: 200px minmax(0, 1fr) var(--side-w); }
+}
 @media (max-width: 900px) {
+  .only-narrow { display: inline-block; }
   .work { grid-template-columns: minmax(0, 1fr); }
-  .side { position: fixed; right: 0; top: 62px; bottom: 22px; width: min(92vw, 360px); z-index: 30;
+  .nodes { position: fixed; left: 0; top: 29px; bottom: 22px; width: min(86vw, 300px); z-index: 31;
+           box-shadow: 2px 0 10px rgba(0,0,0,.2); }
+  body:not(.nav-open) .nodes { display: none; }
+  .side { position: fixed; right: 0; top: 29px; bottom: 22px; width: min(92vw, 360px); z-index: 30;
           box-shadow: -2px 0 10px rgba(0,0,0,.2); }
   body:not(.side-open) .side { display: none; }
-  .toolbar { overflow-x: auto; }
-  .toolbar #zoom-in, .toolbar #zoom-out, .toolbar .tsep { display: none; }
-  #q { width: 150px; }
-  .labname, #sel-line, #src-line { display: none; }
-  .center { --pane-h: 42vh; }
+  .labname, #sel-line, #src-line, .menu-note { display: none; }
+  .center { --pane-h: 40vh; }
 }

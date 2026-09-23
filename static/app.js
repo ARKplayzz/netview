@@ -1,9 +1,12 @@
 /* NetView client - lab workbench.
  *
- * Layout follows the CML workbench: menu bar and toolbar on top, the lab
- * canvas (nodes at their CML x/y, cabling from the topology), a properties
- * sidebar for whatever is selected, and a bottom pane holding the node table,
- * the lab-wide checks, the ping log and console tabs.
+ * CML already draws the whole lab, so NetView does not.  The main view is a
+ * path: pick a From and a To, and the nodes between them are laid out left to
+ * right in hop order, with redundant alternatives stacked in the same column.
+ * A trace then shows which of those links the packets actually crossed.
+ * Around it: the node list on the left, a properties sidebar for the selected
+ * node on the right, and a bottom pane with the node table, the lab-wide
+ * checks, the ping log and console tabs.
  *
  * The inventory is fetched once; only /api/state is polled on the tick.
  * Hidden nodes persist as an exclusion list: anything new in the lab defaults
@@ -25,7 +28,7 @@ const store = {
 
 let INV = null, NODES = [], LINKS = [];
 const BY = new Map();
-let selected = null, hovered = null, countdown = REFRESH_S, paused = false;
+let selected = null, countdown = REFRESH_S, paused = false;
 let site = store.get(SITE_KEY, 'all');
 if (!['all', 'HQ', 'DR', 'other'].includes(site)) site = 'all';
 const hidden = new Set(store.get(HIDE_KEY, []));
@@ -66,9 +69,7 @@ async function boot() {
   await loadInventory(false);
   infobar();
   renderAll();
-  fit();
   setInterval(tickSecond, 1000);
-  if (prefs.traffic) startTraffic();
   Object.values(LAB).forEach((t) => t.refresh && t.refresh());
 }
 
@@ -88,7 +89,6 @@ async function loadInventory(fresh) {
   BY.clear();
   NODES.forEach((n) => { Object.assign(n, keep.get(n.label) || {}); BY.set(n.label, n); });
   LINKS = buildLinks();
-  parkUnplaced();
   if (selected && !BY.has(selected)) selected = null;
 }
 
@@ -96,7 +96,8 @@ async function poll(fresh) {
   try {
     await loadInventory(fresh);
     countdown = REFRESH_S;
-    renderCanvas(); renderStatus(); renderPaneTabs();
+    renderPathBody(); renderNodeList(); renderStatus(); renderPaneTabs();
+    if (!$('#path-head').contains(document.activeElement)) renderPathHead();
     if (paneTab === 'nodes') renderPaneBody();
     if (!selected || ['node', 'addresses', 'interfaces'].includes(sideTab)) renderSide();
     if (fresh) infobar();
@@ -122,22 +123,6 @@ function buildLinks() {
   return [...seen.values()].filter((l) => BY.has(l.a) && BY.has(l.b));
 }
 
-/* Nodes with no canvas position (declared-but-absent ghosts, or a topology
- * without x/y) are parked in a frame right of the lab, so they stay visible
- * without pretending to be cabled anywhere. */
-function parkUnplaced() {
-  const placed = NODES.filter((n) => typeof n.x === 'number' && typeof n.y === 'number');
-  const loose = NODES.filter((n) => !placed.includes(n));
-  if (!loose.length) return;
-  const x0 = placed.length ? Math.max(...placed.map((n) => n.x)) + 200 : 0;
-  const y0 = placed.length ? Math.min(...placed.map((n) => n.y)) : 0;
-  loose.forEach((n, i) => {
-    n.x = x0 + Math.floor(i / 6) * 150;
-    n.y = y0 + (i % 6) * 100;
-    n.parked = true;
-  });
-}
-
 function infobar() {
   const box = $('#banners');
   box.innerHTML = '';
@@ -146,7 +131,7 @@ function infobar() {
     const d = el('div');
     d.appendChild(el('span', cls, text));
     const x = el('button', 'linkish', 'Dismiss');
-    x.addEventListener('click', () => { d.remove(); box.hidden = !box.children.length; fit(); });
+    x.addEventListener('click', () => { d.remove(); box.hidden = !box.children.length; });
     d.appendChild(x);
     box.appendChild(d);
   };
@@ -157,7 +142,7 @@ function infobar() {
   }
   if (m.counts.undeclared) {
     line(null, `${m.counts.undeclared} node(s) are in the lab but not in the manifest and get no generated config. ` +
-      'They have an orange outline on the canvas.');
+      'They are flagged "undeclared" in the node list.');
   }
   box.hidden = !box.children.length;
 }
@@ -264,153 +249,10 @@ const X_ICON = () => {
   return s;
 };
 
-/* --------------------------------------------------------------- canvas -- */
-const view = { x: 0, y: 0, k: 1 };
-const NODE_SIZE = 36;
-
-function applyView() {
-  $('#viewport').setAttribute('transform', `translate(${view.x} ${view.y}) scale(${view.k})`);
-  $('#zoomread').textContent = Math.round(view.k * 100) + '%';
-}
-
-function fit() {
-  const pts = NODES.filter(shown);
-  if (!pts.length) return;
-  const r = $('#canvas').getBoundingClientRect();
-  const xs = pts.map((n) => n.x), ys = pts.map((n) => n.y);
-  const minX = Math.min(...xs) - 70, maxX = Math.max(...xs) + 70;
-  const minY = Math.min(...ys) - 50, maxY = Math.max(...ys) + 60;
-  const k = Math.min((r.width - 40) / (maxX - minX), (r.height - 30) / (maxY - minY), 1.5);
-  view.k = Math.max(0.15, k);
-  view.x = (r.width - (maxX - minX) * view.k) / 2 - minX * view.k;
-  view.y = (r.height - (maxY - minY) * view.k) / 2 - minY * view.k;
-  applyView();
-}
-
-function zoomAt(factor, cx, cy) {
-  const r = $('#canvas').getBoundingClientRect();
-  if (cx == null) { cx = r.width / 2; cy = r.height / 2; }
-  const k = Math.min(4, Math.max(0.12, view.k * factor));
-  view.x = cx - (cx - view.x) * (k / view.k);
-  view.y = cy - (cy - view.y) * (k / view.k);
-  view.k = k;
-  applyView();
-}
-
-function centerOn(n, force) {
-  const r = $('#canvas').getBoundingClientRect();
-  const sx = n.x * view.k + view.x, sy = n.y * view.k + view.y;
-  if (!force && sx > 60 && sx < r.width - 60 && sy > 60 && sy < r.height - 60) return;
-  view.x = r.width / 2 - n.x * view.k;
-  view.y = r.height / 2 - n.y * view.k;
-  applyView();
-}
-
 const shortIf = (s) => (s || '')
   .replace(/^GigabitEthernet/i, 'Gi').replace(/^TenGigabitEthernet/i, 'Te')
   .replace(/^FastEthernet/i, 'Fa').replace(/^Ethernet/i, 'e').replace(/^Management/i, 'Mgmt')
   .replace(/^Port-channel/i, 'Po').replace(/^Vlan/i, 'Vl');
-
-function renderCanvas() {
-  const lg = $('#links'), ng = $('#nodes');
-  lg.innerHTML = ''; ng.innerHTML = '';
-
-  LINKS.forEach((l) => {
-    const a = BY.get(l.a), b = BY.get(l.b);
-    if (!shown(a) || !shown(b)) return;
-    const g = svg('g', { 'data-a': l.a, 'data-b': l.b, 'data-link': l.id || '' });
-    g.appendChild(svg('line', { x1: a.x, y1: a.y, x2: b.x, y2: b.y, class: 'wire' + (a.up && b.up ? '' : ' off') }));
-    const hit = svg('line', { x1: a.x, y1: a.y, x2: b.x, y2: b.y, class: 'wire-hit' });
-    hit.appendChild(svg('title', {}, `${l.a} ${l.ai}  to  ${l.b} ${l.bi}${l.subnet ? '\n' + l.subnet : ''}`));
-    g.appendChild(hit);
-    if (prefs.iface) {
-      [[a, b, l.ai], [b, a, l.bi]].forEach(([p, q, name]) => {
-        const len = Math.hypot(q.x - p.x, q.y - p.y) || 1;
-        const t = Math.min(0.4, 40 / len);
-        g.appendChild(svg('text', { x: p.x + (q.x - p.x) * t, y: p.y + (q.y - p.y) * t + 3,
-                                    class: 'iflbl', 'text-anchor': 'middle' }, shortIf(name)));
-      });
-    }
-    g.appendChild(svg('text', { x: (a.x + b.x) / 2 + 4, y: (a.y + b.y) / 2 - 3, class: 'rate' }, ''));
-    lg.appendChild(g);
-  });
-
-  const parked = NODES.filter((n) => n.parked && shown(n));
-  if (parked.length) {
-    const xs = parked.map((n) => n.x), ys = parked.map((n) => n.y);
-    const x = Math.min(...xs) - 70, y = Math.min(...ys) - 56;
-    ng.appendChild(svg('rect', { x, y, width: Math.max(...xs) - x + 70, height: Math.max(...ys) - y + 60, class: 'park' }));
-    ng.appendChild(svg('text', { x: x + 8, y: y + 15, class: 'park-t' }, 'No canvas position'));
-  }
-
-  const s = NODE_SIZE / 2;
-  NODES.filter(shown).forEach((n) => {
-    const cls = ['node'];
-    if (!n.up) cls.push('off');
-    if (n.ghost) cls.push('ghost');
-    if (n.config_status === 'undeclared') cls.push('undecl');
-    if (n.label === selected) cls.push('sel');
-    const g = svg('g', { class: cls.join(' '), transform: `translate(${n.x} ${n.y})`, 'data-label': n.label });
-    g.appendChild(svg('rect', { x: -s - 4, y: -s - 4, width: NODE_SIZE + 8, height: NODE_SIZE + 8, class: 'sel-box' }));
-    g.appendChild(nodeIcon(n, NODE_SIZE));
-    // state lamp, bottom-right: the same square used in the node table
-    if (!n.ghost) {
-      const c = n.state === 'BOOTED' ? 'var(--ok)' : n.state === 'STARTED' ? 'var(--warn)' : 'var(--devoff)';
-      g.appendChild(svg('rect', { x: s - 5, y: s - 5, width: 9, height: 9, fill: c, class: 'lamp' }));
-    }
-    // open known-issues count, top-left
-    if ((n.issues || []).length) {
-      g.appendChild(svg('rect', { x: -s - 4, y: -s - 4, width: 12, height: 12, fill: 'var(--warn)', class: 'lamp' }));
-      g.appendChild(svg('text', { x: -s + 2, y: -s + 5, class: 'iss' }, String(n.issues.length)));
-    }
-    g.appendChild(svg('text', { y: s + 15, class: 'lbl' }, n.label));
-    if (prefs.ip) {
-      const ip = displayIp(n);
-      const txt = n.ghost ? 'not in lab' : ip.text ? ip.text + (ip.drift ? ' (drift)' : '') : '';
-      if (txt) g.appendChild(svg('text', { y: s + 27, class: 'ipl' + (ip.drift || n.ghost ? ' drift' : '') }, txt));
-    }
-    g.appendChild(svg('title', {}, `${n.label}\n${KIND_NAME[kind(n)]}, ${stateWord(n)[0]}`));
-    ng.appendChild(g);
-  });
-
-  renderPathOverlay();
-  highlight();
-  paintTraffic();
-  paintTrace();
-}
-
-/* Dim anything the filters exclude; light up the focused node's cabling. */
-function highlight() {
-  if (traceShown()) { paintTrace(); return; }
-  const focus = hovered || selected;
-  document.querySelectorAll('#nodes .node').forEach((g) => g.classList.toggle('dim', !matches(BY.get(g.dataset.label))));
-  document.querySelectorAll('#links > g').forEach((g) => {
-    const w = g.querySelector('.wire');
-    w.classList.toggle('hl', !!focus && (g.dataset.a === focus || g.dataset.b === focus));
-    w.classList.toggle('dim', !matches(BY.get(g.dataset.a)) || !matches(BY.get(g.dataset.b)));
-  });
-}
-
-/* A curved line from source to target: dashed while a ping runs, then drawn
- * in the verdict's colour.  Also used when hovering a baseline-matrix row. */
-function drawPath(src, dst, level) {
-  const ov = $('#overlay');
-  ov.innerHTML = '';
-  const a = BY.get(src), b = BY.get(dst);
-  if (!a || !b || !shown(a) || !shown(b)) return;
-  const mx = (a.x + b.x) / 2, my = (a.y + b.y) / 2;
-  const dx = b.x - a.x, dy = b.y - a.y, len = Math.hypot(dx, dy) || 1, bend = Math.min(80, len * 0.22);
-  ov.appendChild(svg('path', { d: `M${a.x} ${a.y}Q${mx - dy / len * bend} ${my + dx / len * bend} ${b.x} ${b.y}`,
-                               class: 'path ' + level }));
-}
-function renderPathOverlay() {
-  $('#overlay').innerHTML = '';
-  const job = probeJobs.find((j) => selected && (j.target === selected || j.source === selected));
-  if (!job) return;
-  const v = job.status === 'done' ? (job.result.verdict || {}).level : null;
-  drawPath(job.source, job.target, job.status === 'error' ? 'bad'
-    : job.status !== 'done' ? 'run' : v === 'ok' ? 'ok' : v === 'fail' ? 'bad' : 'warn');
-}
 
 /* ------------------------------------------------------- link traffic ---- */
 /* Two samples of the lab-wide link counters give live pkts/s and a cumulative
@@ -436,45 +278,28 @@ function startTraffic() {
         });
       }
       lastStats = { t, links: s.links };
-      paintTraffic();
       if (selected && sideTab === 'interfaces') renderSide();
-    } catch (e) { linkRates = {}; paintTraffic(); }
+    } catch (e) { linkRates = {}; }
   };
   sample();
   trafficTimer = setInterval(sample, 3000);
 }
 function stopTraffic() {
   clearInterval(trafficTimer); trafficTimer = null; lastStats = null; linkRates = {};
-  paintTraffic();
-}
-function paintTraffic() {
-  document.querySelectorAll('#links > g').forEach((g) => {
-    const r = prefs.traffic ? linkRates[g.dataset.link] : null;
-    const w = g.querySelector('.wire'), tx = g.querySelector('.rate');
-    w.classList.toggle('busy', !!(r && r.pps >= 1));
-    w.classList.toggle('drops', !!(r && r.drops > 0));
-    w.style.strokeWidth = r && r.pps >= 1 ? String(Math.min(5, 1.5 + Math.log10(r.pps + 1))) : '';
-    tx.textContent = !r ? '' : r.drops > 0 ? `${Math.round(r.pps)} pps, ${r.drops} drops`
-      : r.pps >= 1 ? Math.round(r.pps) + ' pps' : '';
-    tx.classList.toggle('bad', !!(r && r.drops > 0));
-  });
 }
 function setTraffic(on) {
   prefs.traffic = on; savePrefs();
-  $('#show-traffic').checked = on;
   if (on) startTraffic(); else stopTraffic();
   if (selected && sideTab === 'interfaces') renderSide();
 }
 
 /* ------------------------------------------------------------ selection -- */
-function select(label, center) {
+function select(label) {
   selected = label;
   const n = label && BY.get(label);
   if (n && ((sideTab === 'dhcp' && !n.dhcp) || (n.ghost && sideTab === 'ping'))) sideTab = 'node';
-  if (n && center) centerOn(n);
   if (n) document.body.classList.add('side-open');
-  renderCanvas(); renderSide(); renderStatus();
-  if (paneTab === 'nodes') markTableSelection();
+  markPathSelection(); renderSide(); renderStatus();
 }
 
 function hideNode(label) {
@@ -519,7 +344,7 @@ function renderStatus() {
   $('#sel-line').textContent = n ? `${n.label}  (${n.node_definition || 'not in lab'})` : '';
 }
 
-function renderAll() { renderCanvas(); renderStatus(); renderPane(); renderSide(); }
+function renderAll() { renderPathHead(); renderPathBody(); renderNodeList(); renderStatus(); renderPane(); renderSide(); }
 
 /* ============================================================== sidebar == */
 const SIDE_TABS = [['node', 'Node'], ['addresses', 'Addresses'], ['interfaces', 'Interfaces'],
@@ -626,7 +451,7 @@ function labSummary() {
   const link = (n, text, cls) => {
     const a = el('a', cls, text);
     a.href = '#';
-    a.addEventListener('click', (e) => { e.preventDefault(); select(n.label, true); });
+    a.addEventListener('click', (e) => { e.preventDefault(); select(n.label); });
     rows.push([n.label, a]);
   };
   NODES.filter((n) => n.ghost).forEach((n) => link(n, 'in manifest, not in lab', 's-bad'));
@@ -637,7 +462,7 @@ function labSummary() {
     .forEach((n) => link(n, n.issues.map((i) => `#${i.id} ${i.title}`).join('; ')));
   d.appendChild(sect('Needs attention', rows.length ? props(rows) : el('div', 'side-empty', 'Nothing flagged.')));
   d.appendChild(el('div', 'side-empty',
-    'Click a node to inspect it. Right-click for actions. Drag to pan, wheel to zoom, F to fit.'));
+    'Click a node in the list to inspect it; right-click for actions. Choose From and To above the path to trace between two nodes.'));
   return d;
 }
 
@@ -716,14 +541,11 @@ function sideNode(n) {
     p.addEventListener('click', () => { sideTab = 'ping'; renderSide(); });
     acts.appendChild(p);
     if (n.can_source_probe && n.up) {
-      const t = el('button', null, 'Trace from here...');
-      t.addEventListener('click', () => startPick(n.label));
+      const t = el('button', null, 'Trace from here');
+      t.addEventListener('click', () => setTraceEnds(n.label, trace.target === n.label ? null : trace.target));
       acts.appendChild(t);
     }
   }
-  const ce = el('button', null, 'Center');
-  ce.addEventListener('click', () => centerOn(n, true));
-  acts.appendChild(ce);
   const h = el('button', null, 'Hide');
   h.title = 'Hide from the canvas and node table (restore from the status bar)';
   h.addEventListener('click', () => hideNode(n.label));
@@ -810,7 +632,7 @@ function sideInterfaces(n) {
     if (l) {
       const a = el('a', l.state === 'STOPPED' ? 's-dim' : null, l.peer + ' ' + shortIf(l.peer_iface));
       a.href = '#';
-      a.addEventListener('click', (e) => { e.preventDefault(); select(l.peer, true); });
+      a.addEventListener('click', (e) => { e.preventDefault(); select(l.peer); });
       peer.appendChild(a);
       if (l.state === 'STOPPED') peer.appendChild(el('span', 'src', 'link stopped'));
     } else peer.textContent = '-';
@@ -985,7 +807,6 @@ async function runProbe(source, target, target_ip, methods) {
 }
 
 function refreshProbeViews() {
-  renderPathOverlay();
   if (selected && sideTab === 'ping') renderSide();
   if (paneTab === 'pings') renderPaneBody();
   renderPaneTabs();
@@ -1047,9 +868,7 @@ function resultBlock(res) {
 
 /* =========================================================== bottom pane == */
 function showPane(k) {
-  const was = paneTab;
   paneTab = k;
-  if ((was === 'trace') !== (k === 'trace')) setTimeout(() => { renderCanvas(); }, 0);
   if (prefs.paneMin) { prefs.paneMin = false; savePrefs(); applyPane(); }
   renderPane();
   if (LAB[k] && LAB[k].refresh) LAB[k].refresh();
@@ -1075,7 +894,7 @@ function renderPaneTabs() {
   };
   const vis = NODES.filter((n) => shown(n) && matches(n)).length;
   add('nodes', 'Nodes', { text: String(vis) });
-  add('trace', 'Path trace', trace.job ? { text: 'running', level: 'warn' }
+  add('trace', 'Trace details', trace.job ? { text: 'running', level: 'warn' }
     : trace.result ? { text: trace.result.verdict.level === 'ok' ? 'confirmed' : trace.result.verdict.level === 'fail' ? 'failed' : 'check',
                        level: trace.result.verdict.level === 'ok' ? 'ok' : trace.result.verdict.level === 'fail' ? 'bad' : 'warn' } : null);
   Object.entries(LAB).forEach(([k, t]) => add(k, t.title, t.badge()));
@@ -1092,7 +911,7 @@ function renderPaneBody() {
   body.innerHTML = '';
   if (paneTab === 'nodes') body.appendChild(nodeTable());
   else if (paneTab.startsWith('con:')) body.appendChild(consolePane(paneTab.slice(4)));
-  else if (paneTab === 'trace') body.appendChild(tracePane());
+  else if (paneTab === 'trace') body.appendChild(traceDetails());
   else if (LAB[paneTab]) LAB[paneTab].draw(body);
   body.scrollTop = scroll;
 }
@@ -1142,7 +961,7 @@ function nodeTable() {
     const o = el('option', null, t); o.value = v; gs.appendChild(o);
   });
   gs.value = prefs.groupBy;
-  gs.addEventListener('change', () => { prefs.groupBy = gs.value; savePrefs(); renderPaneBody(); });
+  gs.addEventListener('change', () => { prefs.groupBy = gs.value; savePrefs(); renderPaneBody(); renderNodeList(); });
   gl.appendChild(gs);
   head.appendChild(gl);
   const hl = el('label');
@@ -1209,22 +1028,19 @@ function nodeRow(n) {
   tr.appendChild(el('td', 'm', (n.dns || {}).fqdn || ''));
   const fl = flags(n);
   tr.appendChild(el('td', fl.includes('absent') ? 's-bad' : fl.length ? 's-warn' : null, fl.join(', ')));
-  tr.addEventListener('click', () => { if (pick) pickNode(n.label); else select(n.label, true); });
+  tr.addEventListener('click', () => { if (pick) pickNode(n.label); else select(n.label); });
   tr.addEventListener('dblclick', () => { if (!n.ghost) openConsole(n.label); });
   tr.addEventListener('contextmenu', (e) => { e.preventDefault(); select(n.label); nodeMenu(n, e.clientX, e.clientY); });
-  tr.addEventListener('mouseenter', () => { hovered = n.label; highlight(); });
-  tr.addEventListener('mouseleave', () => { hovered = null; highlight(); });
+  tr.addEventListener('mouseenter', () => hoverPath(n.label));
+  tr.addEventListener('mouseleave', () => hoverPath(null));
   return tr;
 }
 
-function markTableSelection() {
-  document.querySelectorAll('#pane-body tr.row').forEach((tr) => tr.classList.toggle('sel', tr.dataset.label === selected));
-}
 
 function refilter() {
-  renderPaneTabs();
+  renderPaneTabs(); renderNodeList();
   if (paneTab === 'nodes') renderPaneBody();
-  highlight(); renderStatus();
+  renderStatus();
 }
 
 /* ------------------------------------------------------------- console --- */
@@ -1336,7 +1152,7 @@ LAB.matrix = labCheck({
   },
   render(box, st) {
     box.appendChild(checkHead(this, st, `Run all ${st.total}`, 'Running...',
-      'Paths from probe_matrix.py. "Must fail" rows are perimeter denies; one passing is a leak. Hover a row to see it on the canvas.',
+      'Paths from probe_matrix.py. "Must fail" rows are perimeter denies; one passing is a leak. Click a row to trace it.',
       st.status === 'done' ? el('span', 's-dim', 'finished ' + st.ended) : null));
     const done = new Map((st.rows || []).map((r) => [r.source + '>' + r.dest, r]));
     const t = gridTable(['Result', 'Source', 'Destination', 'Checks', 'Loss', 'RTT']);
@@ -1357,11 +1173,12 @@ LAB.matrix = labCheck({
       tr.appendChild(el('td', 'wrap', p.description));
       tr.appendChild(el('td', 'm', r && r.loss_pct != null ? r.loss_pct + '%' : '-'));
       tr.appendChild(el('td', 'm', r && r.rtt_ms != null ? r.rtt_ms + ' ms' : '-'));
-      const lvl = !r ? 'run' : MATRIX_OK.includes(r.outcome) ? 'ok'
-        : r.outcome === 'leak' || ['dead', 'error'].includes(r.verdict) ? 'bad' : 'warn';
-      tr.addEventListener('mouseenter', () => drawPath(p.source, p.dest, lvl));
-      tr.addEventListener('mouseleave', renderPathOverlay);
-      tr.addEventListener('click', () => { const n = BY.get(p.source); if (n) centerOn(n); });
+      const dst = ownerOf(p.dest) || (BY.has(p.dest) ? p.dest : null);
+      tr.title = dst ? `Click to trace ${p.source} to ${dst}` : 'Destination is not a node in this lab';
+      tr.addEventListener('click', () => {
+        if (!dst || !BY.has(p.source)) return;
+        setTraceEnds(p.source, dst, /^\d+\.\d+\.\d+\.\d+$/.test(p.dest) ? p.dest : null);
+      });
       t.appendChild(tr);
     });
     box.appendChild(t);
@@ -1439,7 +1256,7 @@ LAB.harvest = labCheck({
       tr.appendChild(el('td', 'm', n.label));
       tr.appendChild(el('td', 'm', n.live.error || n.live_ip || '(no up interface with an address)'));
       tr.appendChild(el('td', 'm', n.primary_ip || '-'));
-      tr.addEventListener('click', () => { sideTab = 'addresses'; select(n.label, true); });
+      tr.addEventListener('click', () => { sideTab = 'addresses'; select(n.label); });
       t.appendChild(tr);
     });
     box.appendChild(t);
@@ -1460,7 +1277,7 @@ LAB.pings = {
     probeJobs.forEach((j) => {
       const b = jobBlock(j);
       b.style.cursor = 'pointer';
-      b.addEventListener('click', () => { sideTab = 'ping'; select(j.target, true); });
+      b.addEventListener('click', () => { sideTab = 'ping'; select(j.target); });
       box.appendChild(b);
     });
   },
@@ -1484,31 +1301,91 @@ function applyHarvestToNodes(st) {
     changed = true;
   });
   if (changed) {
-    renderCanvas();
+    renderPathBody(); renderNodeList();
     if (paneTab === 'nodes') renderPaneBody();
     if (selected) renderSide();
   }
 }
 
+/* ============================================================ node list == */
+/* Always on the left: every node, grouped, filterable.  Click to inspect,
+ * From / To to set the ends of the path, right-click for everything else. */
+function renderNodeList() {
+  const box = $('#nlist');
+  const scroll = box.scrollTop;
+  box.innerHTML = '';
+  const vis = NODES.filter((n) => shown(n) && matches(n)).sort(byLabel);
+  if (!vis.length) { box.appendChild(el('div', 'side-empty', 'No nodes match.')); return; }
+  const groups = new Map();
+  vis.forEach((n) => {
+    const [k, title] = groupKey(n);
+    if (!groups.has(k)) groups.set(k, { title, nodes: [] });
+    groups.get(k).nodes.push(n);
+  });
+  const order = prefs.groupBy === 'layer'
+    ? INV.layers.map((l) => l.key).filter((k) => groups.has(k)) : [...groups.keys()].sort();
+  order.forEach((k) => {
+    const g = groups.get(k);
+    if (prefs.groupBy !== 'none') {
+      box.appendChild(el('div', 'nl-grp', `${g.title}  ${g.nodes.filter((n) => n.up).length}/${g.nodes.length}`));
+    }
+    g.nodes.forEach((n) => box.appendChild(nodeListRow(n)));
+  });
+  box.scrollTop = scroll;
+}
+
+function nodeListRow(n) {
+  const r = el('div', 'nl-row' + (n.up || n.ghost ? '' : ' off') + (n.label === selected ? ' sel' : '')
+    + (n.label === trace.source ? ' is-from' : '') + (n.label === trace.target ? ' is-to' : ''));
+  r.dataset.label = n.label;
+  r.appendChild(lamp(n));
+  const mid = el('div', 'nl-mid');
+  mid.appendChild(el('div', 'nl-name', n.label));
+  const ip = displayIp(n);
+  const fl = flags(n);
+  mid.appendChild(el('div', 'nl-sub' + (fl.length ? ' s-warn' : ''), fl.length ? fl.join(', ') : ip.text || KIND_NAME[kind(n)]));
+  r.appendChild(mid);
+  const acts = el('div', 'nl-acts');
+  if (n.label === trace.source) acts.appendChild(el('span', 'nl-end', 'FROM'));
+  else if (n.label === trace.target) acts.appendChild(el('span', 'nl-end', 'TO'));
+  else {
+    const f = el('button', 'linkish', 'From');
+    f.disabled = !n.can_source_probe || !n.up;
+    f.title = f.disabled ? 'Cannot send test traffic (not running, or no console this tool can drive)' : 'Trace from this node';
+    f.addEventListener('click', (e) => { e.stopPropagation(); setTraceEnds(n.label, trace.target); });
+    const t = el('button', 'linkish', 'To');
+    t.disabled = !!n.ghost;
+    t.title = 'Trace to this node';
+    t.addEventListener('click', (e) => { e.stopPropagation(); setTraceEnds(trace.source, n.label); });
+    acts.appendChild(f); acts.appendChild(t);
+  }
+  r.appendChild(acts);
+  r.addEventListener('click', () => {
+    if (pick) pickNode(n.label); else { select(n.label); document.body.classList.remove('nav-open'); }
+  });
+  r.addEventListener('dblclick', () => { if (!n.ghost) openConsole(n.label); });
+  r.addEventListener('contextmenu', (e) => { e.preventDefault(); select(n.label); nodeMenu(n, e.clientX, e.clientY); });
+  r.addEventListener('mouseenter', () => hoverPath(n.label));
+  r.addEventListener('mouseleave', () => hoverPath(null));
+  return r;
+}
+
 /* =========================================================== path trace == */
-/* Pick a source and a destination; the canvas narrows to the nodes between
- * them.  Before a run it shows every shortest path over the running part of
- * the lab (the routes the packets COULD take).  A run sends a burst of pings
- * and reads CML's per-link packet counters before and after, so it shows the
- * links the packets DID cross, at layer 2 as well as layer 3.  Run it, stop
- * the active core switch in CML, run it again: the path moves. */
+/* The main view.  Before a run it shows every shortest path over the running
+ * part of the lab (the routes the packets COULD take).  A run sends a burst
+ * of pings and reads CML's per-link packet counters before and after, so it
+ * shows the links the packets DID cross, at layer 2 as well as layer 3.  Run
+ * it, stop the active core switch in CML, run it again: the path moves. */
 const trace = { source: null, target: null, ip: null, count: 100, repeat: false,
                 job: null, stage: '', result: null, cand: null, history: [], error: null };
 let pick = null;           // null | 'source' | 'target'
 
-function traceShown() { return !!pick || (paneTab === 'trace' && !!trace.source && !!trace.target); }
-
 function startPick(src) {
   if (src) { trace.source = src; pick = 'target'; } else { pick = 'source'; }
   pickBar();
-  renderCanvas();
+  renderNodeList();
 }
-function cancelPick() { pick = null; pickBar(); renderCanvas(); }
+function cancelPick() { pick = null; pickBar(); }
 
 function pickNode(label) {
   const n = BY.get(label);
@@ -1518,47 +1395,55 @@ function pickNode(label) {
       pickBar(`${label} cannot send the test traffic (${!n.up ? 'not running' : 'no console this tool can drive'}). Pick another.`);
       return;
     }
-    trace.source = label;
     pick = 'target';
+    setTraceEnds(label, trace.target === label ? null : trace.target);
     pickBar();
-    renderCanvas();
     return;
   }
   if (label === trace.source || n.ghost) return;
   pick = null;
   pickBar();
   setTraceEnds(trace.source, label);
-  showPane('trace');
 }
 
 function pickBar(msg) {
   const bar = $('#pickbar');
   bar.hidden = !pick;
-  $('#canvas').classList.toggle('picking', !!pick);
   if (!pick) return;
   bar.innerHTML = '';
   bar.appendChild(el('span', 't', 'Trace path'));
   bar.appendChild(el('span', null, msg || (pick === 'source'
-    ? 'Click the node to send from. It must be running and have a console (router, switch, firewall or Linux host).'
-    : `From ${trace.source}. Now click the destination.`)));
+    ? 'Click the node to send from in the node list. It must be running and have a console.'
+    : `From ${trace.source}. Now click the destination in the node list.`)));
   const c = el('button', 'linkish', 'Cancel');
   c.addEventListener('click', cancelPick);
   bar.appendChild(c);
 }
 
-function setTraceEnds(src, dst) {
+/* ip -> node label, from every address the page knows. */
+function ownerOf(ip) {
+  for (const n of NODES) {
+    if (n.live_ip === ip || n.primary_ip === ip) return n.label;
+    if ((n.addresses || []).some((a) => a.value === ip && !/virtual/.test(a.kind || ''))) return n.label;
+  }
+  return null;
+}
+
+function setTraceEnds(src, dst, ip) {
   const changed = src !== trace.source || dst !== trace.target;
-  trace.source = src;
-  trace.target = dst;
-  const t = BY.get(dst);
-  if (changed || !trace.ip) trace.ip = t ? (t.live_ip || t.primary_ip) : null;
+  trace.source = src || null;
+  trace.target = dst && dst !== src ? dst : null;
+  const t = BY.get(trace.target);
+  if (ip) trace.ip = ip;
+  else if (changed || !trace.ip) trace.ip = t ? (t.live_ip || t.primary_ip) : null;
   if (changed) {
-    trace.result = [...trace.history].reverse().find((h) => h.source === src && h.target === dst) || null;
+    trace.result = [...trace.history].reverse()
+      .find((h) => h.source === trace.source && h.target === trace.target) || null;
     trace.error = null;
   }
-  trace.cand = candidates(src, dst);
-  renderPane();
-  renderCanvas();
+  trace.cand = trace.source && trace.target ? candidates(trace.source, trace.target) : null;
+  renderPathHead(); renderPathBody(); renderNodeList(); renderPaneTabs();
+  if (paneTab === 'trace') renderPaneBody();
 }
 
 /* Every node and link on SOME shortest path, over running nodes and started
@@ -1579,9 +1464,10 @@ function candidates(src, dst) {
     }
     return d;
   };
-  if (!adj.has(src) || !adj.has(dst)) return { nodes: [], links: [], paths: 0, hops: null, depth: {} };
+  const none = { nodes: [], links: [], paths: 0, hops: null };
+  if (!adj.has(src) || !adj.has(dst)) return none;
   const ds = bfs(src), dt = bfs(dst);
-  if (!ds.has(dst)) return { nodes: [], links: [], paths: 0, hops: null, depth: {} };
+  if (!ds.has(dst)) return none;
   const D = ds.get(dst);
   const on = [...adj.keys()].filter((u) => ds.has(u) && dt.has(u) && ds.get(u) + dt.get(u) === D);
   const onSet = new Set(on);
@@ -1595,9 +1481,7 @@ function candidates(src, dst) {
       }
     });
   });
-  const depth = {};
-  on.forEach((u) => { depth[u] = ds.get(u); });
-  return { nodes: on, links: [...links], paths: ways.get(dst) || 0, hops: D, depth };
+  return { nodes: on, links: [...links], paths: ways.get(dst) || 0, hops: D };
 }
 
 async function runTrace() {
@@ -1605,7 +1489,7 @@ async function runTrace() {
   trace.error = null;
   trace.job = { t0: Date.now(), eta: 30 };
   trace.stage = 'starting';
-  renderPane();
+  renderPathHead(); renderPathBody(); renderPaneTabs();
   try {
     const r = await fetch('/api/trace', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -1624,8 +1508,7 @@ async function runTrace() {
       if (st.status === 'done') {
         const res = st.result;
         const prev = [...trace.history].reverse().find((h) => h.source === res.source && h.target === res.target);
-        res.changed = prev && prev.path.join('>') !== res.path.join('>')
-          ? { from: prev.path, at: prev.at } : null;
+        res.changed = prev && prev.path.join('>') !== res.path.join('>') ? { from: prev.path, at: prev.at } : null;
         trace.history.push(res);
         if (res.source === trace.source && res.target === trace.target) trace.result = res;
         break;
@@ -1634,8 +1517,9 @@ async function runTrace() {
   } catch (e) { trace.error = String(e.message || e); }
   trace.job = null;
   await poll(false);           // the lab may have changed; refresh before drawing
-  trace.cand = candidates(trace.source, trace.target);
-  renderPane(); renderCanvas();
+  if (trace.source && trace.target) trace.cand = candidates(trace.source, trace.target);
+  renderPathHead(); renderPathBody(); renderPaneTabs();
+  if (paneTab === 'trace') renderPaneBody();
   if (trace.repeat && !trace.error) setTimeout(() => { if (trace.repeat && !trace.job) runTrace(); }, 5000);
 }
 
@@ -1644,220 +1528,152 @@ function resultFor() {
   return r && r.source === trace.source && r.target === trace.target ? r : null;
 }
 
-/* Narrow the canvas to the trace: everything off the candidate and observed
- * paths fades, candidate links are dashed, used links are drawn solid with
- * the packet count the counters measured. */
-function paintTrace() {
-  const nodesEl = document.querySelectorAll('#nodes .node');
-  const linkEl = document.querySelectorAll('#links > g');
-  document.querySelectorAll('#nodes .t-tag').forEach((t) => t.remove());
-  nodesEl.forEach((g) => g.classList.remove('t-dim', 't-end', 't-stop', 't-idle', 't-nopick'));
-  linkEl.forEach((g) => g.querySelector('.wire').classList.remove('t-cand', 't-both', 't-one', 't-fwd', 't-dim'));
-  if (!traceShown()) return;
-  nodesEl.forEach((g) => g.classList.remove('dim'));
-  linkEl.forEach((g) => g.querySelector('.wire').classList.remove('dim', 'hl'));
-  const tag = (label, text) => {
-    const g = document.querySelector(`#nodes .node[data-label="${CSS.escape(label)}"]`);
-    if (!g) return;
-    g.classList.add('t-end');
-    g.appendChild(svg('text', { y: -NODE_SIZE / 2 - 9, class: 't-tag' }, text));
-  };
-  if (pick) {
-    if (pick === 'source') nodesEl.forEach((g) => {
-      const n = BY.get(g.dataset.label);
-      if (!n.can_source_probe || !n.up) g.classList.add('t-nopick');
-    });
-    if (trace.source) tag(trace.source, 'FROM');
-    return;
-  }
-  const cand = trace.cand || { nodes: [], links: [] };
-  const res = resultFor();
-  const inSet = new Set(cand.nodes);
-  const used = new Map();
-  if (res) {
-    res.path.forEach((x) => inSet.add(x));
-    res.links.filter((l) => l.use !== 'none').forEach((l) => { used.set(l.id, l); inSet.add(l.a); inSet.add(l.b); });
-  }
-  const onPath = new Set(res ? res.path : []);
-  nodesEl.forEach((g) => {
-    const l = g.dataset.label;
-    if (!inSet.has(l)) g.classList.add('t-dim');
-    else if (res && !onPath.has(l) && ![...used.values()].some((u) => u.a === l || u.b === l)) g.classList.add('t-idle');
-    if (res && res.stop_at === l) g.classList.add('t-stop');
-  });
-  const candLinks = new Set(cand.links);
-  linkEl.forEach((g) => {
-    const w = g.querySelector('.wire'), tx = g.querySelector('.rate');
-    const u = used.get(g.dataset.link);
-    if (u) {
-      w.classList.add(u.use === 'both' ? 't-both' : u.use === 'forward' ? 't-fwd' : 't-one');
-      tx.textContent = u.packets != null ? u.packets + ' pkts' : '';
-      tx.classList.toggle('bad', u.use === 'forward');
-    } else if (candLinks.has(g.dataset.link)) {
-      w.classList.add('t-cand');
-    } else {
-      w.classList.add('t-dim');
-    }
-  });
-  tag(trace.source, 'FROM');
-  tag(trace.target, 'TO');
-}
-
-/* ------------------------------------------------------------ the pane --- */
-function tracePane() {
-  const wrap = el('div');
-  const head = el('div', 'phead');
+/* ------------------------------------------------------- the controls --- */
+function renderPathHead() {
+  const head = $('#path-head');
+  head.innerHTML = '';
   const sel = (items, value, onChange, empty) => {
     const s = el('select');
-    if (empty) { const o = el('option', null, empty); o.value = ''; s.appendChild(o); }
-    items.forEach(([v, t]) => { const o = el('option', null, t); o.value = v; s.appendChild(o); });
+    const o = el('option', null, empty); o.value = ''; s.appendChild(o);
+    items.forEach(([v, t]) => { const x = el('option', null, t); x.value = v; s.appendChild(x); });
     s.value = value || '';
     s.addEventListener('change', () => onChange(s.value));
     return s;
   };
   const sources = NODES.filter((n) => n.can_source_probe && n.up).sort(byLabel).map((n) => [n.label, n.label]);
   const targets = NODES.filter((n) => !n.ghost && n.label !== trace.source).sort(byLabel).map((n) => [n.label, n.label]);
-  const lf = el('label', null, 'From ');
-  lf.appendChild(sel(sources, trace.source, (v) => setTraceEnds(v || null, trace.target), 'choose'));
+  const lf = el('label', null, 'From');
+  lf.appendChild(sel(sources, trace.source, (v) => setTraceEnds(v || null, trace.target), 'choose a source'));
   head.appendChild(lf);
-  const lt = el('label', null, 'To ');
-  lt.appendChild(sel(targets, trace.target, (v) => setTraceEnds(trace.source, v || null), 'choose'));
+  const sw = el('button', null, 'Swap');
+  sw.title = 'Trace the reverse direction';
+  sw.disabled = !trace.source || !trace.target || !BY.get(trace.target).can_source_probe || !BY.get(trace.target).up;
+  sw.addEventListener('click', () => setTraceEnds(trace.target, trace.source));
+  head.appendChild(sw);
+  const lt = el('label', null, 'To');
+  lt.appendChild(sel(targets, trace.target, (v) => setTraceEnds(trace.source, v || null), 'choose a destination'));
   head.appendChild(lt);
   const t = BY.get(trace.target);
   if (t) {
     const ips = [];
     const seen = new Set();
-    [t.live_ip, t.primary_ip, ...(t.addresses || []).filter((a) => !/virtual/.test(a.kind || '')).map((a) => a.value)]
+    [trace.ip, t.live_ip, t.primary_ip, ...(t.addresses || []).filter((a) => !/virtual/.test(a.kind || '')).map((a) => a.value)]
       .forEach((ip) => { if (ip && !seen.has(ip)) { seen.add(ip); ips.push([ip, ip]); } });
-    const la = el('label', null, 'Address ');
-    la.appendChild(sel(ips, trace.ip, (v) => { trace.ip = v; }));
+    const la = el('label', null, 'Address');
+    const s = sel(ips, trace.ip, (v) => { trace.ip = v; }, 'none known');
+    s.classList.add('m');
+    la.appendChild(s);
     head.appendChild(la);
   }
-  const lc = el('label', null, 'Packets ');
+  const lc = el('label', null, 'Packets');
   const cnt = el('input');
   cnt.type = 'number'; cnt.min = 20; cnt.max = 500; cnt.step = 20; cnt.value = trace.count;
-  cnt.style.width = '64px';
+  cnt.style.width = '62px';
   cnt.addEventListener('change', () => { trace.count = Math.max(20, Math.min(500, +cnt.value || 100)); });
   lc.appendChild(cnt);
   head.appendChild(lc);
   const run = el('button', 'default', trace.job ? 'Tracing...' : 'Run trace');
-  run.disabled = !!trace.job || !trace.source || !trace.target;
+  run.disabled = !!trace.job || !trace.source || !trace.target || !trace.ip;
   run.addEventListener('click', runTrace);
   head.appendChild(run);
   const rl = el('label');
   const rc = el('input'); rc.type = 'checkbox'; rc.checked = trace.repeat;
   rc.addEventListener('change', () => { trace.repeat = rc.checked; if (rc.checked && !trace.job) runTrace(); });
   rl.appendChild(rc); rl.appendChild(document.createTextNode('Repeat'));
-  rl.title = 'Run again 5 s after each trace finishes. Leave it running while you stop and start nodes in CML to watch the path move.';
+  rl.title = 'Run again 5 s after each trace finishes. Leave it on while you stop and start nodes in CML to watch the path move.';
   head.appendChild(rl);
-  const pk = el('button', null, 'Pick on canvas');
-  pk.addEventListener('click', () => startPick());
-  head.appendChild(pk);
-  wrap.appendChild(head);
+}
 
+/* ---------------------------------------------------------- the view --- */
+function renderPathBody() {
+  const body = $('#path-body');
+  body.innerHTML = '';
   if (!trace.source || !trace.target) {
-    wrap.appendChild(el('div', 'pmsg', 'Choose From and To above, or use Pick on canvas (T). Right-click a node for "Trace path from here".'));
-    return wrap;
+    const e = el('div', 'path-empty');
+    e.appendChild(el('div', 'pe-t', trace.source ? `From ${trace.source}. Choose a destination.` : 'Choose two nodes to see the path between them.'));
+    e.appendChild(el('div', null, 'Use From and To above, the From / To links in the node list, or right-click any node. ' +
+      'The nodes between them are drawn here in hop order; redundant alternatives stack in the same column.'));
+    body.appendChild(e);
+    return;
   }
+  const res = resultFor();
+  const cand = trace.cand || { nodes: [], links: [], paths: 0 };
+  const top = el('div', 'path-status');
   if (trace.job) {
-    const box = el('div', 'result');
-    const st = el('div', 's-dim', trace.stage);
+    const st = el('span', 's-dim', trace.stage);
     st.dataset.traceStage = '1';
-    box.appendChild(st);
+    top.appendChild(el('b', null, 'Tracing  '));
+    top.appendChild(st);
     const bar = el('div', 'meter'); const fill = el('i'); bar.appendChild(fill);
     const pct = () => Math.min(97, (Date.now() - trace.job.t0) / 1000 / trace.job.eta * 100) + '%';
     fill.style.width = pct();
     const iv = setInterval(() => { if (!fill.isConnected || !trace.job) clearInterval(iv); else fill.style.width = pct(); }, 500);
-    box.appendChild(bar);
-    wrap.appendChild(box);
-  }
-  if (trace.error) wrap.appendChild(el('div', 'pmsg bad', 'Trace failed: ' + trace.error));
-
-  const res = resultFor();
-  const cand = trace.cand || { nodes: [], paths: 0 };
-  if (!res) {
-    wrap.appendChild(el('div', 'pmsg', cand.paths
-      ? `Predicted: ${cand.paths} shortest path${cand.paths > 1 ? 's' : ''} of ${cand.hops} hops over the running lab (dashed). Run the trace to see which links the packets actually cross.`
-      : 'No path between these nodes over the running part of the lab.'));
-  } else {
+    top.appendChild(bar);
+  } else if (trace.error) {
+    top.appendChild(el('span', 's-bad', 'Trace failed: ' + trace.error));
+  } else if (res) {
     const v = res.verdict;
-    wrap.appendChild(el('div', 'pmsg ' + (v.level === 'ok' ? 'ok' : v.level === 'fail' ? 'bad' : 'warn'),
-      v.text + `  (${new Date(res.at).toLocaleTimeString()}, ${res.sent} sent, ` +
-      `${res.received == null ? 'replies not counted' : res.received + ' answered'}, ${res.elapsed_s} s)`));
-    if (res.changed) {
-      const was = res.changed.from.filter((x) => !res.path.includes(x));
-      const now = res.path.filter((x) => !res.changed.from.includes(x));
-      wrap.appendChild(el('div', 'pmsg warn', `Path changed since ${new Date(res.changed.at).toLocaleTimeString()}: ` +
-        (was.length ? `no longer through ${was.join(', ')}` : '') + (was.length && now.length ? '; ' : '') +
-        (now.length ? `now through ${now.join(', ')}` : '') + '.'));
-    }
+    top.appendChild(el('span', v.level === 'ok' ? 's-ok' : v.level === 'fail' ? 's-bad' : 's-warn', v.text));
+    top.appendChild(el('span', 's-dim', `   ${new Date(res.at).toLocaleTimeString()}, ${res.sent} sent, ` +
+      `${res.received == null ? 'replies not counted' : res.received + ' answered'}, ${res.elapsed_s} s`));
+  } else {
+    top.appendChild(el('span', null, cand.paths
+      ? `${cand.paths} possible path${cand.paths > 1 ? 's' : ''} of ${cand.hops} hops over the running lab. Run the trace to see which one the packets take.`
+      : 'No path between these nodes over the running part of the lab.'));
   }
-  wrap.appendChild(traceDiagram(res, cand));
+  body.appendChild(top);
+  if (res && res.changed && !trace.job) {
+    const was = res.changed.from.filter((x) => !res.path.includes(x));
+    const now = res.path.filter((x) => !res.changed.from.includes(x));
+    body.appendChild(el('div', 'path-changed', `Path changed since ${new Date(res.changed.at).toLocaleTimeString()}: ` +
+      (was.length ? `no longer through ${was.join(', ')}` : '') + (was.length && now.length ? '; ' : '') +
+      (now.length ? `now through ${now.join(', ')}` : '') + '.'));
+  }
+  body.appendChild(pathDiagram(res, cand, body.clientWidth));
   if (res) {
-    res.findings.forEach((f) => wrap.appendChild(el('div', 'pmsg', f)));
-    const cols = el('div', 'tcols');
-    const used = res.links.filter((l) => l.use !== 'none');
-    const t1 = gridTable(['Link', 'Packets', 'Direction', 'Shortest path']);
-    used.sort((a, b) => res.path.indexOf(a.a) - res.path.indexOf(b.a)).forEach((l) => {
-      const tr = el('tr', 'row');
-      tr.appendChild(el('td', 'm', `${l.a} ${shortIf(l.ai)}  to  ${l.b} ${shortIf(l.bi)}`));
-      tr.appendChild(el('td', 'm', l.packets == null ? '-' : String(l.packets)));
-      tr.appendChild(el('td', l.use === 'both' ? 's-ok' : 's-warn',
-        { both: 'both ways', 'one-way': 'one way only', forward: 'requests only' }[l.use]));
-      tr.appendChild(el('td', l.candidate ? null : 's-warn', l.candidate ? 'yes' : 'no'));
-      t1.appendChild(tr);
-    });
-    const a = el('div'); a.appendChild(t1); cols.appendChild(a);
-    const t2 = gridTable(['Hop', 'Address', 'Node', 'RTT']);
-    res.trace.hops.forEach((h) => {
-      const tr = el('tr', 'row');
-      [String(h.ttl), h.ip || '*', h.node || (h.ip ? 'unknown' : ''), h.rtt_ms != null ? h.rtt_ms + ' ms' : ''].forEach((v, i) =>
-        tr.appendChild(el('td', i === 1 ? 'm' : i === 2 && !h.node && h.ip ? 's-warn' : null, v)));
-      t2.appendChild(tr);
-    });
-    const b = el('div');
-    b.appendChild(t2);
-    if (!res.trace.hops.length) b.appendChild(el('div', 'pmsg', 'Traceroute returned no hops.'));
-    cols.appendChild(b);
-    wrap.appendChild(cols);
+    const f = el('div', 'path-findings');
+    res.findings.forEach((x) => f.appendChild(el('div', null, x)));
+    if (res.findings.length) body.appendChild(f);
   }
-  const hist = trace.history.filter((h) => h.source === trace.source && h.target === trace.target);
-  if (hist.length > 1) {
-    const t3 = gridTable(['Time', 'Result', 'Path']);
-    [...hist].reverse().forEach((h) => {
-      const tr = el('tr', 'row');
-      tr.appendChild(el('td', null, new Date(h.at).toLocaleTimeString()));
-      tr.appendChild(el('td', h.verdict.level === 'ok' ? 's-ok' : h.verdict.level === 'fail' ? 's-bad' : 's-warn',
-        h.verdict.level === 'ok' ? 'reached' : h.verdict.level === 'fail' ? 'failed' : 'check'));
-      tr.appendChild(el('td', 'wrap' + (h.changed ? ' s-warn' : ''), h.path.join(' > ') + (h.changed ? '   (changed)' : '')));
-      tr.addEventListener('click', () => { trace.result = h; renderPane(); renderCanvas(); });
-      t3.appendChild(tr);
-    });
-    const hs = el('div', 'tsect');
-    hs.appendChild(el('div', 'tsect-h', 'Runs this session (click one to show it)'));
-    hs.appendChild(t3);
-    wrap.appendChild(hs);
-  }
-  return wrap;
+  markPathSelection();
 }
 
-/* The nodes between the two ends, laid out left to right by hop count from
- * the source.  Parallel boxes in one column are redundant alternatives. */
-function traceDiagram(res, cand) {
+function markPathSelection() {
+  document.querySelectorAll('.pdiag .node').forEach((g) => g.classList.toggle('sel', g.dataset.label === selected));
+  document.querySelectorAll('#nlist .nl-row').forEach((r) => r.classList.toggle('sel', r.dataset.label === selected));
+  document.querySelectorAll('#pane-body tr.row[data-label]').forEach((tr) => tr.classList.toggle('sel', tr.dataset.label === selected));
+}
+function hoverPath(label) {
+  document.querySelectorAll('.pdiag .node').forEach((g) => g.classList.toggle('hov', g.dataset.label === label));
+}
+
+/* The nodes between the two ends, left to right by hop count from the
+ * source.  Parallel boxes in one column are redundant alternatives.  After a
+ * failover, the previous path's nodes stay on the diagram, dotted, so the
+ * swap is visible rather than just described. */
+function pathDiagram(res, cand, width) {
   const set = new Set(cand.nodes || []);
   const used = res ? res.links.filter((l) => l.use !== 'none') : [];
   if (res) { res.path.forEach((x) => set.add(x)); used.forEach((l) => { set.add(l.a); set.add(l.b); }); }
   set.add(trace.source); set.add(trace.target);
+  const prevPath = res && res.changed ? res.changed.from.filter((x) => BY.has(x)) : [];
+  prevPath.forEach((x) => set.add(x));
   const usedBy = new Map(used.map((l) => [l.id, l]));
   const candLinks = new Set(cand.links || []);
   const edges = [];
   const seen = new Set();
-  [...set].forEach((u) => (BY.get(u) ? BY.get(u).links || [] : []).forEach((l) => {
+  const pairKey = (a, b) => [a, b].sort().join('|');
+  [...set].forEach((u) => ((BY.get(u) || {}).links || []).forEach((l) => {
     if (!set.has(l.peer) || seen.has(l.link_id)) return;
     if (!usedBy.has(l.link_id) && !candLinks.has(l.link_id)) return;
     seen.add(l.link_id);
-    edges.push({ a: u, b: l.peer, id: l.link_id, ai: l.local_iface, bi: l.peer_iface });
+    edges.push({ a: u, b: l.peer, id: l.link_id, kind: usedBy.has(l.link_id) ? 'used' : 'cand' });
   }));
+  const drawn = new Set(edges.map((e) => pairKey(e.a, e.b)));
+  for (let i = 1; i < prevPath.length; i++) {
+    const k = pairKey(prevPath[i - 1], prevPath[i]);
+    if (!drawn.has(k)) { drawn.add(k); edges.push({ a: prevPath[i - 1], b: prevPath[i], kind: 'prev' }); }
+  }
   // hop depth over the drawn edges
   const depth = new Map([[trace.source, 0]]);
   const q = [trace.source];
@@ -1873,58 +1689,153 @@ function traceDiagram(res, cand) {
   const cols = [];
   depth.forEach((d, u) => { (cols[d] = cols[d] || []).push(u); });
   const onPath = new Set(res ? res.path : []);
-  cols.forEach((c) => c.sort((a, b) => (onPath.has(b) - onPath.has(a)) || a.localeCompare(b, undefined, { numeric: true })));
-  const avail = ($('#pane-body').clientWidth || 1000) - 140;
-  const colW = Math.max(110, Math.min(140, avail / Math.max(1, cols.length - 1))), rowH = 70, padX = 60, padY = 34;
-  const rows = Math.max(1, ...cols.map((c) => (c ? c.length : 0)));
-  const W = padX * 2 + (cols.length - 1) * colW, H = padY + rows * rowH;
-  const pos = new Map();
-  cols.forEach((c, d) => (c || []).forEach((u, i) => pos.set(u, {
-    x: padX + d * colW, y: padY + i * rowH + (rows - c.length) * rowH / 2,
-  })));
+  cols.forEach((c) => c && c.sort((a, b) => (onPath.has(b) - onPath.has(a)) || a.localeCompare(b, undefined, { numeric: true })));
 
-  const box = el('div', 'tdiag');
+  // Lay the columns out like lines of text: when the path is longer than
+  // the view is wide, it wraps onto the next row and carries on left to
+  // right, so every hop stays readable without zooming or scrolling.
+  const padX = 80, padY = 46, rowH = 100, minColW = 170, segGap = 70;
+  const nCols = cols.length;
+  const avail = Math.max(minColW * 2, (width || 1000) - padX * 2);
+  const perSeg = Math.max(2, Math.min(nCols, Math.floor(avail / minColW) + 1));
+  const colW = perSeg > 1 ? Math.min(240, avail / (perSeg - 1)) : 0;
+  const rows = Math.max(1, ...cols.map((c) => (c ? c.length : 0)));
+  const segH = (rows - 1) * rowH + 64;
+  const nSegs = Math.ceil(nCols / perSeg);
+  const W = padX * 2 + (Math.min(nCols, perSeg) - 1) * colW;
+  const H = padY + nSegs * segH + (nSegs - 1) * segGap + 20;
+  const pos = new Map();
+  cols.forEach((c, d) => (c || []).forEach((u, i) => {
+    const seg = Math.floor(d / perSeg);
+    pos.set(u, { x: padX + (d % perSeg) * colW,
+                 y: padY + seg * (segH + segGap) + i * rowH + (rows - c.length) * rowH / 2, d, seg });
+  }));
+
+  const box = el('div', 'pdiag');
   const s = svg('svg', { viewBox: `0 0 ${W} ${H}`, width: W, height: H });
   edges.forEach((e) => {
-    const a = pos.get(e.a), b = pos.get(e.b);
-    const u = usedBy.get(e.id);
-    const cls = 'wire ' + (u ? (u.use === 'both' ? 't-both' : u.use === 'forward' ? 't-fwd' : 't-one') : 't-cand');
-    s.appendChild(svg('line', { x1: a.x, y1: a.y, x2: b.x, y2: b.y, class: cls }));
+    let a = pos.get(e.a), b = pos.get(e.b);
+    if (a.d > b.d) [a, b] = [b, a];
+    const u = e.id && usedBy.get(e.id);
+    const cls = 'wire ' + (e.kind === 'prev' ? 't-prev' : u ? (u.use === 'both' ? 't-both' : u.use === 'forward' ? 't-fwd' : 't-one') : 't-cand');
+    let lx, ly;
+    if (a.seg === b.seg) {
+      s.appendChild(svg('line', { x1: a.x, y1: a.y, x2: b.x, y2: b.y, class: cls }));
+      lx = (a.x + b.x) / 2; ly = (a.y + b.y) / 2 - 7;
+    } else {
+      // wrap: out to the right, down into the gap, back to the left, in
+      const gapY = padY + (a.seg + 1) * (segH + segGap) - segGap / 2 - 8;
+      const r = a.x + padX * 0.6, l = b.x - padX * 0.6;
+      s.appendChild(svg('polyline', { points: `${a.x},${a.y} ${r},${a.y} ${r},${gapY} ${l},${gapY} ${l},${b.y} ${b.x},${b.y}`, class: cls }));
+      lx = (r + l) / 2; ly = gapY - 6;
+    }
     if (u && u.packets != null) {
-      s.appendChild(svg('text', { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 - 5, class: 'rate' + (u.use === 'forward' ? ' bad' : ''),
-                                  'text-anchor': 'middle' }, String(u.packets)));
+      s.appendChild(svg('text', { x: lx, y: ly, class: 'rate' + (u.use === 'forward' ? ' bad' : ''),
+                                  'text-anchor': 'middle' }, u.packets + ' pkts'));
     }
   });
+  const prevOnly = new Set(prevPath.filter((x) => !onPath.has(x)));
   pos.forEach((p, u) => {
     const n = BY.get(u);
     if (!n) return;
     const cls = ['node'];
     if (!n.up) cls.push('off');
     if (res && !onPath.has(u) && !used.some((l) => l.a === u || l.b === u)) cls.push('t-idle');
+    if (prevOnly.has(u)) cls.push('t-was');
     if (u === trace.source || u === trace.target) cls.push('t-end');
     if (res && res.stop_at === u) cls.push('t-stop');
-    const g = svg('g', { class: cls.join(' '), transform: `translate(${p.x} ${p.y})` });
-    g.appendChild(svg('rect', { x: -17, y: -17, width: 34, height: 34, class: 'sel-box' }));
-    g.appendChild(nodeIcon(n, 26));
-    g.appendChild(svg('text', { y: 27, class: 'lbl' }, u));
+    if (n.config_status === 'undeclared') cls.push('undecl');
+    const g = svg('g', { class: cls.join(' '), transform: `translate(${p.x} ${p.y})`, 'data-label': u });
+    g.appendChild(svg('rect', { x: -23, y: -23, width: 46, height: 46, class: 'sel-box' }));
+    g.appendChild(nodeIcon(n, 36));
+    if (!n.ghost) {
+      const c = n.state === 'BOOTED' ? 'var(--ok)' : n.state === 'STARTED' ? 'var(--warn)' : 'var(--devoff)';
+      g.appendChild(svg('rect', { x: 13, y: 13, width: 9, height: 9, fill: c, class: 'lamp' }));
+    }
+    const end = u === trace.source ? 'FROM' : u === trace.target ? 'TO' : null;
+    if (end) g.appendChild(svg('text', { y: -30, class: 't-tag' }, end));
+    g.appendChild(svg('text', { y: 34, class: 'lbl' }, u));
     const ip = displayIp(n).text;
-    if (ip) g.appendChild(svg('text', { y: 38, class: 'ipl' }, ip));
-    g.appendChild(svg('title', {}, `${u}\n${KIND_NAME[kind(n)]}${res && !onPath.has(u) ? '\nnot used this run' : ''}`));
+    const note = prevOnly.has(u) ? (n.up ? 'not used now' : 'stopped') : ip;
+    if (note) g.appendChild(svg('text', { y: 47, class: 'ipl' + (prevOnly.has(u) ? ' drift' : '') }, note));
+    g.appendChild(svg('title', {}, `${u}\n${KIND_NAME[kind(n)]}, ${stateWord(n)[0]}` +
+      (res && !onPath.has(u) ? '\nnot used this run' : '')));
     g.addEventListener('click', () => select(u));
+    g.addEventListener('dblclick', () => { if (!n.ghost) openConsole(u); });
+    g.addEventListener('contextmenu', (ev) => { ev.preventDefault(); select(u); nodeMenu(n, ev.clientX, ev.clientY); });
     s.appendChild(g);
   });
   box.appendChild(s);
   const key = el('div', 'tkey');
-  [['t-both', 'used, both ways'], ['t-one', 'used, one way'], ['t-fwd', 'requests only'], ['t-cand', 'possible, not used']]
-    .forEach(([c, t]) => {
-      const k = el('span');
-      const ks = svg('svg', { width: 26, height: 8 });
-      ks.appendChild(svg('line', { x1: 0, y1: 4, x2: 26, y2: 4, class: 'wire ' + c }));
-      k.appendChild(ks); k.appendChild(document.createTextNode(t));
-      key.appendChild(k);
-    });
+  [['t-both', 'used, both ways'], ['t-one', 'used, one way only'], ['t-fwd', 'requests only'],
+   ['t-cand', 'possible, not used'], ['t-prev', 'previous run']].forEach(([c, t]) => {
+    if (c === 't-prev' && !prevPath.length) return;
+    const k = el('span');
+    const ks = svg('svg', { width: 28, height: 8 });
+    ks.appendChild(svg('line', { x1: 0, y1: 4, x2: 28, y2: 4, class: 'wire ' + c }));
+    k.appendChild(ks); k.appendChild(document.createTextNode(t));
+    key.appendChild(k);
+  });
   box.appendChild(key);
   return box;
+}
+
+/* ------------------------------------------------- trace details (pane) -- */
+function traceDetails() {
+  const wrap = el('div');
+  const res = resultFor();
+  if (!res) {
+    wrap.appendChild(el('div', 'pmsg', trace.source && trace.target
+      ? 'No run yet for this pair. Press Run trace above the path.'
+      : 'Choose From and To above the path, then Run trace.'));
+    return wrap;
+  }
+  const cols = el('div', 'tcols');
+  const used = res.links.filter((l) => l.use !== 'none');
+  const t1 = gridTable(['Link', 'Packets', 'Direction', 'Shortest path']);
+  used.sort((a, b) => res.path.indexOf(a.a) - res.path.indexOf(b.a)).forEach((l) => {
+    const tr = el('tr', 'row');
+    tr.appendChild(el('td', 'm', `${l.a} ${shortIf(l.ai)}  to  ${l.b} ${shortIf(l.bi)}`));
+    tr.appendChild(el('td', 'm', l.packets == null ? '-' : String(l.packets)));
+    tr.appendChild(el('td', l.use === 'both' ? 's-ok' : 's-warn',
+      { both: 'both ways', 'one-way': 'one way only', forward: 'requests only' }[l.use]));
+    tr.appendChild(el('td', l.candidate ? null : 's-warn', l.candidate ? 'yes' : 'no'));
+    t1.appendChild(tr);
+  });
+  const a = el('div');
+  a.appendChild(el('div', 'tsect-h', 'Links the packets crossed (CML link counters)'));
+  a.appendChild(t1);
+  cols.appendChild(a);
+  const t2 = gridTable(['Hop', 'Address', 'Node', 'RTT']);
+  res.trace.hops.forEach((h) => {
+    const tr = el('tr', 'row');
+    [String(h.ttl), h.ip || '*', h.node || (h.ip ? 'unknown' : ''), h.rtt_ms != null ? h.rtt_ms + ' ms' : ''].forEach((v, i) =>
+      tr.appendChild(el('td', i === 1 ? 'm' : i === 2 && !h.node && h.ip ? 's-warn' : null, v)));
+    t2.appendChild(tr);
+  });
+  const b = el('div');
+  b.appendChild(el('div', 'tsect-h', 'Traceroute from ' + res.source));
+  b.appendChild(t2);
+  if (!res.trace.hops.length) b.appendChild(el('div', 'pmsg', 'Traceroute returned no hops.'));
+  cols.appendChild(b);
+  wrap.appendChild(cols);
+
+  const hist = trace.history.filter((h) => h.source === trace.source && h.target === trace.target);
+  const t3 = gridTable(['Time', 'Result', 'Path']);
+  [...hist].reverse().forEach((h) => {
+    const tr = el('tr', 'row' + (h === res ? ' sel' : ''));
+    tr.appendChild(el('td', null, new Date(h.at).toLocaleTimeString()));
+    tr.appendChild(el('td', h.verdict.level === 'ok' ? 's-ok' : h.verdict.level === 'fail' ? 's-bad' : 's-warn',
+      h.verdict.level === 'ok' ? 'reached' : h.verdict.level === 'fail' ? 'failed' : 'check'));
+    tr.appendChild(el('td', 'wrap' + (h.changed ? ' s-warn' : ''), h.path.join(' > ') + (h.changed ? '   (changed)' : '')));
+    tr.addEventListener('click', () => { trace.result = h; renderPathBody(); renderPaneBody(); });
+    t3.appendChild(tr);
+  });
+  const hs = el('div');
+  hs.appendChild(el('div', 'tsect-h', 'Runs this session (click one to show it)'));
+  hs.appendChild(t3);
+  wrap.appendChild(hs);
+  return wrap;
 }
 
 /* ================================================================ menus == */
@@ -1937,19 +1848,12 @@ function menuItems(which) {
     { label: 'Run baseline matrix', fn: () => { LAB.matrix.run(); showPane('matrix'); } },
     { label: 'Run DNS audit', fn: () => { LAB.dns.run(); showPane('dns'); } },
     '-',
-    { label: 'Trace a path...', key: 'T', fn: startPick },
+    { label: 'Pick From and To in the node list', key: 'T', fn: () => startPick() },
     '-',
     { label: 'Refresh from CML now', key: 'R', fn: () => poll(true) },
     { label: 'Export inventory as CSV', fn: () => { location.href = '/api/export.csv'; } },
   ];
   if (which === 'view') return [
-    toggle('Address labels', prefs.ip, () => { prefs.ip = !prefs.ip; $('#show-ip').checked = prefs.ip; savePrefs(); renderCanvas(); }),
-    toggle('Interface labels', prefs.iface, () => { prefs.iface = !prefs.iface; $('#show-if').checked = prefs.iface; savePrefs(); renderCanvas(); }),
-    toggle('Link traffic', prefs.traffic, () => setTraffic(!prefs.traffic)),
-    '-',
-    { label: 'Fit lab to window', key: 'F', fn: fit },
-    { label: 'Clear selection', key: 'Esc', fn: () => select(null) },
-    '-',
     { head: 'Theme' },
     toggle('Follow system', !prefs.theme, () => setTheme(null)),
     toggle('Light', prefs.theme === 'light', () => setTheme('light')),
@@ -2012,12 +1916,10 @@ function nodeMenu(n, x, y) {
     { label: 'Copy address', disabled: !ip, fn: () => navigator.clipboard.writeText(ip) },
     { label: 'Copy DNS name', disabled: !fqdn, fn: () => navigator.clipboard.writeText(fqdn) },
     '-',
-    { label: 'Trace path from here...', disabled: !n.can_source_probe || !n.up, fn: () => startPick(n.label) },
-    { label: trace.source && trace.source !== n.label ? `Trace path from ${trace.source} to here` : 'Trace path to here',
-      disabled: !trace.source || trace.source === n.label || n.ghost,
-      fn: () => { setTraceEnds(trace.source, n.label); showPane('trace'); } },
-    '-',
-    { label: 'Center in view', fn: () => centerOn(n, true) },
+    { label: 'Trace from here', disabled: !n.can_source_probe || !n.up,
+      fn: () => setTraceEnds(n.label, trace.target === n.label ? null : trace.target) },
+    { label: 'Trace to here', disabled: n.ghost || trace.source === n.label,
+      fn: () => setTraceEnds(trace.source, n.label) },
     { label: 'Hide node', fn: () => hideNode(n.label) },
   ], box);
   box.hidden = false;
@@ -2053,16 +1955,7 @@ function wire() {
   $('#hidden-btn').addEventListener('click', unhideAll);
   $('#pause').addEventListener('click', togglePause);
 
-  $('#show-ip').checked = prefs.ip;
-  $('#show-if').checked = prefs.iface;
-  $('#show-traffic').checked = prefs.traffic;
-  $('#show-ip').addEventListener('change', (e) => { prefs.ip = e.target.checked; savePrefs(); renderCanvas(); });
-  $('#show-if').addEventListener('change', (e) => { prefs.iface = e.target.checked; savePrefs(); renderCanvas(); });
-  $('#show-traffic').addEventListener('change', (e) => setTraffic(e.target.checked));
-  $('#zoom-in').addEventListener('click', () => zoomAt(1.25));
-  $('#zoom-out').addEventListener('click', () => zoomAt(0.8));
-  $('#zoom-fit').addEventListener('click', fit);
-  $('#trace-btn').addEventListener('click', () => (pick ? cancelPick() : startPick()));
+  $('#nav-toggle').addEventListener('click', () => document.body.classList.toggle('nav-open'));
   $('#refresh-btn').addEventListener('click', () => poll(true));
 
   document.querySelectorAll('.menu').forEach((m) => {
@@ -2072,8 +1965,9 @@ function wire() {
   document.addEventListener('click', (e) => { if (!e.target.closest('.dropdown, .ctxmenu')) closeMenus(); });
   window.addEventListener('blur', closeMenus);
 
-  wireCanvas();
   wireSplitter();
+  let rt = null;
+  window.addEventListener('resize', () => { clearTimeout(rt); rt = setTimeout(renderPathBody, 150); });
   applyPane();
 
   document.addEventListener('keydown', (e) => {
@@ -2088,82 +1982,7 @@ function wire() {
     if (e.key === '/') { e.preventDefault(); $('#q').focus(); }
     if ((e.key === 't' || e.key === 'T') && !e.metaKey && !e.ctrlKey) startPick();
     if ((e.key === 'r' || e.key === 'R') && !e.metaKey && !e.ctrlKey) poll(true);
-    if ((e.key === 'f' || e.key === 'F') && !e.metaKey && !e.ctrlKey) fit();
   });
-}
-
-/* Drag the background to pan, wheel or pinch to zoom, click a node to select
- * it, click empty canvas to clear, double-click for the console log,
- * right-click for the node menu. */
-function wireCanvas() {
-  const c = $('#canvas');
-  let drag = null;
-  const pointers = new Map();
-  c.addEventListener('pointerdown', (e) => {
-    if (e.button === 2) return;
-    pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
-    const nodeEl = e.target.closest('.node');
-    drag = { x: e.clientX, y: e.clientY, vx: view.x, vy: view.y, moved: false, node: nodeEl && nodeEl.dataset.label };
-    c.setPointerCapture(e.pointerId);
-  });
-  c.addEventListener('pointermove', (e) => {
-    if (pointers.has(e.pointerId)) pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
-    if (pointers.size === 2) {
-      const [p, q] = [...pointers.values()];
-      const dist = Math.hypot(p.x - q.x, p.y - q.y);
-      if (drag && drag.pinch) {
-        const r = c.getBoundingClientRect();
-        zoomAt(dist / drag.pinch, (p.x + q.x) / 2 - r.left, (p.y + q.y) / 2 - r.top);
-      }
-      if (drag) { drag.pinch = dist; drag.moved = true; }
-      return;
-    }
-    if (!drag) {
-      const nodeEl = e.target.closest && e.target.closest('.node');
-      const h = nodeEl ? nodeEl.dataset.label : null;
-      if (h !== hovered) { hovered = h; highlight(); }
-      return;
-    }
-    const dx = e.clientX - drag.x, dy = e.clientY - drag.y;
-    if (!drag.moved && Math.hypot(dx, dy) < 4) return;
-    drag.moved = true;
-    c.classList.add('panning');
-    view.x = drag.vx + dx; view.y = drag.vy + dy;
-    applyView();
-  });
-  const end = (e) => {
-    pointers.delete(e.pointerId);
-    if (!drag) return;
-    if (!drag.moved && pick && drag.node) { pickNode(drag.node); }
-    else if (!drag.moved) {
-      select(drag.node || null);
-      if (!drag.node) document.body.classList.remove('side-open');
-    }
-    if (pointers.size === 0) drag = null;
-    c.classList.remove('panning');
-  };
-  c.addEventListener('pointerup', end);
-  c.addEventListener('pointercancel', end);
-  c.addEventListener('pointerleave', () => { if (!drag && hovered) { hovered = null; highlight(); } });
-  c.addEventListener('wheel', (e) => {
-    e.preventDefault();
-    const r = c.getBoundingClientRect();
-    zoomAt(Math.exp(-e.deltaY * 0.0015), e.clientX - r.left, e.clientY - r.top);
-  }, { passive: false });
-  c.addEventListener('dblclick', (e) => {
-    const nodeEl = e.target.closest('.node');
-    if (nodeEl && !BY.get(nodeEl.dataset.label).ghost) openConsole(nodeEl.dataset.label);
-  });
-  c.addEventListener('contextmenu', (e) => {
-    const nodeEl = e.target.closest('.node');
-    e.preventDefault();
-    if (!nodeEl) return;
-    const n = BY.get(nodeEl.dataset.label);
-    select(n.label);
-    nodeMenu(n, e.clientX, e.clientY);
-  });
-  let t = null;
-  window.addEventListener('resize', () => { clearTimeout(t); t = setTimeout(fit, 150); });
 }
 
 function wireSplitter() {

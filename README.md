@@ -23,34 +23,31 @@ app is not used.
 
 ## UI
 
-Laid out like the CML workbench, and styled as a desktop network tool rather
-than a web dashboard:
+CML already draws the whole lab, so NetView does not. It is laid out as a
+desktop network tool around one view: the path between two nodes.
 
-- **Menu bar** (Lab / View / Tools): run the address harvest, baseline matrix
-  and DNS audit, export CSV, toggle canvas labels, theme (system / light /
-  dark), restore hidden nodes, pause refresh.
-- **Toolbar**: fit and zoom, label toggles (addresses, interfaces, link
-  traffic), site filter, and search (`/`).
-- **Canvas**: every node at its CML x/y with the lab's real cabling. Icon shape
-  gives the device class; fill and a square lamp give state (green booted,
-  amber starting, grey stopped, dashed red outline absent). An orange outline
-  marks nodes missing from the manifest. Drag to pan, wheel or pinch to zoom,
-  `F` to fit, double-click for the console log, right-click for node actions.
-  Filters dim the canvas instead of moving nodes. Nodes with no x/y (absent
-  ghosts) sit in a "No canvas position" frame.
-- **Properties sidebar** (right): lab summary and "needs attention" list with
-  nothing selected; with a node selected, Node / Addresses / Interfaces / DHCP
-  / Ping tabs.
-- **Bottom pane**: a sortable, groupable node table, the Baseline matrix,
-  DNS audit, Live addresses and Ping log tabs (tab titles carry their result
-  counts), and one closable tab per console log. Hovering a matrix row draws
-  that path on the canvas; a ping draws its path, dashed while running and
-  coloured by verdict when done. Drag the divider to resize, double-click it
-  to minimise.
+- **Menu bar** (Lab / View / Tools) and **Refresh from CML** (`R`).
+- **Node list** (left, always there): every node grouped by layer, filterable
+  by search (`/`) and site, with its state lamp and address. Click to inspect;
+  **From** / **To** on a row set the ends of the path; double-click for the
+  console log; right-click for everything else.
+- **Path view** (centre): choose From and To (or use the list). The nodes
+  between them are drawn left to right in hop order, with redundant
+  alternatives stacked in the same column; a long path wraps onto the next
+  row like a line of text. Dashed = possible, solid = what the packets
+  actually crossed, with the packet count on each link. After a failover the
+  previous run's nodes stay on the diagram, dotted, marked stopped / not used
+  now. See "Path trace" below.
+- **Properties sidebar** (right): the lab summary with nothing selected; with a
+  node selected, Node / Addresses / Interfaces / DHCP / Ping tabs, each value
+  labelled with where it came from.
+- **Bottom pane**: node table (sortable, groupable), Trace details (links
+  crossed, traceroute hops, every run this session), Baseline matrix (click a
+  row to trace that path), DNS audit, Live addresses, Ping log, and one tab
+  per console log.
 
 Hidden nodes persist as an **exclusion** list, so anything new in the lab
-defaults to visible. Canvas toggles, pane height, sort and grouping are
-remembered per browser.
+defaults to visible.
 
 ## Where the data comes from
 
@@ -76,9 +73,9 @@ read CML does not answer is reported, never silently left blank.
 
 ## Path trace
 
-Pick a source and a destination (**Trace path** / `T`, a node's right-click
-menu, or the Path trace tab). The canvas narrows to the nodes between them
-and a left-to-right diagram of those nodes appears in the pane.
+Pick a source and a destination (From / To above the path view, the From /
+To links in the node list, a node's right-click menu, or `T` to pick in the
+list). The path view draws the nodes between them left to right.
 
 1. **Predicted**: every shortest path over the running part of the lab,
    dashed. With redundancy there are several.
