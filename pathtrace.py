@@ -118,7 +118,15 @@ def candidates(nodes: list[dict], src: str, dst: str) -> dict:
 
 _IOS_RATE = re.compile(r"Success rate is (\d+) percent \((\d+)/(\d+)\)")
 _LNX_RATE = re.compile(r"(\d+) packets transmitted,\s*(\d+) (?:packets )?received")
-_HOP = re.compile(r"^\s*(\d+)\s+(?:(\d+\.\d+\.\d+\.\d+)|\*)(?:\s+\(?\S*\)?)?(?:\s+([\d.]+)\s*ms)?", re.M)
+# No hostname ever appears between the IP and the time here — both traceroute
+# commands below force numeric output (`numeric` on IOS, `-n` on BusyBox) — so
+# there is nothing between them to skip.  A middle "optional hostname" group
+# used to sit here and, being greedy with nothing real to match, swallowed the
+# RTT number itself before the trailing `ms` group ever saw it: confirmed live
+# 2026-09-24, every real hop from both dialects ("2 172.16.90.31 1 msec",
+# "3  172.16.90.31  0.479 ms") parsed with rtt_ms=None. IOS spells the unit
+# "msec", BusyBox "ms" — `m?s(?:ec)?` accepts either.
+_HOP = re.compile(r"^\s*(\d+)\s+(?:(\d+\.\d+\.\d+\.\d+)|\*)\s*(?:([\d.]+)\s*m?s(?:ec)?)?", re.M)
 
 
 def _burst(con: Console, source: dict, ip: str, count: int, fast: bool) -> dict:
@@ -187,6 +195,26 @@ def _delta(a: dict, b: dict) -> dict[str, dict]:
                     "write": (v.get("writepackets") or 0) - (p.get("writepackets") or 0),
                     "drops": (v.get("drops") or 0) - (p.get("drops") or 0)}
     return out
+
+
+def _calibratable(src: dict, nodes: list[dict], raw_delta: dict, base: dict,
+                  base_dt: float, dt: float) -> bool:
+    """Would `analyse()` get a usable factor out of this burst?  Same
+    background-corrected sum over the source's own links that `analyse()`
+    computes for real, checked early so a too-small burst can be retried
+    with more packets before the console session closes, instead of only
+    finding out from a `factor: null` result the caller has to re-request."""
+    src_links = {l.get("link_id") for n in nodes if n["label"] == src["label"]
+                for l in (n.get("links") or [])}
+    total = 0.0
+    for lid in src_links:
+        d = raw_delta.get(lid)
+        if not d:
+            continue
+        b = base.get(lid) or {"read": 0, "write": 0}
+        rate = (b["read"] + b["write"]) / base_dt
+        total += max(0.0, d["read"] + d["write"] - rate * dt)
+    return total > 0
 
 
 # --------------------------------------------------------------------------
@@ -264,12 +292,32 @@ def _execute(job_id: str, cml, con: Console, spec: dict) -> dict:
     base = _delta(s0, s1)
     base_dt = max(0.5, t1 - t0)
 
-    _set(job_id, stage=f"sending {count} pings from {src['label']}")
-    t2, s2 = _stats(cml)
-    burst = _burst(con, src, ip, count, fast=not answering)
-    t3, s3 = _stats(cml)
-    dt = t3 - t2
-    raw_delta = _delta(s2, s3)
+    # A healthy, low-latency path can blast a full burst in a couple of
+    # seconds regardless of count (IOS sends the next echo as soon as the
+    # reply arrives, not on a fixed interval), so the requested packet count
+    # does not reliably control the burst's wall-clock window.  On a busy
+    # trunk that window can be too short for the signal to clear the
+    # background rate — measured 2026-09-24: a 100-packet burst on a link
+    # with ~19 pkt/s of HSRP background came back uncalibratable
+    # (factor: null) while the SAME path at 150+ packets calibrated cleanly
+    # (factor 0.994-1.003), and a different link elsewhere in this lab
+    # (AccessSwitch-DR-1's core-transit trunk, which carries HSRP hellos for
+    # eight VLANs at once) runs ~96 pkt/s at idle — five times busier. A
+    # single fixed count cannot be a safe default across links that differ
+    # that much, so retry once with a bigger burst rather than trusting one
+    # static number to be enough everywhere.
+    retried = False
+    for attempt_count in (count, min(500, max(count * 3, 300))):
+        _set(job_id, stage=f"sending {attempt_count} pings from {src['label']}")
+        t2, s2 = _stats(cml)
+        burst = _burst(con, src, ip, attempt_count, fast=not answering)
+        t3, s3 = _stats(cml)
+        dt = t3 - t2
+        raw_delta = _delta(s2, s3)
+        count = attempt_count
+        if _calibratable(src, nodes, raw_delta, base, base_dt, dt):
+            break
+        retried = True
 
     _set(job_id, stage=f"traceroute from {src['label']}")
     try:
@@ -281,6 +329,10 @@ def _execute(job_id: str, cml, con: Console, spec: dict) -> dict:
 
     out = analyse(nodes, src, dst, ip, count, burst, raw_delta, base, base_dt, dt, cand, trace,
                   spec.get("owners") or {}, pre, answering)
+    out["retried"] = retried
+    if retried and out.get("factor") is not None:
+        out["findings"].insert(0, f"The first burst was too small to separate from background "
+                                  f"traffic on this link; retried at {count} packets.")
     if dns:
         out["dns"] = dns
         if dns.get("ok") and not dns.get("matches"):

@@ -17,7 +17,6 @@ did not answer" rather than silently blank.
 """
 from __future__ import annotations
 
-import concurrent.futures as cf
 import threading
 import time
 from datetime import datetime, timezone
@@ -27,8 +26,6 @@ import cfgparse
 _cache: dict = {"at": 0.0, "data": None}
 _lock = threading.Lock()
 TTL_S = 5            # a page refresh never waits on a fetch younger than this
-CONFIG_TTL_S = 30    # per-node config reads are one request each; cache a bit longer
-_configs: dict = {"at": 0.0, "by_id": {}}
 
 
 def _get(cml, path: str):
@@ -72,35 +69,25 @@ def fetch(cml, force: bool = False) -> dict:
 
 
 def node_configs(cml, topo_nodes: list[dict], force: bool = False) -> tuple[dict, str | None]:
-    """node id -> config text.  Uses the config carried in the topology when
-    CML includes it; otherwise asks each node (in parallel) and caches."""
+    """node id -> config text, from whatever `topology()` embeds.
+
+    There is no GET endpoint to read a node's stored config beyond what
+    topology() already carries — confirmed 2026-09-24 against CML 2.10.0's
+    own OpenAPI spec: `/nodes/{id}/config` doesn't exist (404) and the only
+    config-shaped path is `PUT .../extract_configuration`, a WRITE that pulls
+    the device's live running config back into CML. That's a state-changing
+    action, wrong to fire silently on a read-only dashboard refresh, so it is
+    not used here. Nodes topology() has no configuration for (measured: every
+    `win2025` node, which is staged over the network per the winserver skill,
+    not day-0) simply have none to show — reported as such, not retried.
+    """
     have = {n["id"]: n.get("configuration") for n in topo_nodes
-            if n.get("id") and n.get("configuration")}
-    missing = [n["id"] for n in topo_nodes if n.get("id") and n["id"] not in have]
-    if not missing:
-        return {k: cfgparse.config_text(v) for k, v in have.items()}, None
-
-    now = time.time()
-    if force or now - _configs["at"] > CONFIG_TTL_S:
-        err = None
-
-        def one(nid):
-            try:
-                return nid, _get(cml, f"/nodes/{nid}/config"), None
-            except Exception as e:             # noqa: BLE001
-                return nid, None, f"{type(e).__name__}: {e}"
-
-        got = {}
-        with cf.ThreadPoolExecutor(max_workers=8) as ex:
-            for nid, cfg, e in ex.map(one, missing):
-                if cfg is not None:
-                    got[nid] = cfg
-                elif e and not err:
-                    err = e
-        _configs.update({"at": now, "by_id": got, "err": err})
-    merged = {k: cfgparse.config_text(v) for k, v in have.items()}
-    merged.update({k: cfgparse.config_text(v) for k, v in _configs["by_id"].items()})
-    return merged, _configs.get("err")
+           if n.get("id") and n.get("configuration")}
+    without = [n["label"].rstrip() for n in topo_nodes
+              if n.get("id") and n["id"] not in have]
+    err = (f"no config from CML for: {', '.join(sorted(without))}"
+          if without else None)
+    return {k: cfgparse.config_text(v) for k, v in have.items()}, err
 
 
 def _normalise_l3(raw) -> dict:
@@ -163,9 +150,17 @@ def apply(inv: dict, topology: dict, lab: dict, configs: dict, role_layer: dict,
         fn = full_by_label.get(n["label"], {})
         tags = _tags({"tags": fn.get("tags") or tn.get("tags")})
         n["tags"] = tags["_all"]
-        n["image"] = fn.get("image_definition") or tn.get("image_definition")
-        n["cpus"] = fn.get("cpus") or tn.get("cpus")
-        n["ram"] = fn.get("ram") or tn.get("ram")
+        # `cpus`/`ram`/`image_definition` are top-level fields that hold the
+        # PER-NODE OVERRIDE and are None on every node that just takes the
+        # image's default (confirmed live 2026-09-23: None on every node
+        # checked except one with an explicit RAM override; the running
+        # values are always in `operational`, which nodes_full() carries and
+        # topology() does not, so the topology() fallback below can never
+        # supply what nodes_full() didn't).
+        op = fn.get("operational") or {}
+        n["image"] = fn.get("image_definition") or op.get("image_definition") or tn.get("image_definition")
+        n["cpus"] = fn.get("cpus") or op.get("cpus") or tn.get("cpus")
+        n["ram"] = fn.get("ram") or op.get("ram") or tn.get("ram")
         if fn.get("x") is not None:
             n["x"], n["y"] = fn.get("x"), fn.get("y")
 

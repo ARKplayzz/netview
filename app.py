@@ -245,7 +245,11 @@ def api_trace():
     target_ip = body.get("target_ip") or target.get("live_ip") or target.get("primary_ip")
     if not target_ip:
         return jsonify({"error": f"No address known for {target['label']}."}), 400
-    count = max(20, min(int(body.get("count", 100)), 500))
+    # 100 measured too low on this lab's busier trunks (factor: null on a
+    # link running ~19 pkt/s background, clean calibration from ~150 up) —
+    # see pathtrace._execute()'s retry logic. 150 as the default cuts how
+    # often that retry is needed without slowing the common case much.
+    count = max(20, min(int(body.get("count", 150)), 500))
     # Optional: also ask a resolver for the target's name, from the source
     # itself when it has a shell, else from a Linux node at the same site.
     vantage = None
