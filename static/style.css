@@ -284,6 +284,15 @@ table.p tr.drift td { background: var(--infobg); }
 .wire.t-both { stroke: var(--ok); stroke-width: 4; }
 .wire.t-one { stroke: var(--warn); stroke-width: 4; stroke-dasharray: 9 3; }
 .wire.t-fwd { stroke: var(--bad); stroke-width: 4; }
+.wire.pkt-flash { stroke-width: 8; transition: stroke-width 60ms ease-out; }
+.wire.pkt-flash.pkt-req { stroke: var(--sel); }
+.wire.pkt-flash.pkt-reply { stroke: var(--ok); }
+.pkt-log-head { display: flex; align-items: center; gap: 8px; padding: 8px 14px 0; flex-wrap: wrap; }
+.pkt-log-wrap { max-height: 220px; overflow: auto; margin: 6px 14px 12px; border: 1px solid var(--line2); }
+.pkt-log-wrap table.g { table-layout: fixed; }
+.pkt-log-wrap table.g td, .pkt-log-wrap table.g th { padding: 1px 8px; }
+tr.pkt-row.reply td { color: var(--ink2); }
+tr.pkt-row.hl td { background: var(--selbg); }
 .tkey { display: flex; gap: 16px; color: var(--ink2); padding: 4px 10px 0; flex-wrap: wrap; }
 .tkey span { display: flex; gap: 6px; align-items: center; }
 .tcols { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(420px, 100%), 1fr)); gap: 0 1px;

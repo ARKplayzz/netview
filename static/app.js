@@ -961,7 +961,7 @@ function nodeListRow(n) {
  * shows the links the packets DID cross, at layer 2 as well as layer 3.  Run
  * it, stop the active core switch in CML, run it again: the path moves. */
 const trace = { source: null, target: null, ip: null, count: 100, repeat: false, dns: false,
-                job: null, stage: '', result: null, cand: null, history: [], error: null };
+                capture: false, job: null, stage: '', result: null, cand: null, history: [], error: null };
 let pick = null;           // null | 'source' | 'target'
 
 function startPick(src) {
@@ -1078,7 +1078,7 @@ async function runTrace() {
     const r = await fetch('/api/trace', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ source: trace.source, target: trace.target, target_ip: trace.ip,
-                             count: trace.count, dns: trace.dns }),
+                             count: trace.count, dns: trace.dns, capture: trace.capture }),
     });
     const j = await r.json();
     if (!r.ok) throw new Error(j.error);
@@ -1169,6 +1169,13 @@ function renderPathHead() {
   dl.title = t && (t.dns || {}).fqdn ? `Also resolve ${t.dns.fqdn} and compare the answer with the address being traced`
     : 'The destination has no internal DNS name';
   head.appendChild(dl);
+  const pl = el('label');
+  const pc = el('input'); pc.type = 'checkbox'; pc.checked = trace.capture;
+  pc.addEventListener('change', () => { trace.capture = pc.checked; });
+  pl.appendChild(pc); pl.appendChild(document.createTextNode('Packet capture'));
+  pl.title = 'Capture on every candidate link and show the actual timestamped ICMP packets, ' +
+             'not just before/after counters. Slower - adds a capture start/stop per link.';
+  head.appendChild(pl);
   const rl = el('label');
   const rc = el('input'); rc.type = 'checkbox'; rc.checked = trace.repeat;
   rc.addEventListener('change', () => { trace.repeat = rc.checked; if (rc.checked && !trace.job) runTrace(); });
@@ -1227,8 +1234,78 @@ function renderPathBody() {
     const f = el('div', 'path-findings');
     res.findings.forEach((x) => f.appendChild(el('div', null, x)));
     if (res.findings.length) body.appendChild(f);
+    if (res.packet_log && res.packet_log.length) body.appendChild(packetLogPanel(res));
   }
   markPathSelection();
+}
+
+/* ------------------------------------------- packet log + replay on the topology --- */
+const PKT_LOG_CAP = 300;   // above this, sample evenly - 2000+ DOM rows and timers is just jank, not more proof
+
+function packetLogPanel(res) {
+  const full = res.packet_log;
+  const step = Math.max(1, Math.ceil(full.length / PKT_LOG_CAP));
+  const log = step === 1 ? full : full.filter((_, i) => i % step === 0);
+  const box = el('div', 'pkt-log');
+  const head = el('div', 'pkt-log-head');
+  head.appendChild(el('b', null, step === 1 ? `Packets captured (${log.length})`
+                                            : `Packets captured (showing ${log.length} of ${full.length})`));
+  head.appendChild(el('span', 's-dim', ' — real ICMP echoes seen on each candidate link, by timestamp'));
+  const btn = el('button', 'default', 'Replay on topology');
+  btn.addEventListener('click', () => replayPackets(log, btn));
+  head.appendChild(btn);
+  box.appendChild(head);
+
+  const wrap = el('div', 'pkt-log-wrap');
+  const t = el('table', 'g');
+  const thead = el('tr');
+  ['t (ms)', 'link', 'iface', '', 'direction', 'seq'].forEach((h) => thead.appendChild(el('th', null, h)));
+  t.appendChild(thead);
+  log.forEach((e, i) => {
+    const tr = el('tr', 'row pkt-row ' + e.dir);
+    tr.dataset.pktIndex = String(i);
+    tr.appendChild(el('td', null, String(e.t_ms)));
+    tr.appendChild(el('td', null, e.a));
+    tr.appendChild(el('td', null, e.ai));
+    tr.appendChild(el('td', null, e.dir === 'request' ? '→' : '←'));
+    tr.appendChild(el('td', null, `${e.dir} (${e.b} ${e.bi})`));
+    tr.appendChild(el('td', null, e.seq || ''));
+    t.appendChild(tr);
+  });
+  wrap.appendChild(t);
+  box.appendChild(wrap);
+  return box;
+}
+
+function replayPackets(log, btn) {
+  if (!log.length) return;
+  btn.disabled = true;
+  const origText = btn.textContent;
+  const span = log[log.length - 1].t_ms - log[0].t_ms || 1;
+  // Real captures finish in well under a second on this lab - too fast to
+  // watch. Stretch playback to a length a person can actually follow while
+  // keeping every packet's relative order and spacing intact.
+  const playMs = Math.min(8000, Math.max(2500, span));
+  const scale = playMs / span;
+  let done = 0;
+  log.forEach((e, i) => {
+    setTimeout(() => {
+      const w = document.querySelector(`.pdiag [data-link-id="${e.link_id}"]`);
+      if (w) {
+        w.classList.add('pkt-flash', e.dir === 'request' ? 'pkt-req' : 'pkt-reply');
+        setTimeout(() => w.classList.remove('pkt-flash', 'pkt-req', 'pkt-reply'), 220);
+      }
+      const row = document.querySelector(`tr.pkt-row[data-pkt-index="${i}"]`);
+      if (row) {
+        row.classList.add('hl');
+        row.scrollIntoView({ block: 'nearest' });
+        setTimeout(() => row.classList.remove('hl'), 220);
+      }
+      done++;
+      if (done === log.length) { btn.disabled = false; btn.textContent = origText; }
+    }, (e.t_ms - log[0].t_ms) * scale);
+  });
+  btn.textContent = 'Replaying...';
 }
 
 function markPathSelection() {
@@ -1313,13 +1390,13 @@ function pathDiagram(res, cand, width) {
     const cls = 'wire ' + (e.kind === 'prev' ? 't-prev' : u ? (u.use === 'both' ? 't-both' : u.use === 'forward' ? 't-fwd' : 't-one') : 't-cand');
     let lx, ly;
     if (a.seg === b.seg) {
-      s.appendChild(svg('line', { x1: a.x, y1: a.y, x2: b.x, y2: b.y, class: cls }));
+      s.appendChild(svg('line', { x1: a.x, y1: a.y, x2: b.x, y2: b.y, class: cls, 'data-link-id': e.id || '' }));
       lx = (a.x + b.x) / 2; ly = (a.y + b.y) / 2 - 7;
     } else {
       // wrap: out to the right, down into the gap, back to the left, in
       const gapY = padY + (a.seg + 1) * (segH + segGap) - segGap / 2 - 8;
       const r = a.x + padX * 0.6, l = b.x - padX * 0.6;
-      s.appendChild(svg('polyline', { points: `${a.x},${a.y} ${r},${a.y} ${r},${gapY} ${l},${gapY} ${l},${b.y} ${b.x},${b.y}`, class: cls }));
+      s.appendChild(svg('polyline', { points: `${a.x},${a.y} ${r},${a.y} ${r},${gapY} ${l},${gapY} ${l},${b.y} ${b.x},${b.y}`, class: cls, 'data-link-id': e.id || '' }));
       lx = (r + l) / 2; ly = gapY - 6;
     }
     if (u && u.packets != null) {
