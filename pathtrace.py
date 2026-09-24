@@ -259,16 +259,45 @@ def _capture_start_all(cml, link_ids: list[str], maxtime: int) -> dict[str, str 
     return starts
 
 
-def _parse_pcap(packets: list[dict], lid: str, l: dict, base_t: datetime, ip: str) -> list[dict]:
+def _parse_pcap(packets: list[dict], lid: str, l: dict, base_t: datetime, ip: str,
+                src_label: str, owners: dict[str, str]) -> list[dict]:
     """Turn CML's raw packet listing for one link into this trace's own echo
     events. Shared by the final (post-stop) pull and the live poller so both
-    agree on what counts as a match."""
+    agree on what counts as a match.
+
+    Matching on the target IP alone is not enough: a link the source shares
+    with other traffic can carry SOMEONE ELSE'S ping to (or from) the exact
+    same target during the same capture window - HSRP health checks, another
+    admin's test, a second trace run - and that traffic would get shown as
+    this test's own proof.  IP routing preserves the IP header end to end
+    (only the framing changes per hop), so the OTHER endpoint is the same
+    address on every hop of a real run of this test: the source device's own
+    address, whichever interface it sent from.  `owners` (built from every
+    address the inventory knows) resolves that address back to a node label.
+
+    Fails OPEN on an address `owners` doesn't recognise, not closed: measured
+    live 2026-09-24, CoreSwitch-DR-1's own Ethernet0/2 address never made it
+    into the harvested/config address list at all (a pre-existing gap in that
+    data, not something introduced here), so a strict "must resolve to
+    src_label" check rejected CoreSwitch-DR-1's own genuine echo traffic on
+    its own outgoing interface. Only reject a packet whose other endpoint
+    resolves to a DIFFERENT, KNOWN node - that's the actual failure mode this
+    exists to catch (traffic from some other, identifiable device sharing the
+    same target IP), not an unlabelled address."""
     events = []
     for p in packets:
         info = p.get("info") or ""
         if p.get("protocol") != "ICMP" or "Echo" not in info:
             continue
-        if ip not in (p.get("source"), p.get("destination")):
+        src_ip, dst_ip = p.get("source"), p.get("destination")
+        if dst_ip == ip:
+            other = src_ip
+        elif src_ip == ip:
+            other = dst_ip
+        else:
+            continue
+        owner = owners.get(other)
+        if owner is not None and owner != src_label:
             continue
         m = _ECHO_ID_SEQ.search(info)
         try:
@@ -287,7 +316,8 @@ def _parse_pcap(packets: list[dict], lid: str, l: dict, base_t: datetime, ip: st
 
 
 def _live_poll(job_id: str, cml, link_ids: list[str], links: dict, starts: dict[str, str | None],
-               ip: str, stop: threading.Event, interval: float = 0.5) -> None:
+               ip: str, src_label: str, owners: dict[str, str], stop: threading.Event,
+               interval: float = 0.5) -> None:
     """Poll every candidate link's capture WHILE it's still running (verified
     live 2026-09-24: /pcap/{id}/packets returns whatever has been captured so
     far, no need to stop first) and append newly-seen echoes to the job as
@@ -302,8 +332,17 @@ def _live_poll(job_id: str, cml, link_ids: list[str], links: dict, starts: dict[
         except (TypeError, ValueError):
             pass
     seen: dict[str, set] = {lid: set() for lid in link_ids}
+    # Same ICMP-id fingerprinting as _packet_log(), applied prospectively as
+    # it's learned rather than in one final pass: the source's own link is
+    # polled first each cycle so `own_ids` fills in before the other links
+    # are checked, but until it has anything, everything owner-matched is
+    # shown - a live view can't hold packets back waiting for a cross-check
+    # that might never resolve on a link that isn't a capture candidate.
+    own_ids: set[str] = set()
+    ordered = [lid for lid in link_ids if src_label in (links.get(lid, {}).get("a"), links.get(lid, {}).get("b"))] + \
+             [lid for lid in link_ids if src_label not in (links.get(lid, {}).get("a"), links.get(lid, {}).get("b"))]
     while not stop.is_set():
-        for lid in link_ids:
+        for lid in ordered:
             l, base_t = links.get(lid), base_ts.get(lid)
             if not l or not base_t:
                 continue
@@ -315,7 +354,11 @@ def _live_poll(job_id: str, cml, link_ids: list[str], links: dict, starts: dict[
             if not fresh:
                 continue
             seen[lid].update(p.get("no") for p in fresh)
-            events = _parse_pcap(fresh, lid, l, base_t, ip)
+            events = _parse_pcap(fresh, lid, l, base_t, ip, src_label, owners)
+            if src_label in (l["a"], l["b"]):
+                own_ids.update(e["icmp_id"] for e in events if e["icmp_id"])
+            elif own_ids:
+                events = [e for e in events if e["icmp_id"] in own_ids]
             if events:
                 with _jobs_lock:
                     job = _jobs.get(job_id)
@@ -325,7 +368,7 @@ def _live_poll(job_id: str, cml, link_ids: list[str], links: dict, starts: dict[
 
 
 def _packet_log(cml, link_ids: list[str], links: dict, starts: dict[str, str | None],
-                ip: str) -> list[dict]:
+                ip: str, src_label: str, owners: dict[str, str]) -> list[dict]:
     """Stop capture on every candidate link and return the target IP's own
     echo request/reply packets, time-ordered across all of them. Each
     packet's `time` from CML is seconds since THAT link's own capture
@@ -350,7 +393,21 @@ def _packet_log(cml, link_ids: list[str], links: dict, starts: dict[str, str | N
             packets = cml.pcap_packets(lid)
         except RuntimeError:
             continue
-        events.extend(_parse_pcap(packets, lid, l, base_t, ip))
+        events.extend(_parse_pcap(packets, lid, l, base_t, ip, src_label, owners))
+    # The owners check (above) rules out traffic from a different, identified
+    # device sharing the same target IP, but not a second ping session
+    # between these exact same two endpoints - e.g. someone running the
+    # identical test by hand on the device's own console at the same time.
+    # IOS/ASA assigns one ICMP id per `ping` invocation, shared by every
+    # packet in that run and never reused by a concurrent one, so the id(s)
+    # actually seen on the source's OWN link - which by definition carries
+    # only the source's own traffic - are this test's real fingerprint.
+    # Fails open (keeps everything) if that link wasn't captured or came back
+    # empty, rather than discarding real proof over a missing cross-check.
+    own_ids = {e["icmp_id"] for e in events
+              if e["icmp_id"] and src_label in (e["a"], e["b"])}
+    if own_ids:
+        events = [e for e in events if e["icmp_id"] in own_ids]
     events.sort(key=lambda e: e["at"])
     if events:
         t0 = events[0]["at"]
@@ -450,6 +507,7 @@ def _run(job_id: str) -> None:
 def _execute(job_id: str, cml, con: Console, spec: dict) -> dict:
     src, dst, ip, count = spec["source"], spec["target"], spec["target_ip"], spec["count"]
     nodes = spec["nodes"]
+    owners = spec.get("owners") or {}
     cand = candidates(nodes, src["label"], dst["label"])
 
     _set(job_id, stage="checking the target answers")
@@ -478,7 +536,7 @@ def _execute(job_id: str, cml, con: Console, spec: dict) -> dict:
         _set(job_id, live_packets=[])
         live_thread = threading.Thread(target=_live_poll, daemon=True,
                                        args=(job_id, cml, cand["links"], link_map, capture_starts,
-                                             ip, live_stop))
+                                             ip, src["label"], owners, live_stop))
         live_thread.start()
 
     # A healthy, low-latency path can blast a full burst in a couple of
@@ -530,7 +588,8 @@ def _execute(job_id: str, cml, con: Console, spec: dict) -> dict:
     out["retried"] = retried
     if capture:
         _set(job_id, stage="collecting packet capture")
-        out["packet_log"] = _packet_log(cml, cand["links"], link_map, capture_starts, ip)
+        out["packet_log"] = _packet_log(cml, cand["links"], link_map, capture_starts, ip,
+                                        src["label"], owners)
     if retried and out.get("factor") is not None:
         out["findings"].insert(0, f"The first burst was too small to separate from background "
                                   f"traffic on this link; retried at {count} packets.")
@@ -619,6 +678,25 @@ def analyse(nodes, src, dst, ip, count, burst, raw_delta, base, base_dt, dt, can
         pk = net.get(lid, 0) / factor if factor else None
         share = pk / expected if pk is not None and expected else 0
         cls = "both" if share >= BOTH_WAYS else "one-way" if share >= ONE_WAY else "none"
+        # A link whose raw read and write deltas are close to each other
+        # carried real traffic in both directions almost by definition - a
+        # genuinely one-way link (asymmetric routing) shows a lopsided ratio
+        # instead, since only one direction's packets cross it at all.
+        # `share` alone can land just under BOTH_WAYS from ordinary noise in
+        # the overall calibration even when both directions plainly crossed
+        # this specific link - reproduced live 2026-09-24, repeatedly, on the
+        # same link: share 0.73, read 176/write 176 (later runs: 446 read
+        # /write on the SAME link, again near-identical) - every other link
+        # on the same trace read "both" cleanly. Verified against packet
+        # capture: that link carried exactly 150 requests AND 150 replies,
+        # so "one-way" was wrong. Using the read/write balance as a second
+        # signal (rather than just lowering BOTH_WAYS, which would risk
+        # hiding a link that genuinely carries mostly one direction) fixes
+        # this without weakening the real asymmetric-routing case.
+        if cls == "one-way":
+            r, w = raw_delta[lid]["read"], raw_delta[lid]["write"]
+            if min(r, w) / max(r, w, 1) >= 0.6:
+                cls = "both"
         # with no replies at all, a link carrying the requests is "one-way" by
         # construction; call it forward so the page does not claim asymmetry
         if recv == 0 and cls != "none":
