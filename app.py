@@ -257,6 +257,7 @@ def api_trace():
         vantage = probes.pick_dns_vantage(source, inv["nodes"], source.get("site"))
     job_id = pathtrace.submit({"source": source, "target": target, "target_ip": target_ip,
                                "count": count, "nodes": inv["nodes"], "dns": bool(body.get("dns")),
+                               "capture": bool(body.get("capture")),
                                "vantage": vantage, "owners": _address_owners(inv["nodes"])})
     job = pathtrace.get(job_id)
     return jsonify({"job_id": job_id, "eta_seconds": job["eta_seconds"], "target_ip": target_ip})

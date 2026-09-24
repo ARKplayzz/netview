@@ -210,6 +210,93 @@ def _delta(a: dict, b: dict) -> dict[str, dict]:
     return out
 
 
+# --------------------------------------------------------------------------
+# packet capture (ground truth for the counter-based trace above)
+# --------------------------------------------------------------------------
+#
+# simulation_stats() counters say HOW MANY packets crossed a link; they can't
+# say these specific packets did. A live capture can: start it on every
+# candidate link before the burst, stop it after, and pull back the real
+# ICMP echo request/reply packets by id+seq. CML's `bpfilter` is broken (any
+# non-empty value captures 0 packets, verified 2026-09-24), so every link is
+# captured unfiltered and the echo request/reply pair for THIS trace's target
+# IP is picked out client-side by matching source/destination.
+_ECHO_ID_SEQ = re.compile(r"id=(0x[0-9a-f]+), seq=(\d+)")
+
+
+def _capture_start_all(cml, link_ids: list[str], maxtime: int) -> dict[str, str | None]:
+    """Start an unfiltered capture on each candidate link. Returns
+    {link_id: starttime} so packet offsets (relative to each link's own
+    capture) can be converted to one shared absolute timeline. A link whose
+    capture was already running (e.g. a previous job's cleanup lost a race)
+    is treated as already-on rather than failing the whole trace over it."""
+    starts: dict[str, str | None] = {}
+    for lid in link_ids:
+        try:
+            r = cml.capture_start(lid, maxpackets=3000, maxtime=maxtime)
+            starts[lid] = (r or {}).get("starttime")
+        except RuntimeError as e:
+            if "already running" not in str(e):
+                raise
+            st = cml.capture_status(lid)
+            starts[lid] = (st or {}).get("starttime")
+    return starts
+
+
+def _packet_log(cml, link_ids: list[str], links: dict, starts: dict[str, str | None],
+                ip: str) -> list[dict]:
+    """Stop capture on every candidate link and return the target IP's own
+    echo request/reply packets, time-ordered across all of them. Each
+    packet's `time` from CML is seconds since THAT link's own capture
+    started, not a shared clock, so it's converted to one absolute timeline
+    using the per-link starttime `_capture_start_all` recorded."""
+    for lid in link_ids:
+        try:
+            cml.capture_stop(lid)
+        except RuntimeError:
+            pass
+    events = []
+    for lid in link_ids:
+        l = links.get(lid)
+        start = starts.get(lid)
+        if not l or not start:
+            continue
+        try:
+            base_t = datetime.strptime(start, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+        try:
+            packets = cml.pcap_packets(lid)
+        except RuntimeError:
+            continue
+        for p in packets:
+            info = p.get("info") or ""
+            if p.get("protocol") != "ICMP" or "Echo" not in info:
+                continue
+            if ip not in (p.get("source"), p.get("destination")):
+                continue
+            m = _ECHO_ID_SEQ.search(info)
+            try:
+                offset = float(p.get("time") or 0)
+            except ValueError:
+                offset = 0.0
+            at = base_t.timestamp() + offset
+            # CML annotates a reply with "(request in N)", so "request" alone
+            # appears in BOTH lines - check which one this line opens with.
+            direction = "reply" if info.lstrip().startswith("Echo (ping) reply") else "request"
+            events.append({"link_id": lid, "a": l["a"], "ai": l["ai"], "b": l["b"], "bi": l["bi"],
+                           "at": at, "dir": direction,
+                           "src": p.get("source"), "dst": p.get("destination"),
+                           "icmp_id": m.group(1) if m else None, "seq": m.group(2) if m else None})
+    events.sort(key=lambda e: e["at"])
+    if events:
+        t0 = events[0]["at"]
+        for e in events:
+            e["t_ms"] = round((e["at"] - t0) * 1000)
+            e["at"] = datetime.fromtimestamp(e["at"], tz=timezone.utc).isoformat()
+    return events
+
+
 def _calibratable(src: dict, nodes: list[dict], raw_delta: dict, base: dict,
                   base_dt: float, dt: float, expected: int) -> bool:
     """Would `analyse()` get a usable factor out of this burst?  Same
@@ -249,7 +336,7 @@ def submit(spec: dict) -> str:
     job = {"id": job_id, "spec": spec, "status": "queued", "stage": "waiting for a console session",
            "created": datetime.now(timezone.utc).isoformat(), "result": None, "error": None,
            "eta_seconds": int(probe_engine.COST_OPEN_S + BASELINE_S + 3 * probe_engine.COST_ATTACH_S
-                              + count * per + 12)}
+                              + count * per + 12 + (8 if spec.get("capture") else 0))}
     with _jobs_lock:
         _jobs[job_id] = job
         while len(_jobs) > 100:
@@ -313,6 +400,16 @@ def _execute(job_id: str, cml, con: Console, spec: dict) -> dict:
     base = _delta(s0, s1)
     base_dt = max(0.5, t1 - t0)
 
+    capture = bool(spec.get("capture")) and bool(cand["links"])
+    capture_starts: dict[str, str | None] = {}
+    if capture:
+        _set(job_id, stage="starting packet capture on candidate links")
+        # Covers both the first attempt and a retry (see below) at up to 500
+        # packets each, plus the traceroute that follows - generous rather
+        # than tight, since a capture that stops early loses proof, not just
+        # accuracy.
+        capture_starts = _capture_start_all(cml, cand["links"], maxtime=45)
+
     # A healthy, low-latency path can blast a full burst in a couple of
     # seconds regardless of count (IOS sends the next echo as soon as the
     # reply arrives, not on a fixed interval), so the requested packet count
@@ -352,6 +449,9 @@ def _execute(job_id: str, cml, con: Console, spec: dict) -> dict:
     out = analyse(nodes, src, dst, ip, count, burst, raw_delta, base, base_dt, dt, cand, trace,
                   spec.get("owners") or {}, pre, answering)
     out["retried"] = retried
+    if capture:
+        _set(job_id, stage="collecting packet capture")
+        out["packet_log"] = _packet_log(cml, cand["links"], _link_map(nodes), capture_starts, ip)
     if retried and out.get("factor") is not None:
         out["findings"].insert(0, f"The first burst was too small to separate from background "
                                   f"traffic on this link; retried at {count} packets.")
@@ -396,8 +496,7 @@ def _dns(job_id: str, con: Console, spec: dict) -> dict:
     return parsed
 
 
-def analyse(nodes, src, dst, ip, count, burst, raw_delta, base, base_dt, dt, cand, trace,
-            owners, pre, answering) -> dict:
+def _link_map(nodes: list[dict]) -> dict[str, dict]:
     by_label = {n["label"]: n for n in nodes}
     links: dict[str, dict] = {}
     for n in nodes:
@@ -405,7 +504,13 @@ def analyse(nodes, src, dst, ip, count, burst, raw_delta, base, base_dt, dt, can
             lid = l.get("link_id")
             if lid and lid not in links and l["peer"] in by_label:
                 links[lid] = {"id": lid, "a": n["label"], "ai": l["local_iface"],
-                              "b": l["peer"], "bi": l["peer_iface"]}
+                             "b": l["peer"], "bi": l["peer_iface"]}
+    return links
+
+
+def analyse(nodes, src, dst, ip, count, burst, raw_delta, base, base_dt, dt, cand, trace,
+            owners, pre, answering) -> dict:
+    links = _link_map(nodes)
 
     # background-corrected packet delta per link
     net: dict[str, float] = {}
