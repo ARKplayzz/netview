@@ -293,6 +293,10 @@ table.p tr.drift td { background: var(--infobg); }
 .pkt-log-wrap table.g td, .pkt-log-wrap table.g th { padding: 1px 8px; }
 tr.pkt-row.reply td { color: var(--ink2); }
 tr.pkt-row.hl td { background: var(--selbg); }
+.mode-tag { font: 700 10px var(--sans); letter-spacing: .04em; padding: 1px 6px; border-radius: 3px;
+           margin-right: 6px; }
+.mode-tag.verified { background: var(--ok); color: var(--canvas); }
+.mode-pick select { margin-left: 2px; }
 .tkey { display: flex; gap: 16px; color: var(--ink2); padding: 4px 10px 0; flex-wrap: wrap; }
 .tkey span { display: flex; gap: 6px; align-items: center; }
 .tcols { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(420px, 100%), 1fr)); gap: 0 1px;

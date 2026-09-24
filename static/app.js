@@ -1182,13 +1182,22 @@ function renderPathHead() {
   dl.title = t && (t.dns || {}).fqdn ? `Also resolve ${t.dns.fqdn} and compare the answer with the address being traced`
     : 'The destination has no internal DNS name';
   head.appendChild(dl);
-  const pl = el('label');
-  const pc = el('input'); pc.type = 'checkbox'; pc.checked = trace.capture;
-  pc.addEventListener('change', () => { trace.capture = pc.checked; });
-  pl.appendChild(pc); pl.appendChild(document.createTextNode('Packet capture'));
-  pl.title = 'Capture on every candidate link and show the actual timestamped ICMP packets, ' +
-             'not just before/after counters. Slower - adds a capture start/stop per link.';
-  head.appendChild(pl);
+  const ml = el('label', 'mode-pick');
+  ml.appendChild(document.createTextNode('Mode '));
+  const ms = el('select');
+  [['quick', 'Quick (counters)'], ['verified', 'Verified (capture)']].forEach(([v, t]) => {
+    const o = el('option', null, t); o.value = v; ms.appendChild(o);
+  });
+  ms.value = trace.capture ? 'verified' : 'quick';
+  ms.addEventListener('change', () => { trace.capture = ms.value === 'verified'; });
+  ml.appendChild(ms);
+  ml.title = 'Quick reads before/after packet counters - fast, but a byte count can\'t tell this ' +
+             'test\'s traffic from anything else crossing the same link at the same moment, so a ' +
+             'result can vary between identical runs. Verified captures the actual packets on every ' +
+             'candidate link and checks each one\'s IP endpoints and ICMP id against this exact test ' +
+             'before counting it - slower (a capture start/stop per link), but the path and verdict ' +
+             'shown can\'t be shifted by anything else happening on the network.';
+  head.appendChild(ml);
   const rl = el('label');
   const rc = el('input'); rc.type = 'checkbox'; rc.checked = trace.repeat;
   rc.addEventListener('change', () => { trace.repeat = rc.checked; if (rc.checked && !trace.job) runTrace(); });
@@ -1232,6 +1241,11 @@ function renderPathBody() {
     top.appendChild(el('span', 's-bad', 'Trace failed: ' + trace.error));
   } else if (res) {
     const v = res.verdict;
+    if (res.mode === 'capture') {
+      const tag = el('span', 'mode-tag verified', 'VERIFIED');
+      tag.title = 'Path and verdict came from captured packets, not byte counters - not affected by other traffic on the network.';
+      top.appendChild(tag);
+    }
     top.appendChild(el('span', v.level === 'ok' ? 's-ok' : v.level === 'fail' ? 's-bad' : 's-warn', v.text));
     top.appendChild(el('span', 's-dim', `   ${new Date(res.at).toLocaleTimeString()}, ${res.sent} sent, ` +
       `${res.received == null ? 'replies not counted' : res.received + ' answered'}, ${res.elapsed_s} s`));

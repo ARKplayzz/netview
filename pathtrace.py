@@ -584,12 +584,33 @@ def _execute(job_id: str, cml, con: Console, spec: dict) -> dict:
             live_thread.join(timeout=2)
 
     out = analyse(nodes, src, dst, ip, count, burst, raw_delta, base, base_dt, dt, cand, trace,
-                  spec.get("owners") or {}, pre, answering)
+                  owners, pre, answering)
     out["retried"] = retried
+    out["mode"] = "counters"
     if capture:
         _set(job_id, stage="collecting packet capture")
         out["packet_log"] = _packet_log(cml, cand["links"], link_map, capture_starts, ip,
                                         src["label"], owners)
+        # Capture mode is authoritative when it's on: the diagnosis (path,
+        # per-link classification, verdict, findings) comes entirely from
+        # proven packets, not byte counts, so nothing else happening on the
+        # network at the time can change the answer. The counter-based
+        # result computed above is kept as `counter_estimate` rather than
+        # discarded - when the two disagree, that disagreement is itself
+        # useful evidence of exactly the kind of noise this mode exists to
+        # rule out.
+        counter_estimate = {"path": out["path"], "verdict": out["verdict"]}
+        cap = analyse_capture(nodes, src, dst, ip, out["packet_log"], cand, trace, owners,
+                              pre, answering, out["sent"], out["received"])
+        out["path"], out["stop_at"] = cap["path"], cap["stop_at"]
+        out["links"], out["verdict"], out["findings"] = cap["links"], cap["verdict"], cap["findings"]
+        out["mode"] = "capture"
+        out["counter_estimate"] = counter_estimate
+        if counter_estimate["path"] != cap["path"]:
+            out["findings"].insert(0, "The counter-based estimate disagreed with this capture-"
+                                      f"verified result: it suggested {' -> '.join(counter_estimate['path']) or '(no path)'}. "
+                                      "That's exactly the kind of noise packet capture exists to rule out - "
+                                      "trust the path above.")
     if retried and out.get("factor") is not None:
         out["findings"].insert(0, f"The first burst was too small to separate from background "
                                   f"traffic on this link; retried at {count} packets.")
@@ -797,6 +818,120 @@ def analyse(nodes, src, dst, ip, count, burst, raw_delta, base, base_dt, dt, can
         "trace": trace, "findings": findings, "verdict": {"level": level, "text": text},
         "at": datetime.now(timezone.utc).isoformat(),
     }
+
+
+def analyse_capture(nodes, src, dst, ip, packet_log, cand, trace, owners, pre, answering,
+                    sent, recv) -> dict:
+    """The same shape of result as analyse() - path, per-link classification,
+    verdict, findings - but built entirely from packets the capture actually
+    proved crossed each link, not from background-corrected byte counts.
+
+    No calibration factor, no assumption that background traffic held
+    steady during the burst: a link is "both" because captured request AND
+    reply packets were both seen on it, full stop. Nothing else happening on
+    the network at the same time can shift this - that's the whole point of
+    this mode versus analyse()'s counter-based one, which this session
+    caught misattributing traffic to unrelated links three separate times
+    (a bogus "satellite" path, an unrelated switch's link, and a real link
+    wrongly called one-way) before landing on capture as the fix."""
+    links = _link_map(nodes)
+    by_link: dict[str, dict] = {}
+    for e in packet_log:
+        by_link.setdefault(e["link_id"], {"request": 0, "reply": 0})[e["dir"]] += 1
+
+    rows = []
+    for lid, l in links.items():
+        c = by_link.get(lid)
+        req, reply = (c["request"], c["reply"]) if c else (0, 0)
+        if not req and not reply:
+            cls = "none"
+        elif recv == 0:
+            cls = "forward"          # no replies exist at all this run, by construction
+        elif req and reply:
+            cls = "both"
+        else:
+            cls = "one-way"
+        rows.append({**l, "read": reply, "write": req, "drops": 0, "packets": req + reply,
+                     "share": 1.0 if cls == "both" else (0.5 if cls != "none" else 0.0),
+                     "use": cls, "candidate": lid in cand["links"]})
+
+    used = [r for r in rows if r["use"] != "none"]
+    adj: dict[str, list[tuple[str, dict]]] = {}
+    for r in used:
+        adj.setdefault(r["a"], []).append((r["b"], r))
+        adj.setdefault(r["b"], []).append((r["a"], r))
+
+    prev: dict[str, str | None] = {src["label"]: None}
+    q = deque([src["label"]])
+    while q:
+        u = q.popleft()
+        for v, _ in adj.get(u, []):
+            if v not in prev:
+                prev[v] = u
+                q.append(v)
+    path, stop_at = [], None
+    if dst["label"] in prev:
+        x = dst["label"]
+        while x:
+            path.append(x)
+            x = prev[x]
+        path.reverse()
+    elif len(prev) > 1:
+        far = max(prev, key=lambda k: _depth(prev, k))
+        stop_at = far
+        x = far
+        while x:
+            path.append(x)
+            x = prev[x]
+        path.reverse()
+
+    for h in trace["hops"]:
+        h["node"] = owners.get(h["ip"]) if h.get("ip") else None
+
+    findings = []
+    cand_nodes = set(cand["nodes"])
+    path_set = set(path)
+    if not packet_log:
+        findings.append("No packets matching this test were captured on any candidate link. "
+                        "Either the burst never reached the source's own links, or the capture "
+                        "window closed before the burst did - try again, or check the counter "
+                        "estimate below for a rough signal.")
+    if cand["paths"] > 1:
+        idle = sorted(cand_nodes - path_set - {src["label"], dst["label"]})
+        findings.append(f"{cand['paths']} equal-length paths exist between these nodes (by hop count)."
+                        + (f" Not used this time: {', '.join(idle)}." if idle and path else ""))
+    off = [x for x in path if x not in cand_nodes]
+    if off and cand["nodes"] and answering:
+        findings.append("Traffic left the shortest paths, through " + ", ".join(off) +
+                        ". A routing preference, a blocked STP port or a failed link can cause this.")
+    one_way = [r for r in used if r["use"] == "one-way"]
+    if one_way:
+        findings.append("Asymmetric: " + ", ".join(f"{r['a']} to {r['b']}" for r in one_way) +
+                        " carried captured packets in only one direction.")
+    stray = [r for r in used if r["a"] not in path_set or r["b"] not in path_set]
+    if stray and path:
+        findings.append("Also carried real packets from this test outside the walked path: " +
+                        ", ".join(f"{r['a']} to {r['b']}" for r in stray) + ".")
+    hop_nodes = [h["node"] for h in trace["hops"] if h.get("node")]
+    missing = [x for x in hop_nodes if x not in path_set]
+    if missing and path:
+        findings.append("Traceroute named " + ", ".join(missing) +
+                        " but no captured packets confirmed traffic through it.")
+
+    if not answering and stop_at:
+        level, text = "fail", f"{dst['label']} did not answer. Captured packets got as far as {stop_at}."
+    elif not answering:
+        level, text = "fail", f"{dst['label']} did not answer, and no captured packets left {src['label']}."
+    elif not path or path[-1] != dst["label"]:
+        level, text = "warn", "The target answered, but no captured packets showed a complete path."
+    elif off or one_way:
+        level, text = "warn", f"Reached {dst['label']} in {len(path) - 1} hops, not by the expected route."
+    else:
+        level, text = "ok", f"Reached {dst['label']} in {len(path) - 1} hops, confirmed by packet capture" + \
+            (f" (one of {cand['paths']} equal paths by hop count)." if cand["paths"] > 1 else ".")
+
+    return {"path": path, "stop_at": stop_at, "links": rows, "findings": findings,
+           "verdict": {"level": level, "text": text}}
 
 
 def _depth(prev: dict, k: str) -> int:
