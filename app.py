@@ -37,6 +37,25 @@ import probes           # noqa: E402
 
 app = Flask(__name__)
 
+# Named DNS/anycast failover identities layered on top of CML by the DNS and
+# routing config, not something CML's own API has any concept of - a lab
+# topology pull has no way to discover "fileserver.p45.nz" on its own, so
+# this is hand-maintained rather than derived. Selectable as a trace TARGET
+# only: what answers depends on which real backend currently holds the name
+# or address, which is exactly the thing a trace to one is meant to reveal.
+VIRTUAL_TARGETS = [
+    {"label": "fileserver.p45.nz", "fqdn": "fileserver.p45.nz", "kind": "dns-failover",
+     "note": "DNS-based failover: normally FileServer-HQ-1, fails over to FileServer-DR-1 "
+             "on a failed SMB/445 health check (probed from DC-DR-1 every 1 min, "
+             "3-consecutive-check hysteresis both ways). The record itself flips, TTL 45s - "
+             "tracing this resolves it fresh from the source's own site resolver, the same way "
+             "a real client would, so the answer reflects whichever way it's currently pointed."},
+    {"label": "(company)website.p45.nz", "ip": "10.50.100.20", "kind": "anycast-vip",
+     "note": "Network-layer (anycast) failover: always the same address, 10.50.100.20 - "
+             "whichever site currently advertises the best route to it is who answers. "
+             "No DNS lookup involved; the failover already happened by the time a ping reaches it."},
+]
+
 PORT = 5057
 TOPOLOGY_TTL_S = 5       # how long a live topology pull is reused; short, so a
                          # change made in CML shows on the page's next refresh
@@ -198,6 +217,8 @@ def _inventory(force: bool = False) -> dict:
         "lab_read_at": lab_at,
         "manifest": model.MANIFEST.exists(),
     }
+    inv["virtual_targets"] = VIRTUAL_TARGETS
+    inv["layers"].append({"key": "virtual", "title": "Virtual (DNS/anycast failover)"})
     return inv
 
 
@@ -234,17 +255,49 @@ def api_trace():
     body = request.get_json(force=True) or {}
     inv = _inventory(force=True)       # trace against the lab as it is right now
     by_label = {n["label"]: n for n in inv["nodes"]}
-    source, target = by_label.get(body.get("source", "")), by_label.get(body.get("target", ""))
-    if not source or not target:
+    owners = _address_owners(inv["nodes"])
+    source = by_label.get(body.get("source", ""))
+    target = by_label.get(body.get("target", ""))
+    virtual = None
+    if not target:
+        virtual = next((v for v in VIRTUAL_TARGETS if v["label"] == body.get("target")), None)
+    if not source or not (target or virtual):
         return jsonify({"error": "unknown source or target node"}), 404
     if not source["can_source_probe"]:
         return jsonify({"error": f"{source['label']} has no console this tool can drive, "
                                  f"so it cannot send the test traffic."}), 400
     if not source["up"]:
         return jsonify({"error": f"{source['label']} is {source['state'] or 'not running'}."}), 409
-    target_ip = body.get("target_ip") or target.get("live_ip") or target.get("primary_ip")
-    if not target_ip:
-        return jsonify({"error": f"No address known for {target['label']}."}), 400
+    virtual_fqdn = None
+    if virtual and virtual.get("ip"):
+        # Static (anycast) failover: the address never changes, so there is
+        # nothing to resolve. Whichever real node currently holds it is found
+        # the same way a traceroute hop is named - via `owners` - purely for
+        # a nicer path diagram; if nobody currently holds it that's itself a
+        # real finding (no site is advertising the VIP), not an error here.
+        target_ip = virtual["ip"]
+        target = by_label.get(owners.get(target_ip)) or {"label": virtual["label"], "virtual": True}
+    elif virtual:
+        # DNS-based failover: which real backend answers depends on which way
+        # the record currently points, so it can only be found by resolving
+        # it fresh, from the source's own site, inside the job itself (the
+        # same way a real client would look it up) - see pathtrace._execute().
+        target_ip = None
+        target = {"label": virtual["label"], "virtual": True}
+        virtual_fqdn = virtual["fqdn"]
+    else:
+        target_ip = body.get("target_ip") or target.get("live_ip") or target.get("primary_ip")
+        if not target_ip:
+            return jsonify({"error": f"No address known for {target['label']}."}), 400
+    # Confirmed live 2026-09-24: a node whose live harvest never ran (or was
+    # lost - it's in-memory, so a dev-server restart empties it) has no
+    # live_ip, and everything then falls back to primary_ip/cml-config -
+    # CML's STORED config, which can silently drift from the real device.
+    # It did here: the stored config's address belonged to a DIFFERENT node
+    # entirely, and "the target didn't answer" cost real time to diagnose
+    # before that surfaced. Flagged for the job to surface as a finding
+    # rather than silently trusted.
+    stale_target = bool(target) and not target.get("live_ip") and not virtual
     # 100 measured too low on this lab's busier trunks (factor: null on a
     # link running ~19 pkt/s background, clean calibration from ~150 up) —
     # see pathtrace._execute()'s retry logic. 150 as the default cuts how
@@ -252,13 +305,19 @@ def api_trace():
     count = max(20, min(int(body.get("count", 150)), 500))
     # Optional: also ask a resolver for the target's name, from the source
     # itself when it has a shell, else from a Linux node at the same site.
+    # A DNS-based virtual target always needs a vantage, checkbox or not -
+    # resolving it IS the trace, not an optional cross-check on top of it.
     vantage = None
-    if body.get("dns") and (target.get("dns") or {}).get("fqdn"):
+    if virtual_fqdn or (body.get("dns") and (target.get("dns") or {}).get("fqdn")):
         vantage = probes.pick_dns_vantage(source, inv["nodes"], source.get("site"))
+        if virtual_fqdn and not vantage:
+            return jsonify({"error": f"No running Linux node available to resolve {virtual_fqdn}."}), 409
     job_id = pathtrace.submit({"source": source, "target": target, "target_ip": target_ip,
                                "count": count, "nodes": inv["nodes"], "dns": bool(body.get("dns")),
-                               "capture": bool(body.get("capture")),
-                               "vantage": vantage, "owners": _address_owners(inv["nodes"])})
+                               "capture": bool(body.get("capture")), "virtual_fqdn": virtual_fqdn,
+                               "virtual_label": virtual["label"] if virtual else None,
+                               "stale_target": stale_target,
+                               "vantage": vantage, "owners": owners})
     job = pathtrace.get(job_id)
     return jsonify({"job_id": job_id, "eta_seconds": job["eta_seconds"], "target_ip": target_ip})
 

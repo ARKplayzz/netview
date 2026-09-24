@@ -508,6 +508,36 @@ def _execute(job_id: str, cml, con: Console, spec: dict) -> dict:
     src, dst, ip, count = spec["source"], spec["target"], spec["target_ip"], spec["count"]
     nodes = spec["nodes"]
     owners = spec.get("owners") or {}
+    resolved_note = None
+    if spec.get("virtual_fqdn"):
+        # A DNS-based failover target only exists as a name - which real
+        # backend answers depends on which way the record currently points,
+        # so it has to be resolved fresh here, from the source's own site,
+        # the same way a real client would look it up, rather than assumed
+        # from whatever it happened to point to when the inventory last
+        # loaded. Once resolved, everything downstream (candidates, the
+        # burst, the path diagram) runs exactly as if this were an ordinary
+        # trace to that real node - dst is swapped for its real record, not
+        # just relabeled.
+        fqdn = spec["virtual_fqdn"]
+        _set(job_id, stage=f"resolving {fqdn}")
+        vantage = spec.get("vantage")
+        if not vantage:
+            raise RuntimeError(f"no running Linux node available to resolve {fqdn}")
+        resolver = src.get("resolver") or vantage.get("resolver")
+        if not resolver:
+            raise RuntimeError(f"no DNS resolver known for {vantage['label']}'s site")
+        raw = con.linux_exec(vantage["label"], f"nslookup {fqdn} {resolver}", timeout_ms=25000,
+                             line=vantage.get("console_line", 0))
+        parsed = probe_engine.parse_nslookup(raw or "")
+        if not parsed["ok"] or not parsed["addresses"]:
+            raise RuntimeError(f"{fqdn} did not resolve ({parsed.get('reason') or 'no answer'})")
+        ip = parsed["addresses"][0]
+        owner = owners.get(ip)
+        by_label = {n["label"]: n for n in nodes}
+        dst = by_label.get(owner) or {"label": owner or ip, "virtual": True, "up": True}
+        resolved_note = (f"{fqdn} currently resolves to {owner or ip} ({ip}), via "
+                         f"{vantage['label']} asking {resolver}.")
     cand = candidates(nodes, src["label"], dst["label"])
 
     _set(job_id, stage="checking the target answers")
@@ -626,6 +656,16 @@ def _execute(job_id: str, cml, con: Console, spec: dict) -> dict:
                                       f" ({dns.get('reason')}).")
             if out["verdict"]["level"] == "ok" and not dns.get("offnet"):
                 out["verdict"] = {"level": "warn", "text": out["verdict"]["text"] + " The name did not resolve."}
+    if spec.get("virtual_label"):
+        out["virtual_target"] = spec["virtual_label"]
+    if resolved_note:
+        out["findings"].insert(0, resolved_note)
+    if spec.get("stale_target"):
+        out["findings"].insert(0, f"{dst['label']} has no live-harvested address right now - "
+                                  f"{ip} came from CML's stored config, which can silently drift "
+                                  "from what the device is actually running (confirmed live "
+                                  "2026-09-24: it pointed at a different node's address entirely). "
+                                  "Run a harvest refresh before trusting a \"did not answer\" result.")
     return out
 
 

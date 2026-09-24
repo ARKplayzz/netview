@@ -79,7 +79,15 @@ async function loadInventory(fresh) {
     ghost: true, up: false, dns: {}, links: [], vlans: [], addresses: [],
     ha: {}, interfaces: [], probe_family: 'none',
     can_source_probe: false, addressing: 'unaddressed',
-  }, g)));
+  }, g))).concat((INV.virtual_targets || []).map((v) => ({
+    label: v.label, virtual: true, virtual_kind: v.kind, note: v.note,
+    up: true, ghost: false, dns: {}, links: [], vlans: [], addresses: [],
+    ha: {}, interfaces: [], probe_family: 'none', can_source_probe: false,
+    addressing: 'unaddressed', state: null, layer: 'virtual', layer_title: 'Virtual (DNS/anycast failover)',
+    site: null, role: null,
+    role_title: v.kind === 'dns-failover' ? 'DNS failover name' : 'Anycast failover VIP',
+    config_status: 'n/a', primary_ip: v.ip || null, live_ip: null,
+  })));
   BY.clear();
   NODES.forEach((n) => { Object.assign(n, keep.get(n.label) || {}); BY.set(n.label, n); });
   LINKS = buildLinks();
@@ -180,6 +188,7 @@ function lamp(n) { return el('span', 'lamp-i ' + (n.ghost ? 'ghost' : n.state ||
  * cloud for the outside.  Shape carries the class; colour carries state. */
 function kind(n) {
   const d = n.node_definition || '', r = n.role || '';
+  if (n.virtual) return 'virtual';
   if (r === 'firewall_asa' || d === 'asav') return 'firewall';
   if (['edge_router', 'isp_router', 'home_router'].includes(r) || ['iosv', 'csr1000v'].includes(d)) return 'router';
   if (['l3_core', 'l3_core_hsrp', 'l3_dist'].includes(r)) return 'l3switch';
@@ -197,6 +206,7 @@ function kind(n) {
 const KIND_NAME = {
   router: 'Router', l3switch: 'L3 switch', switch: 'L2 switch', firewall: 'Firewall', server: 'Server',
   host: 'Host', wlc: 'WLC', ap: 'Access point', tester: 'Traffic generator', cloud: 'External', unknown: 'Other',
+  virtual: 'Virtual (failover) target',
 };
 const ARROW = (x1, y1, x2, y2) => {
   const a = Math.atan2(y2 - y1, x2 - x1), h = 3.4;
@@ -215,6 +225,10 @@ const GLYPH = {
   tester: () => ['M-11 1H-6L-3 -8L2 9L5 -2L7 1H11'],
   cloud: () => ['M-9 6a5 5 0 0 1 0-10a7 7 0 0 1 13-2a5 5 0 0 1 5 12Z'],
   unknown: () => ['M-4 -5a4 4 0 1 1 5 4c-1 .5-1 1.5-1 3', 'M0 7v.5'],
+  // A diamond, not a device shape - this isn't a physical box on a rack,
+  // it's a name/address that resolves to whichever real one currently
+  // answers, which is exactly what makes it worth tracing to.
+  virtual: () => ['M0 -11L11 0L0 11L-11 0Z', 'M0 -5L0 5M-5 0L5 0'],
 };
 const ROUND = new Set(['router', 'ap', 'cloud', 'unknown']);
 
@@ -1158,9 +1172,11 @@ function renderPathHead() {
     [trace.ip, t.live_ip, t.primary_ip, ...(t.addresses || []).filter((a) => !/virtual/.test(a.kind || '')).map((a) => a.value)]
       .forEach((ip) => { if (ip && !seen.has(ip)) { seen.add(ip); ips.push([ip, ip]); } });
     const la = el('label', null, 'Address');
-    const s = sel(ips, trace.ip, (v) => { trace.ip = v; }, 'none known');
+    const s = sel(ips, trace.ip, (v) => { trace.ip = v; },
+                 t.virtual && t.virtual_kind === 'dns-failover' ? 'resolved live at trace time' : 'none known');
     s.classList.add('m');
     la.appendChild(s);
+    if (t.virtual && t.note) la.title = t.note;
     head.appendChild(la);
   }
   const lc = el('label', null, 'Packets');
@@ -1241,6 +1257,12 @@ function renderPathBody() {
     top.appendChild(el('span', 's-bad', 'Trace failed: ' + trace.error));
   } else if (res) {
     const v = res.verdict;
+    if (res.virtual_target) {
+      const tag = el('span', 'mode-tag virtual', '◆ ' + res.virtual_target);
+      tag.title = `A virtual (failover) target - traced to ${res.target}, whichever real ` +
+                  'backend currently answers for it.';
+      top.appendChild(tag);
+    }
     if (res.mode === 'capture') {
       const tag = el('span', 'mode-tag verified', 'VERIFIED');
       tag.title = 'Path and verdict came from captured packets, not byte counters - not affected by other traffic on the network.';
