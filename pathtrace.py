@@ -160,12 +160,28 @@ def _burst(con: Console, source: dict, ip: str, count: int, fast: bool) -> dict:
             m = _LNX_RATE.search(raw or "")
         sent, recv = (int(m.group(1)), int(m.group(2))) if m else (count, None)
     else:
-        cmd = f"ping {ip} repeat {count} timeout {0 if fast and fam == 'ios' else 1}"
+        # ASA takes the identical `ping ... repeat N timeout 0` syntax and
+        # genuinely does not wait for replies with it - verified live
+        # 2026-09-24 (20 probes against a dead target: 3.8s, not ~20s).  This
+        # used to check `fam == "ios"` only, so a firewall (fam == "asa")
+        # against a confirmed-dead target always fell through to `timeout 1`
+        # while `_burst()`'s timeout_ms budget below still used the FAST
+        # per-packet multiplier for it (keyed on `fast` alone) - a budget
+        # sized for a few-second command wrapped around one that actually
+        # takes close to `count` seconds. A 150-packet burst measured 68.6s
+        # against a 65s budget: `_drain()` gave up while the ASA was still
+        # mid-ping, `_detach()` fired while the device was still printing `?`
+        # marks, and the NEXT `_attach()` (traceroute) then walked into that
+        # live, still-running session - matching no recognised prompt and
+        # burning up to the full 60-iteration budget before recovering or
+        # raising "could not reach privileged EXEC".
+        fast_cli = fast and fam in ("ios", "asa")
+        cmd = f"ping {ip} repeat {count} timeout {0 if fast_cli else 1}"
         raw = con.exec(source["label"], cmd,
-                       timeout_ms=int(count * (300 if fast else 1100) + 20000))
+                       timeout_ms=int(count * (300 if fast_cli else 1100) + 20000))
         m = _IOS_RATE.search(raw or "")
         sent, recv = (int(m.group(3)), int(m.group(2))) if m else (count, None)
-        if fast and fam == "ios":
+        if fast_cli:
             recv = None          # timeout 0 does not wait, so its count means nothing
     return {"sent": sent, "received": recv, "raw": raw, "cmd": cmd}
 
