@@ -243,6 +243,71 @@ def _capture_start_all(cml, link_ids: list[str], maxtime: int) -> dict[str, str 
     return starts
 
 
+def _parse_pcap(packets: list[dict], lid: str, l: dict, base_t: datetime, ip: str) -> list[dict]:
+    """Turn CML's raw packet listing for one link into this trace's own echo
+    events. Shared by the final (post-stop) pull and the live poller so both
+    agree on what counts as a match."""
+    events = []
+    for p in packets:
+        info = p.get("info") or ""
+        if p.get("protocol") != "ICMP" or "Echo" not in info:
+            continue
+        if ip not in (p.get("source"), p.get("destination")):
+            continue
+        m = _ECHO_ID_SEQ.search(info)
+        try:
+            offset = float(p.get("time") or 0)
+        except ValueError:
+            offset = 0.0
+        at = base_t.timestamp() + offset
+        # CML annotates a reply with "(request in N)", so "request" alone
+        # appears in BOTH lines - check which one this line opens with.
+        direction = "reply" if info.lstrip().startswith("Echo (ping) reply") else "request"
+        events.append({"link_id": lid, "a": l["a"], "ai": l["ai"], "b": l["b"], "bi": l["bi"],
+                       "at": at, "dir": direction, "no": p.get("no"),
+                       "src": p.get("source"), "dst": p.get("destination"),
+                       "icmp_id": m.group(1) if m else None, "seq": m.group(2) if m else None})
+    return events
+
+
+def _live_poll(job_id: str, cml, link_ids: list[str], links: dict, starts: dict[str, str | None],
+               ip: str, stop: threading.Event, interval: float = 0.5) -> None:
+    """Poll every candidate link's capture WHILE it's still running (verified
+    live 2026-09-24: /pcap/{id}/packets returns whatever has been captured so
+    far, no need to stop first) and append newly-seen echoes to the job as
+    they're seen, instead of only after the whole burst finishes. Runs in its
+    own thread alongside `_burst()`'s blocking console read; `stop` ends it
+    once the burst (and its retry, if any) is done. Cosmetic only - the final
+    `_packet_log()` pull after capture/stop is still the source of truth."""
+    base_ts: dict[str, datetime] = {}
+    for lid, start in starts.items():
+        try:
+            base_ts[lid] = datetime.strptime(start, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        except (TypeError, ValueError):
+            pass
+    seen: dict[str, set] = {lid: set() for lid in link_ids}
+    while not stop.is_set():
+        for lid in link_ids:
+            l, base_t = links.get(lid), base_ts.get(lid)
+            if not l or not base_t:
+                continue
+            try:
+                packets = cml.pcap_packets(lid)
+            except RuntimeError:
+                continue
+            fresh = [p for p in packets if p.get("no") not in seen[lid]]
+            if not fresh:
+                continue
+            seen[lid].update(p.get("no") for p in fresh)
+            events = _parse_pcap(fresh, lid, l, base_t, ip)
+            if events:
+                with _jobs_lock:
+                    job = _jobs.get(job_id)
+                    if job is not None:
+                        job.setdefault("live_packets", []).extend(events)
+        stop.wait(interval)
+
+
 def _packet_log(cml, link_ids: list[str], links: dict, starts: dict[str, str | None],
                 ip: str) -> list[dict]:
     """Stop capture on every candidate link and return the target IP's own
@@ -269,25 +334,7 @@ def _packet_log(cml, link_ids: list[str], links: dict, starts: dict[str, str | N
             packets = cml.pcap_packets(lid)
         except RuntimeError:
             continue
-        for p in packets:
-            info = p.get("info") or ""
-            if p.get("protocol") != "ICMP" or "Echo" not in info:
-                continue
-            if ip not in (p.get("source"), p.get("destination")):
-                continue
-            m = _ECHO_ID_SEQ.search(info)
-            try:
-                offset = float(p.get("time") or 0)
-            except ValueError:
-                offset = 0.0
-            at = base_t.timestamp() + offset
-            # CML annotates a reply with "(request in N)", so "request" alone
-            # appears in BOTH lines - check which one this line opens with.
-            direction = "reply" if info.lstrip().startswith("Echo (ping) reply") else "request"
-            events.append({"link_id": lid, "a": l["a"], "ai": l["ai"], "b": l["b"], "bi": l["bi"],
-                           "at": at, "dir": direction,
-                           "src": p.get("source"), "dst": p.get("destination"),
-                           "icmp_id": m.group(1) if m else None, "seq": m.group(2) if m else None})
+        events.extend(_parse_pcap(packets, lid, l, base_t, ip))
     events.sort(key=lambda e: e["at"])
     if events:
         t0 = events[0]["at"]
@@ -402,6 +449,9 @@ def _execute(job_id: str, cml, con: Console, spec: dict) -> dict:
 
     capture = bool(spec.get("capture")) and bool(cand["links"])
     capture_starts: dict[str, str | None] = {}
+    live_stop = threading.Event()
+    live_thread = None
+    link_map = _link_map(nodes) if capture else {}
     if capture:
         _set(job_id, stage="starting packet capture on candidate links")
         # Covers both the first attempt and a retry (see below) at up to 500
@@ -409,6 +459,11 @@ def _execute(job_id: str, cml, con: Console, spec: dict) -> dict:
         # than tight, since a capture that stops early loses proof, not just
         # accuracy.
         capture_starts = _capture_start_all(cml, cand["links"], maxtime=45)
+        _set(job_id, live_packets=[])
+        live_thread = threading.Thread(target=_live_poll, daemon=True,
+                                       args=(job_id, cml, cand["links"], link_map, capture_starts,
+                                             ip, live_stop))
+        live_thread.start()
 
     # A healthy, low-latency path can blast a full burst in a couple of
     # seconds regardless of count (IOS sends the next echo as soon as the
@@ -424,34 +479,42 @@ def _execute(job_id: str, cml, con: Console, spec: dict) -> dict:
     # single fixed count cannot be a safe default across links that differ
     # that much, so retry once with a bigger burst rather than trusting one
     # static number to be enough everywhere.
-    retried = False
-    for attempt_count in (count, min(500, max(count * 3, 300))):
-        _set(job_id, stage=f"sending {attempt_count} pings from {src['label']}")
-        t2, s2 = _stats(cml)
-        burst = _burst(con, src, ip, attempt_count, fast=not answering)
-        t3, s3 = _stats(cml)
-        dt = t3 - t2
-        raw_delta = _delta(s2, s3)
-        count = attempt_count
-        expected = (burst["sent"] or attempt_count) + (burst["received"] or 0)
-        if _calibratable(src, nodes, raw_delta, base, base_dt, dt, expected):
-            break
-        retried = True
-
-    _set(job_id, stage=f"traceroute from {src['label']}")
     try:
-        trace = _traceroute(con, src, ip)
-    except Exception as e:                     # noqa: BLE001
-        trace = {"cmd": None, "raw": f"{type(e).__name__}: {e}", "hops": []}
+        retried = False
+        for attempt_count in (count, min(500, max(count * 3, 300))):
+            _set(job_id, stage=f"sending {attempt_count} pings from {src['label']}")
+            t2, s2 = _stats(cml)
+            burst = _burst(con, src, ip, attempt_count, fast=not answering)
+            t3, s3 = _stats(cml)
+            dt = t3 - t2
+            raw_delta = _delta(s2, s3)
+            count = attempt_count
+            expected = (burst["sent"] or attempt_count) + (burst["received"] or 0)
+            if _calibratable(src, nodes, raw_delta, base, base_dt, dt, expected):
+                break
+            retried = True
 
-    dns = _dns(job_id, con, spec) if spec.get("dns") else None
+        _set(job_id, stage=f"traceroute from {src['label']}")
+        try:
+            trace = _traceroute(con, src, ip)
+        except Exception as e:                     # noqa: BLE001
+            trace = {"cmd": None, "raw": f"{type(e).__name__}: {e}", "hops": []}
+
+        dns = _dns(job_id, con, spec) if spec.get("dns") else None
+    finally:
+        # Always stop the poller, even if the burst/traceroute above raised -
+        # it's a live REST loop independent of the console session, so left
+        # running it would keep hitting CML's API forever.
+        if capture:
+            live_stop.set()
+            live_thread.join(timeout=2)
 
     out = analyse(nodes, src, dst, ip, count, burst, raw_delta, base, base_dt, dt, cand, trace,
                   spec.get("owners") or {}, pre, answering)
     out["retried"] = retried
     if capture:
         _set(job_id, stage="collecting packet capture")
-        out["packet_log"] = _packet_log(cml, cand["links"], _link_map(nodes), capture_starts, ip)
+        out["packet_log"] = _packet_log(cml, cand["links"], link_map, capture_starts, ip)
     if retried and out.get("factor") is not None:
         out["findings"].insert(0, f"The first burst was too small to separate from background "
                                   f"traffic on this link; retried at {count} packets.")

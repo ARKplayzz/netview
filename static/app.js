@@ -1074,6 +1074,7 @@ async function runTrace() {
   trace.job = { t0: Date.now(), eta: 30 };
   trace.stage = 'starting';
   renderPathHead(); renderPathBody(); renderPaneTabs();
+  let liveCount = 0;
   try {
     const r = await fetch('/api/trace', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -1083,12 +1084,24 @@ async function runTrace() {
     const j = await r.json();
     if (!r.ok) throw new Error(j.error);
     trace.job.eta = j.eta_seconds || 30;
+    // Capture mode polls faster: CML lets a link's packets be read WHILE its
+    // capture is still running (verified live), so each tick can flash the
+    // wires that actually carried something since the last one, as the
+    // burst happens - not a canned replay stitched together afterward.
+    const pollMs = trace.capture ? 400 : 1200;
     for (;;) {
-      await new Promise((ok) => setTimeout(ok, 1200));
+      await new Promise((ok) => setTimeout(ok, pollMs));
       const st = await getJSON('/api/trace/' + j.job_id);
       trace.stage = st.stage;
       const s = document.querySelector('[data-trace-stage]');
       if (s) s.textContent = st.stage;
+      const live = st.live_packets || [];
+      if (live.length > liveCount) {
+        live.slice(liveCount).forEach((e) => flashLink(e.link_id, e.dir));
+        liveCount = live.length;
+        const c = document.querySelector('[data-live-count]');
+        if (c) c.textContent = `${liveCount} packets captured so far`;
+      }
       if (st.status === 'error') throw new Error(st.error);
       if (st.status === 'done') {
         const res = st.result;
@@ -1209,6 +1222,12 @@ function renderPathBody() {
     fill.style.width = pct();
     const iv = setInterval(() => { if (!fill.isConnected || !trace.job) clearInterval(iv); else fill.style.width = pct(); }, 500);
     top.appendChild(bar);
+    if (trace.capture) {
+      const lc = el('span', 's-dim');
+      lc.dataset.liveCount = '1';
+      top.appendChild(document.createTextNode(' '));
+      top.appendChild(lc);
+    }
   } else if (trace.error) {
     top.appendChild(el('span', 's-bad', 'Trace failed: ' + trace.error));
   } else if (res) {
@@ -1277,6 +1296,13 @@ function packetLogPanel(res) {
   return box;
 }
 
+function flashLink(linkId, dir) {
+  const w = document.querySelector(`.pdiag [data-link-id="${linkId}"]`);
+  if (!w) return;
+  w.classList.add('pkt-flash', dir === 'request' ? 'pkt-req' : 'pkt-reply');
+  setTimeout(() => w.classList.remove('pkt-flash', 'pkt-req', 'pkt-reply'), 220);
+}
+
 function replayPackets(log, btn) {
   if (!log.length) return;
   btn.disabled = true;
@@ -1290,11 +1316,7 @@ function replayPackets(log, btn) {
   let done = 0;
   log.forEach((e, i) => {
     setTimeout(() => {
-      const w = document.querySelector(`.pdiag [data-link-id="${e.link_id}"]`);
-      if (w) {
-        w.classList.add('pkt-flash', e.dir === 'request' ? 'pkt-req' : 'pkt-reply');
-        setTimeout(() => w.classList.remove('pkt-flash', 'pkt-req', 'pkt-reply'), 220);
-      }
+      flashLink(e.link_id, e.dir);
       const row = document.querySelector(`tr.pkt-row[data-pkt-index="${i}"]`);
       if (row) {
         row.classList.add('hl');
