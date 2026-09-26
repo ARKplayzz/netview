@@ -666,6 +666,20 @@ def _execute(job_id: str, cml, con: Console, spec: dict) -> dict:
                                   "from what the device is actually running (confirmed live "
                                   "2026-09-24: it pointed at a different node's address entirely). "
                                   "Run a harvest refresh before trusting a \"did not answer\" result.")
+    # Measured 2026-09-27 across all four ASAs: a ping addressed TO a
+    # firewall is only answered when it arrives on the interface that owns
+    # the address, and its reply leaves the same way. The dmz/outside
+    # addresses never answer from inside; inside/inside2 answer only from
+    # the side whose routing lands on that interface. Through-traffic was
+    # 100% on the same run - so this is how an ASA behaves, not a fault.
+    if not answering and (dst.get("probe_family") == "asa" or src.get("probe_family") == "asa"):
+        who = dst["label"] if dst.get("probe_family") == "asa" else src["label"]
+        out["findings"].insert(0, f"{who} is a Cisco ASA. An ASA only answers a ping on the interface "
+                                  "the packet arrives on, and drops a reply that returns on a different "
+                                  "interface from the one its request left by. Pinging a firewall's "
+                                  "far-side address (dmz/outside, or the other core's inside2), or pinging "
+                                  "from a firewall to something behind its sibling, fails by design. To "
+                                  "test a path through a firewall, trace to a host behind it instead.")
     return out
 
 
