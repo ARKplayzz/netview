@@ -151,9 +151,14 @@ def pick_dns_vantage(source: dict, nodes: list[dict], site: str | None) -> dict 
     # DMZ container asking the internal resolver fails BY DESIGN — measured
     # 2026-08-20, when a DMZ vantage produced 20 false "unreachable resolver"
     # results in one audit.  Same class of bug as the off-net WFH vantage.
+    # A node the harvest read as having no address at all can't reach any
+    # resolver - measured 2026-09-27: with both DHCP servers down, Finance PC
+    # had no IPv4 and was still picked, and a correctly working DNS failover
+    # name "did not resolve". Only skipped on positive evidence (a harvest
+    # record with no address); no record at all means unknown, not broken.
     pool = [n for n in nodes
             if n.get("probe_family") == "linux" and _is_up(n)
-            and not _dmz_resident(n)]
+            and not _dmz_resident(n) and not _harvested_unaddressed(n)]
 
     for pred in (
         lambda n: n.get("site") == site and n.get("role") == "desktop_client",
@@ -174,6 +179,16 @@ def pick_dns_vantage(source: dict, nodes: list[dict], site: str | None) -> dict 
 
 def _is_up(node: dict) -> bool:
     return node.get("state") in ("STARTED", "BOOTED")
+
+
+def _harvested_unaddressed(node: dict) -> bool:
+    # The harvest reports a box with no addresses as an "error" with this
+    # wording; any OTHER error (console unreachable etc.) means unknown.
+    live = node.get("live")
+    if not live or live.get("addresses"):
+        return False
+    err = live.get("error") or ""
+    return not err or "no parseable addresses" in err
 
 
 def _dmz_resident(node: dict) -> bool:

@@ -1036,10 +1036,10 @@ function setTraceEnds(src, dst, ip) {
   else if (changed || !trace.ip) trace.ip = t ? (t.live_ip || t.primary_ip) : null;
   if (changed) {
     trace.result = [...trace.history].reverse()
-      .find((h) => h.source === trace.source && h.target === trace.target) || null;
+      .find((h) => h.source === trace.source && askedTarget(h) === trace.target) || null;
     trace.error = null;
   }
-  trace.cand = trace.source && trace.target ? candidates(trace.source, trace.target) : null;
+  trace.cand = trace.source && trace.target ? candidates(trace.source, effectiveTarget()) : null;
   renderPathHead(); renderPathBody(); renderNodeList(); renderPaneTabs();
   if (paneTab === 'trace') renderPaneBody();
 }
@@ -1119,25 +1119,36 @@ async function runTrace() {
       if (st.status === 'error') throw new Error(st.error);
       if (st.status === 'done') {
         const res = st.result;
-        const prev = [...trace.history].reverse().find((h) => h.source === res.source && h.target === res.target);
+        const prev = [...trace.history].reverse()
+          .find((h) => h.source === res.source && askedTarget(h) === askedTarget(res));
         res.changed = prev && prev.path.join('>') !== res.path.join('>') ? { from: prev.path, at: prev.at } : null;
         trace.history.push(res);
-        if (res.source === trace.source && res.target === trace.target) trace.result = res;
+        if (res.source === trace.source && askedTarget(res) === trace.target) trace.result = res;
         break;
       }
     }
   } catch (e) { trace.error = String(e.message || e); }
   trace.job = null;
   await poll(false);           // the lab may have changed; refresh before drawing
-  if (trace.source && trace.target) trace.cand = candidates(trace.source, trace.target);
+  if (trace.source && trace.target) trace.cand = candidates(trace.source, effectiveTarget());
   renderPathHead(); renderPathBody(); renderPaneTabs();
   if (paneTab === 'trace') renderPaneBody();
   if (trace.repeat && !trace.error) setTimeout(() => { if (trace.repeat && !trace.job) runTrace(); }, 5000);
 }
 
+/* A trace to a virtual (failover) target comes back labelled with the real
+ * node that answered, so results are matched on what was ASKED for, and the
+ * diagram is drawn to what actually ANSWERED. */
+const askedTarget = (r) => r.virtual_target || r.target;
+
 function resultFor() {
   const r = trace.result;
-  return r && r.source === trace.source && r.target === trace.target ? r : null;
+  return r && r.source === trace.source && askedTarget(r) === trace.target ? r : null;
+}
+
+function effectiveTarget() {
+  const r = resultFor();
+  return r && r.virtual_target ? r.target : trace.target;
 }
 
 /* ------------------------------------------------------- the controls --- */
@@ -1187,7 +1198,10 @@ function renderPathHead() {
   lc.appendChild(cnt);
   head.appendChild(lc);
   const run = el('button', 'default', trace.job ? 'Tracing...' : 'Run trace');
-  run.disabled = !!trace.job || !trace.source || !trace.target || !trace.ip;
+  // A DNS failover name has no address until the trace resolves it, live, from
+  // the source's own site - so it is runnable without one.
+  run.disabled = !!trace.job || !trace.source || !trace.target ||
+    (!trace.ip && !(BY.get(trace.target) || {}).virtual);
   run.addEventListener('click', runTrace);
   head.appendChild(run);
   const dl = el('label');
@@ -1383,7 +1397,8 @@ function pathDiagram(res, cand, width) {
   const set = new Set(cand.nodes || []);
   const used = res ? res.links.filter((l) => l.use !== 'none') : [];
   if (res) { res.path.forEach((x) => set.add(x)); used.forEach((l) => { set.add(l.a); set.add(l.b); }); }
-  set.add(trace.source); set.add(trace.target);
+  const dstLabel = res && res.virtual_target ? res.target : trace.target;
+  set.add(trace.source); set.add(dstLabel);
   const prevPath = res && res.changed ? res.changed.from.filter((x) => BY.has(x)) : [];
   prevPath.forEach((x) => set.add(x));
   const usedBy = new Map(used.map((l) => [l.id, l]));
@@ -1470,7 +1485,7 @@ function pathDiagram(res, cand, width) {
     if (!n.up) cls.push('off');
     if (res && !onPath.has(u) && !used.some((l) => l.a === u || l.b === u)) cls.push('t-idle');
     if (prevOnly.has(u)) cls.push('t-was');
-    if (u === trace.source || u === trace.target) cls.push('t-end');
+    if (u === trace.source || u === dstLabel) cls.push('t-end');
     if (res && res.stop_at === u) cls.push('t-stop');
     if (n.config_status === 'undeclared') cls.push('undecl');
     const g = svg('g', { class: cls.join(' '), transform: `translate(${p.x} ${p.y})`, 'data-label': u });
@@ -1480,7 +1495,7 @@ function pathDiagram(res, cand, width) {
       const c = n.state === 'BOOTED' ? 'var(--ok)' : n.state === 'STARTED' ? 'var(--warn)' : 'var(--devoff)';
       g.appendChild(svg('rect', { x: 13, y: 13, width: 9, height: 9, fill: c, class: 'lamp' }));
     }
-    const end = u === trace.source ? 'FROM' : u === trace.target ? 'TO' : null;
+    const end = u === trace.source ? 'FROM' : u === dstLabel ? 'TO' : null;
     if (end) g.appendChild(svg('text', { y: -30, class: 't-tag' }, end));
     g.appendChild(svg('text', { y: 34, class: 'lbl' }, u));
     const ip = displayIp(n).text;
@@ -1560,7 +1575,7 @@ function traceDetails() {
     ]));
     wrap.appendChild(dsec);
   }
-  const hist = trace.history.filter((h) => h.source === trace.source && h.target === trace.target);
+  const hist = trace.history.filter((h) => h.source === trace.source && askedTarget(h) === trace.target);
   const t3 = gridTable(['Time', 'Result', 'Path']);
   [...hist].reverse().forEach((h) => {
     const tr = el('tr', 'row' + (h === res ? ' sel' : ''));
