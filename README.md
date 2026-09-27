@@ -4,6 +4,32 @@ Inventory of the P45 estate: every node, its DNS name, addresses, layer, live
 state — plus path probes, a baseline reachability matrix, live DHCP lease reads,
 a live address harvest, open-issue badges and CSV export.
 
+## Download (no setup needed — Windows)
+
+1. Go to **[Releases](https://github.com/ARKplayzz/netview/releases/latest)** and download **`NetView.exe`**.
+2. Double-click it. Windows may say *"Windows protected your PC"* (the file isn't
+   code-signed): click **More info → Run anyway**.
+3. The first time, a black window asks four things — have them ready:
+   - the **CML server address** (e.g. `https://10.0.0.5`),
+   - your **CML username and password**,
+   - which **lab** to use (pick from the list it shows),
+   - the **lab device password** (ask the lab owner — NetView logs in to the routers to run traces).
+4. NetView opens in your browser at **http://127.0.0.1:5057**. Keep the black
+   window open while you use it; close it to stop NetView.
+
+Next time, just double-click — it remembers your answers. To change them, run
+`NetView.exe --setup` (or delete `%LOCALAPPDATA%\NetView\netview.env`). The
+download carries **no credentials**: yours are saved only on your own PC, in
+that file. Nothing to install and no Python needed; you must be on a network
+that can reach the CML server.
+
+Maintainers: build a new `NetView.exe` from the full project checkout with
+`py -3.11 netview/packaging/build_exe.py` (needs `pyinstaller flask pyyaml
+jinja2 paramiko`), then attach it to a new GitHub Release. The build refuses to
+run if any value from the project `.env` would end up inside the exe.
+
+## Running from source
+
 ```
 py -3.11 netview/app.py      ->  http://127.0.0.1:5057
 ```

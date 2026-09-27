@@ -3,3 +3,6 @@ __pycache__/
 run.out
 run.err
 .env
+# NetView.exe build output - the exe ships as a GitHub Release asset, not in git
+packaging/build/
+packaging/dist/
