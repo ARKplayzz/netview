@@ -315,6 +315,26 @@ def _parse_pcap(packets: list[dict], lid: str, l: dict, base_t: datetime, ip: st
     return events
 
 
+def _parse_esp(packets: list[dict], lid: str, l: dict, base_t: datetime,
+               owners: dict[str, str]) -> list[dict]:
+    """ESP (IPsec) packets on one link, with the node that owns each end, for
+    `_packet_log()` to keep only when both ends are proven tunnel heads."""
+    out = []
+    for p in packets:
+        if p.get("protocol") != "ESP":
+            continue
+        try:
+            offset = float(p.get("time") or 0)
+        except ValueError:
+            offset = 0.0
+        src_ip, dst_ip = p.get("source"), p.get("destination")
+        out.append({"link_id": lid, "a": l["a"], "ai": l["ai"], "b": l["b"], "bi": l["bi"],
+                    "at": base_t.timestamp() + offset, "dir": "esp", "no": p.get("no"),
+                    "src": src_ip, "dst": dst_ip, "src_owner": owners.get(src_ip),
+                    "dst_owner": owners.get(dst_ip), "icmp_id": None, "seq": None})
+    return out
+
+
 def _live_poll(job_id: str, cml, link_ids: list[str], links: dict, starts: dict[str, str | None],
                ip: str, src_label: str, owners: dict[str, str], stop: threading.Event,
                interval: float = 0.5) -> None:
@@ -379,7 +399,7 @@ def _packet_log(cml, link_ids: list[str], links: dict, starts: dict[str, str | N
             cml.capture_stop(lid)
         except RuntimeError:
             pass
-    events = []
+    events, esp = [], []
     for lid in link_ids:
         l = links.get(lid)
         start = starts.get(lid)
@@ -394,6 +414,7 @@ def _packet_log(cml, link_ids: list[str], links: dict, starts: dict[str, str | N
         except RuntimeError:
             continue
         events.extend(_parse_pcap(packets, lid, l, base_t, ip, src_label, owners))
+        esp.extend(_parse_esp(packets, lid, l, base_t, owners))
     # The owners check (above) rules out traffic from a different, identified
     # device sharing the same target IP, but not a second ping session
     # between these exact same two endpoints - e.g. someone running the
@@ -408,6 +429,16 @@ def _packet_log(cml, link_ids: list[str], links: dict, starts: dict[str, str | N
               if e["icmp_id"] and src_label in (e["a"], e["b"])}
     if own_ids:
         events = [e for e in events if e["icmp_id"] in own_ids]
+    # Through a VPN the test's pings are encrypted between the two tunnel
+    # heads, so the links in between show ESP, not ICMP, and would leave a
+    # hole in the proven path (measured 2026-09-27: WFH laptop -> file
+    # server, path "proven" only as far as the home router). ESP can't be
+    # matched to an ICMP id, so it is accepted only between two nodes this
+    # capture has ALREADY proven handled the test's own pings - the tunnel
+    # heads - which excludes any unrelated tunnel crossing the same links.
+    proven = {n for e in events for n in (e["a"], e["b"])}
+    events += [e for e in esp if e["src_owner"] in proven and e["dst_owner"] in proven
+               and e["src_owner"] != e["dst_owner"]]
     events.sort(key=lambda e: e["at"])
     if events:
         t0 = events[0]["at"]
@@ -524,11 +555,14 @@ def _execute(job_id: str, cml, con: Console, spec: dict) -> dict:
         vantage = spec.get("vantage")
         if not vantage:
             raise RuntimeError(f"no running Linux node available to resolve {fqdn}")
+        # No site resolver in the model (the home worker's site has none - its
+        # resolver is whatever its house router hands out by DHCP) means: ask
+        # the vantage's own configured resolver, exactly as a client would.
         resolver = src.get("resolver") or vantage.get("resolver")
-        if not resolver:
-            raise RuntimeError(f"no DNS resolver known for {vantage['label']}'s site")
-        raw = con.linux_exec(vantage["label"], f"nslookup {fqdn} {resolver}", timeout_ms=25000,
+        cmd = f"nslookup {fqdn} {resolver}" if resolver else f"nslookup {fqdn}"
+        raw = con.linux_exec(vantage["label"], cmd, timeout_ms=25000,
                              line=vantage.get("console_line", 0))
+        resolver = resolver or "its own configured resolver"
         parsed = probe_engine.parse_nslookup(raw or "")
         if not parsed["ok"] or not parsed["addresses"]:
             raise RuntimeError(f"{fqdn} did not resolve ({parsed.get('reason') or 'no answer'})")
@@ -556,16 +590,36 @@ def _execute(job_id: str, cml, con: Console, spec: dict) -> dict:
     live_stop = threading.Event()
     live_thread = None
     link_map = _link_map(nodes) if capture else {}
+    # Capture the candidate links AND every link joining two candidate nodes.
+    # Candidates are shortest paths by hop count, but real forwarding can take
+    # a sideways hop between them - measured 2026-09-27: WFH -> FileServer-HQ-1
+    # crossed CoreSwitch-HQ-1 -> CoreSwitch-HQ-2, a link on no shortest path,
+    # so it was never captured and the proven path broke there.
+    cand_nodes = set(cand["nodes"])
+    scope = set(cand_nodes)
+    # Hop-count candidates can't predict a VPN: the WFH laptop's traffic to a
+    # DR host goes through the HQ tunnel by policy, a path no shortest-hop
+    # search offers (measured 2026-09-27: WFH -> Tech PC "proven" only to the
+    # home router). So when a candidate node is a tunnel head, also capture
+    # source -> head, the head's underlay to its peer, and peer -> target.
+    if capture:
+        for x, y in _tunnels(nodes):
+            for h, peer in ((x, y), (y, x)):
+                if h in cand_nodes:
+                    for a_, b_ in ((src["label"], h), (h, peer), (peer, dst["label"])):
+                        scope |= set(candidates(nodes, a_, b_)["nodes"])
+    cap_links = sorted(set(cand["links"]) | {lid for lid, l in link_map.items()
+                                             if l["a"] in scope and l["b"] in scope})
     if capture:
         _set(job_id, stage="starting packet capture on candidate links")
         # Covers both the first attempt and a retry (see below) at up to 500
         # packets each, plus the traceroute that follows - generous rather
         # than tight, since a capture that stops early loses proof, not just
         # accuracy.
-        capture_starts = _capture_start_all(cml, cand["links"], maxtime=45)
+        capture_starts = _capture_start_all(cml, cap_links, maxtime=45)
         _set(job_id, live_packets=[])
         live_thread = threading.Thread(target=_live_poll, daemon=True,
-                                       args=(job_id, cml, cand["links"], link_map, capture_starts,
+                                       args=(job_id, cml, cap_links, link_map, capture_starts,
                                              ip, src["label"], owners, live_stop))
         live_thread.start()
 
@@ -619,7 +673,7 @@ def _execute(job_id: str, cml, con: Console, spec: dict) -> dict:
     out["mode"] = "counters"
     if capture:
         _set(job_id, stage="collecting packet capture")
-        out["packet_log"] = _packet_log(cml, cand["links"], link_map, capture_starts, ip,
+        out["packet_log"] = _packet_log(cml, cap_links, link_map, capture_starts, ip,
                                         src["label"], owners)
         # Capture mode is authoritative when it's on: the diagnosis (path,
         # per-link classification, verdict, findings) comes entirely from
@@ -656,6 +710,25 @@ def _execute(job_id: str, cml, con: Console, spec: dict) -> dict:
                                       f" ({dns.get('reason')}).")
             if out["verdict"]["level"] == "ok" and not dns.get("offnet"):
                 out["verdict"] = {"level": "warn", "text": out["verdict"]["text"] + " The name did not resolve."}
+    # A trace to a node CML itself reports as not running should say so, not
+    # leave "did not answer" to be read as a network fault - the eval DCs power
+    # off hourly and produced exactly that confusion (2026-09-27).
+    if not answering and dst.get("state") and not dst.get("up"):
+        out["findings"].insert(0, f"{dst['label']} is {dst['state']} in CML - it is not running, "
+                                  "so it cannot answer. Start it and trace again.")
+        out["verdict"] = {"level": "fail", "text": f"{dst['label']} is {dst['state']} in CML, so it did not answer."}
+    # A VPN is a routing policy the hop-count prediction can't see, so a path
+    # through both ends of a known tunnel legitimately differs from it.
+    vpn = [t for t in _tunnels(nodes) if t[0] in out["path"] and t[1] in out["path"]]
+    if vpn and out["verdict"]["level"] == "warn" and "not by the expected route" in out["verdict"]["text"]:
+        x, y = vpn[0]
+        out["verdict"] = {"level": "ok", "text": f"Reached {dst['label']} in {len(out['path']) - 1} hops "
+                          f"through the VPN tunnel {x} ⇄ {y}"
+                          + (", confirmed by packet capture." if out.get("mode") == "capture" else ".")}
+        out["findings"] = [f for f in out["findings"] if not f.startswith("Traffic left the shortest paths")]
+        out["findings"].insert(0, f"Routed through the VPN tunnel between {x} and {y}. The tunnel is a "
+                                  "routing policy, so differing from the shortest-hop prediction is "
+                                  "expected here, not a fault.")
     if spec.get("virtual_label"):
         out["virtual_target"] = spec["virtual_label"]
     if resolved_note:
@@ -707,6 +780,24 @@ def _dns(job_id: str, con: Console, spec: dict) -> dict:
     parsed.update(base)
     parsed["matches"] = bool(parsed["ok"] and parsed["addresses"][0] in known)
     return parsed
+
+
+def _tunnels(nodes: list[dict]) -> list[tuple[str, str]]:
+    """Logical tunnel links (VPN/GRE), paired from live-harvested Tunnel*
+    interface addresses that share a /30. CML's topology has no idea these
+    exist - they are configuration, not cables."""
+    by_net: dict[int, set[str]] = {}
+    for n in nodes:
+        for a in (n.get("live") or {}).get("addresses") or []:
+            if not str(a.get("iface", "")).lower().startswith("tunnel"):
+                continue
+            try:
+                o = [int(x) for x in a["ip"].split(".")]
+            except (KeyError, ValueError):
+                continue
+            key = ((o[0] << 24) | (o[1] << 16) | (o[2] << 8) | o[3]) >> 2
+            by_net.setdefault(key, set()).add(n["label"])
+    return [tuple(sorted(v)) for v in by_net.values() if len(v) == 2]
 
 
 def _link_map(nodes: list[dict]) -> dict[str, dict]:
@@ -891,12 +982,15 @@ def analyse_capture(nodes, src, dst, ip, packet_log, cand, trace, owners, pre, a
     links = _link_map(nodes)
     by_link: dict[str, dict] = {}
     for e in packet_log:
-        by_link.setdefault(e["link_id"], {"request": 0, "reply": 0})[e["dir"]] += 1
+        by_link.setdefault(e["link_id"], {"request": 0, "reply": 0, "esp": 0})[e["dir"]] += 1
 
     rows = []
     for lid, l in links.items():
         c = by_link.get(lid)
         req, reply = (c["request"], c["reply"]) if c else (0, 0)
+        tunnel = bool(c and c["esp"]) and not (req or reply)
+        if tunnel:
+            req = reply = c["esp"]      # both directions ride the same ESP pair
         if not req and not reply:
             cls = "none"
         elif recv == 0:
@@ -905,7 +999,7 @@ def analyse_capture(nodes, src, dst, ip, packet_log, cand, trace, owners, pre, a
             cls = "both"
         else:
             cls = "one-way"
-        rows.append({**l, "read": reply, "write": req, "drops": 0, "packets": req + reply,
+        rows.append({**l, "read": reply, "write": req, "drops": 0, "packets": req + reply, "tunnel": tunnel,
                      "share": 1.0 if cls == "both" else (0.5 if cls != "none" else 0.0),
                      "use": cls, "candidate": lid in cand["links"]})
 
@@ -962,6 +1056,13 @@ def analyse_capture(nodes, src, dst, ip, packet_log, cand, trace, owners, pre, a
     if one_way:
         findings.append("Asymmetric: " + ", ".join(f"{r['a']} to {r['b']}" for r in one_way) +
                         " carried captured packets in only one direction.")
+    tunneled = [r for r in used if r.get("tunnel")]
+    if tunneled:
+        findings.append("Carried inside the VPN (encrypted ESP between the two tunnel heads, both "
+                        "proven by this test's own pings): " +
+                        ", ".join(f"{r['a']} to {r['b']}" for r in tunneled) +
+                        ". Encrypted packets can't be matched to the test's ICMP id, so these hops "
+                        "are proven by the tunnel, not by the pings themselves.")
     stray = [r for r in used if r["a"] not in path_set or r["b"] not in path_set]
     if stray and path:
         findings.append("Also carried real packets from this test outside the walked path: " +

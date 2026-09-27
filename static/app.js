@@ -1336,8 +1336,8 @@ function packetLogPanel(res) {
     tr.appendChild(el('td', null, String(e.t_ms)));
     tr.appendChild(el('td', null, e.a));
     tr.appendChild(el('td', null, e.ai));
-    tr.appendChild(el('td', null, e.dir === 'request' ? '→' : '←'));
-    tr.appendChild(el('td', null, `${e.dir} (${e.b} ${e.bi})`));
+    tr.appendChild(el('td', null, e.dir === 'request' ? '→' : e.dir === 'esp' ? '⇄' : '←'));
+    tr.appendChild(el('td', null, e.dir === 'esp' ? `esp, encrypted (${e.src} → ${e.dst})` : `${e.dir} (${e.b} ${e.bi})`));
     tr.appendChild(el('td', null, e.seq || ''));
     t.appendChild(tr);
   });
