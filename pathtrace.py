@@ -608,6 +608,19 @@ def _execute(job_id: str, cml, con: Console, spec: dict) -> dict:
                 if h in cand_nodes:
                     for a_, b_ in ((src["label"], h), (h, peer), (peer, dst["label"])):
                         scope |= set(candidates(nodes, a_, b_)["nodes"])
+        # Firewalls are exactly where OSPF cost policy departs from hop count:
+        # each unit's straight leg costs 10 and its crossover 100, so the
+        # fewest-hops path (Firewall-HQ-1 inside2 -> CoreSwitch-HQ-2) is the one
+        # traffic never takes (it leaves `inside` -> CoreSwitch-HQ-1). Measured
+        # 2026-09-27: WFH -> ServerRoomSwitch-HQ-2 was "proven" only to the home
+        # router because that leg went uncaptured. So capture EVERY leg of any
+        # firewall in scope.
+        fws = {n["label"] for n in nodes if n.get("probe_family") == "asa"} & scope
+        for l in link_map.values():
+            if l["a"] in fws:
+                scope.add(l["b"])
+            elif l["b"] in fws:
+                scope.add(l["a"])
     cap_links = sorted(set(cand["links"]) | {lid for lid, l in link_map.items()
                                              if l["a"] in scope and l["b"] in scope})
     if capture:
@@ -924,9 +937,15 @@ def analyse(nodes, src, dst, ip, count, burst, raw_delta, base, base_dt, dt, can
         findings.append("Traffic left the shortest paths, through " + ", ".join(off) +
                         ". A routing preference, a blocked STP port or a failed link can cause this.")
     one_way = [r for r in used if r["use"] == "one-way"]
+    # Same rule as analyse_capture(): only a firewall on a one-way link is a fault.
+    fam = {n["label"]: n.get("probe_family") for n in nodes}
+    fw_one_way = [r for r in one_way if "asa" in (fam.get(r["a"]), fam.get(r["b"]))]
     if one_way:
-        findings.append("Asymmetric: " + ", ".join(f"{r['a']} to {r['b']}" for r in one_way) +
-                        " carried only one direction. Requests and replies took different routes.")
+        findings.append(("Asymmetric THROUGH A FIREWALL: " if fw_one_way else "Asymmetric (ECMP): ")
+                        + ", ".join(f"{r['a']} to {r['b']}" for r in (fw_one_way or one_way)) +
+                        " carried only one direction. Requests and replies took different routes"
+                        + (" - a stateful firewall drops that." if fw_one_way else
+                           " - normal for a routed core with no firewall on them."))
     stray = [r for r in used if r["a"] not in path_set or r["b"] not in path_set]
     if stray and path:
         findings.append("Also busy during the burst: " + ", ".join(f"{r['a']} to {r['b']}" for r in stray) +
@@ -947,7 +966,7 @@ def analyse(nodes, src, dst, ip, count, burst, raw_delta, base, base_dt, dt, can
         level, text = "fail", f"{dst['label']} did not answer, and no requests were seen leaving {src['label']}."
     elif not path or path[-1] != dst["label"]:
         level, text = "warn", "The target answered, but the counters did not show a complete path."
-    elif off or one_way:
+    elif off or fw_one_way:
         level, text = "warn", f"Reached {dst['label']} in {len(path) - 1} hops, not by the expected route."
     else:
         level, text = "ok", f"Reached {dst['label']} in {len(path) - 1} hops" + \
@@ -1053,9 +1072,23 @@ def analyse_capture(nodes, src, dst, ip, packet_log, cand, trace, owners, pre, a
         findings.append("Traffic left the shortest paths, through " + ", ".join(off) +
                         ". A routing preference, a blocked STP port or a failed link can cause this.")
     one_way = [r for r in used if r["use"] == "one-way"]
-    if one_way:
-        findings.append("Asymmetric: " + ", ".join(f"{r['a']} to {r['b']}" for r in one_way) +
-                        " carried captured packets in only one direction.")
+    # 2026-09-27: one-way links are only a PROBLEM when a stateful firewall
+    # sits on one: it drops the half of a conversation it never saw. Between
+    # plain routers/switches, a reply taking the other equal-cost branch
+    # (CoreSwitch-HQ-1 -> DistSwitch-HQ-2 instead of -1) is ordinary ECMP, and
+    # warning on it made healthy traces read as faults.
+    fam = {n["label"]: n.get("probe_family") for n in nodes}
+    fw_one_way = [r for r in one_way if "asa" in (fam.get(r["a"]), fam.get(r["b"]))]
+    if fw_one_way:
+        findings.append("Asymmetric THROUGH A FIREWALL: " +
+                        ", ".join(f"{r['a']} to {r['b']}" for r in fw_one_way) +
+                        " carried captured packets in only one direction. A stateful firewall "
+                        "drops replies for requests it never saw - check OSPF costs either side.")
+    elif one_way:
+        findings.append("Replies returned by a different equal-cost branch (ECMP): " +
+                        ", ".join(f"{r['a']} to {r['b']}" for r in one_way) +
+                        " carried captured packets in only one direction. Normal for a routed "
+                        "core with no firewall on these links.")
     tunneled = [r for r in used if r.get("tunnel")]
     if tunneled:
         findings.append("Carried inside the VPN (encrypted ESP between the two tunnel heads, both "
@@ -1079,11 +1112,13 @@ def analyse_capture(nodes, src, dst, ip, packet_log, cand, trace, owners, pre, a
         level, text = "fail", f"{dst['label']} did not answer, and no captured packets left {src['label']}."
     elif not path or path[-1] != dst["label"]:
         level, text = "warn", "The target answered, but no captured packets showed a complete path."
-    elif off or one_way:
+    elif off or fw_one_way:
         level, text = "warn", f"Reached {dst['label']} in {len(path) - 1} hops, not by the expected route."
     else:
         level, text = "ok", f"Reached {dst['label']} in {len(path) - 1} hops, confirmed by packet capture" + \
             (f" (one of {cand['paths']} equal paths by hop count)." if cand["paths"] > 1 else ".")
+        if one_way:
+            text += " Replies used an equal-cost return branch."
 
     return {"path": path, "stop_at": stop_at, "links": rows, "findings": findings,
            "verdict": {"level": level, "text": text}}
