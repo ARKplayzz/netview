@@ -898,6 +898,12 @@ def _execute(job_id: str, cml, con: Console, spec: dict) -> dict:
         out["mode"] = "capture"
         out["counter_estimate"] = counter_estimate
         diag = out["capture_diag"]
+        own = [l for l in cap_links if src["label"] in (link_map[l]["a"], link_map[l]["b"])]
+        if not out["path"] and own and not any(capture_starts.get(l) for l in own):
+            # The source's own link was never captured, so "no packets left the
+            # source" is not something this run could observe.
+            out["verdict"] = {"level": "warn", "text": "Inconclusive: CML did not start packet capture on "
+                              f"{src['label']}'s own link, so this run cannot show the path. Try again."}
         if diag["started"] < diag["links"]:
             out["findings"].append(
                 f"CML started packet capture on {diag['started']} of {diag['links']} candidate links "
@@ -1311,8 +1317,14 @@ def analyse_capture(nodes, src, dst, ip, packet_log, cand, trace, owners, pre, a
     # is the only thing joining them, bridge it - labelled as inferred -
     # instead of reporting "no complete path" for a trace that plainly worked.
     inferred: list[dict] = []
-    if dst["label"] not in fwd and uncaptured:
-        gaps = [r for r in rows if r["id"] in uncaptured and r["use"] == "none"]
+    # Both ends of a bridged link must already be proven by captured packets,
+    # and at most ONE link is bridged. (First version bridged any uncaptured
+    # link: with CML so slow that 1 of 45 captures started and ZERO packets
+    # were captured, it "confirmed" a 5-hop path made entirely of guesses.)
+    proven_nodes = {x for r in used for x in (r["a"], r["b"])}
+    if dst["label"] not in fwd and uncaptured and packet_log:
+        gaps = [r for r in rows if r["id"] in uncaptured and r["use"] == "none"
+                and r["a"] in proven_nodes and r["b"] in proven_nodes]
         gap_ids = {r["id"] for r in gaps}
         for r in gaps:
             adj.setdefault(r["a"], []).append((r["b"], r))
@@ -1322,6 +1334,8 @@ def analyse_capture(nodes, src, dst, ip, packet_log, cand, trace, owners, pre, a
             fwd = fwd2
             on = set(zip(chain(fwd, dst["label"]), chain(fwd, dst["label"])[1:]))
             inferred = [r for r in gaps if (r["a"], r["b"]) in on or (r["b"], r["a"]) in on]
+            if len(inferred) > 1:
+                fwd, inferred = walk(src["label"], lambda r: r["write"] > 0), []
             for r in inferred:
                 r["use"] = "inferred"
     if dst["label"] in fwd:

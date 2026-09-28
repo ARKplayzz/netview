@@ -135,3 +135,16 @@ cap = pt.analyse_capture(nodes, {"label": "PC"}, {"label": "T"}, "10.9.9.9", sor
                          uncaptured={"e4"})
 assert not any(r["use"] == "inferred" for r in cap["links"])
 print("GAP OK")
+
+# Nothing captured at all (CML started 1 of N captures): must NOT invent a path
+cap = pt.analyse_capture(nodes, {"label": "PC"}, {"label": "T"}, "10.9.9.9", [],
+                         {"nodes": list(names), "links": [], "paths": 2}, {"hops": []}, owners, {}, True, N, N,
+                         uncaptured={"e1", "e2", "e3", "e4", "e5"})
+assert not any(r["use"] == "inferred" for r in cap["links"]) and cap["verdict"]["level"] != "ok", cap["verdict"]
+# Two consecutive uncaptured links (only PC-A captured): must NOT bridge both
+ev, _ = run("10.9.9.9", {"e1": per["e1"]})
+cap = pt.analyse_capture(nodes, {"label": "PC"}, {"label": "T"}, "10.9.9.9", sorted(ev, key=lambda e: e["at"]),
+                         {"nodes": list(names), "links": [], "paths": 2}, {"hops": []}, owners, {}, True, N, N,
+                         uncaptured={"e2", "e3"})
+assert not any(r["use"] == "inferred" for r in cap["links"]) and cap["verdict"]["level"] != "ok", cap["verdict"]
+print("NO-FABRICATION OK")
