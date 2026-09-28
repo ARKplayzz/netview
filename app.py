@@ -277,6 +277,12 @@ def api_trace():
         # real finding (no site is advertising the VIP), not an error here.
         target_ip = virtual["ip"]
         target = by_label.get(owners.get(target_ip)) or {"label": virtual["label"], "virtual": True}
+        # Every node that holds the VIP (anycast: one per site). The trace proves
+        # whichever copy the network actually delivers to (2026-09-28: the VPN
+        # laptop reaches the HQ copy; the address map alone named the DR one).
+        vip_holders = [n["label"] for n in inv["nodes"]
+                       if target_ip in {a.get("ip") for a in (n.get("live") or {}).get("addresses") or []}
+                       | {a.get("value") for a in n.get("addresses") or []}]
     elif virtual:
         # DNS-based failover: which real backend answers depends on which way
         # the record currently points, so it can only be found by resolving
@@ -317,6 +323,7 @@ def api_trace():
                                "capture": bool(body.get("capture")), "virtual_fqdn": virtual_fqdn,
                                "virtual_label": virtual["label"] if virtual else None,
                                "stale_target": stale_target,
+                               "vip_holders": vip_holders if virtual and virtual.get("ip") else None,
                                "vantage": vantage, "owners": owners})
     job = pathtrace.get(job_id)
     return jsonify({"job_id": job_id, "eta_seconds": job["eta_seconds"], "target_ip": target_ip})

@@ -241,21 +241,67 @@ _ECHO_ID_SEQ = re.compile(r"id=(0x[0-9a-f]+), seq=(\d+)")
 
 
 def _capture_start_all(cml, link_ids: list[str], maxtime: int) -> dict[str, str | None]:
-    """Start an unfiltered capture on each candidate link. Returns
-    {link_id: starttime} so packet offsets (relative to each link's own
-    capture) can be converted to one shared absolute timeline. A link whose
-    capture was already running (e.g. a previous job's cleanup lost a race)
-    is treated as already-on rather than failing the whole trace over it."""
-    starts: dict[str, str | None] = {}
-    for lid in link_ids:
+    """Start a FRESH, RUNNING capture on every candidate link.
+    Returns {link_id: starttime} so each link's packet offsets can be put on one
+    shared timeline. Links to stopped nodes are dropped from `link_ids`.
+
+    Built on what CML measurably does (2026-09-28, NetView's incomplete paths):
+      * a start on a link that ALREADY has a capture returns that old capture
+        without an error - one left over from an earlier trace (2 h of health
+        checks, buffer full) then records none of this test's packets;
+      * a start within ~1 s of that link's previous stop usually (6 of 8) reports
+        success but NEVER RUNS; re-starting it recovers it (5 of 6);
+      * starts issued in PARALLEL collide the same way (29 of 43 came up), while
+        40 sequential starts took 0.1-0.5 s each and 39 of 40 ran;
+      * busy trunks carry ~100-300 pps of HSRP hellos, so 3000 packets filled in
+        ~10 s, before the test's burst; 10000 is used.
+    So: read every status (parallel reads are safe), stop only genuine
+    leftovers, start SEQUENTIALLY, then verify and re-start what did not run."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    def status(lid: str) -> dict:
         try:
-            r = cml.capture_start(lid, maxpackets=3000, maxtime=maxtime)
-            starts[lid] = (r or {}).get("starttime")
+            return cml.capture_status(lid) or {}
+        except RuntimeError:
+            return {}
+
+    def statuses(ids: list[str]) -> dict[str, dict]:
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            return dict(zip(ids, ex.map(status, ids)))
+
+    skip: set[str] = set()
+
+    def start(lid: str) -> None:
+        try:
+            cml.capture_start(lid, maxpackets=10000, maxtime=maxtime)
         except RuntimeError as e:
-            if "already running" not in str(e):
+            if "not running" in str(e):
+                skip.add(lid)                 # a link to a stopped node carries nothing to prove
+            elif "already running" not in str(e):
                 raise
-            st = cml.capture_status(lid)
-            starts[lid] = (st or {}).get("starttime")
+
+    leftovers = [l for l, s in statuses(link_ids).items() if s.get("starttime")]
+    for lid in leftovers:
+        try:
+            cml.capture_stop(lid)
+        except RuntimeError:
+            pass
+    if leftovers:
+        time.sleep(2.5)                       # a start sooner than this silently fails
+    for lid in link_ids:
+        start(lid)
+    for lid in skip:
+        link_ids.remove(lid)
+    starts: dict[str, str | None] = {}
+    for _ in range(3):
+        time.sleep(1.5)
+        st = statuses(link_ids)
+        starts = {l: s.get("starttime") for l, s in st.items()}
+        missing = [l for l, v in starts.items() if not v]
+        if not missing:
+            break
+        for lid in missing:
+            start(lid)
     return starts
 
 
@@ -615,6 +661,18 @@ def _execute(job_id: str, cml, con: Console, spec: dict) -> dict:
         # 2026-09-27: WFH -> ServerRoomSwitch-HQ-2 was "proven" only to the home
         # router because that leg went uncaptured. So capture EVERY leg of any
         # firewall in scope.
+        # ANYCAST (2026-09-28): a static virtual IP is held by several nodes and
+        # the network - not NetView - decides which one answers (the VPN laptop
+        # reaches the HQ copy through the HQ tunnel; a DR desk reaches the DR
+        # copy). Capture towards EVERY holder, so whichever copy the packets go
+        # to is proven, not just the one the address map happened to name.
+        for h in spec.get("vip_holders") or []:
+            if h != dst["label"]:
+                scope |= set(candidates(nodes, src["label"], h)["nodes"])
+                for x, y in _tunnels(nodes):
+                    for hd, peer in ((x, y), (y, x)):
+                        if hd in scope:
+                            scope |= set(candidates(nodes, peer, h)["nodes"])
         fws = {n["label"] for n in nodes if n.get("probe_family") == "asa"} & scope
         for l in link_map.values():
             if l["a"] in fws:
@@ -629,7 +687,12 @@ def _execute(job_id: str, cml, con: Console, spec: dict) -> dict:
         # packets each, plus the traceroute that follows - generous rather
         # than tight, since a capture that stops early loses proof, not just
         # accuracy.
-        capture_starts = _capture_start_all(cml, cap_links, maxtime=45)
+        # 300 s, not 45 (2026-09-28): a retried burst from a Linux PC (300-500
+        # paced pings) outlasted 45 s, so the first links' captures - the
+        # source's own - expired mid-burst and paths "stopped" one hop out.
+        # Every capture is stopped explicitly when the trace ends (or fails),
+        # so this is only a backstop.
+        capture_starts = _capture_start_all(cml, cap_links, maxtime=300)
         _set(job_id, live_packets=[])
         live_thread = threading.Thread(target=_live_poll, daemon=True,
                                        args=(job_id, cml, cap_links, link_map, capture_starts,
@@ -650,6 +713,7 @@ def _execute(job_id: str, cml, con: Console, spec: dict) -> dict:
     # single fixed count cannot be a safe default across links that differ
     # that much, so retry once with a bigger burst rather than trusting one
     # static number to be enough everywhere.
+    completed = False
     try:
         retried = False
         for attempt_count in (count, min(500, max(count * 3, 300))):
@@ -672,6 +736,7 @@ def _execute(job_id: str, cml, con: Console, spec: dict) -> dict:
             trace = {"cmd": None, "raw": f"{type(e).__name__}: {e}", "hops": []}
 
         dns = _dns(job_id, con, spec) if spec.get("dns") else None
+        completed = True
     finally:
         # Always stop the poller, even if the burst/traceroute above raised -
         # it's a live REST loop independent of the console session, so left
@@ -679,6 +744,12 @@ def _execute(job_id: str, cml, con: Console, spec: dict) -> dict:
         if capture:
             live_stop.set()
             live_thread.join(timeout=2)
+            if not completed:
+                for lid in cap_links:           # a failed trace must not leave captures running
+                    try:
+                        cml.capture_stop(lid)
+                    except Exception:           # noqa: BLE001
+                        pass
 
     out = analyse(nodes, src, dst, ip, count, burst, raw_delta, base, base_dt, dt, cand, trace,
                   owners, pre, answering)
@@ -688,6 +759,9 @@ def _execute(job_id: str, cml, con: Console, spec: dict) -> dict:
         _set(job_id, stage="collecting packet capture")
         out["packet_log"] = _packet_log(cml, cap_links, link_map, capture_starts, ip,
                                         src["label"], owners)
+        out["capture_diag"] = {"links": len(cap_links),
+                               "started": sum(1 for l in cap_links if capture_starts.get(l)),
+                               "with_packets": len({e["link_id"] for e in out["packet_log"]})}
         # Capture mode is authoritative when it's on: the diagnosis (path,
         # per-link classification, verdict, findings) comes entirely from
         # proven packets, not byte counts, so nothing else happening on the
@@ -698,9 +772,15 @@ def _execute(job_id: str, cml, con: Console, spec: dict) -> dict:
         # rule out.
         counter_estimate = {"path": out["path"], "verdict": out["verdict"]}
         cap = analyse_capture(nodes, src, dst, ip, out["packet_log"], cand, trace, owners,
-                              pre, answering, out["sent"], out["received"])
+                              pre, answering, out["sent"], out["received"],
+                              holders=spec.get("vip_holders"))
         out["path"], out["stop_at"] = cap["path"], cap["stop_at"]
         out["links"], out["verdict"], out["findings"] = cap["links"], cap["verdict"], cap["findings"]
+        if cap.get("answered_by") and cap["answered_by"] != dst["label"]:
+            # anycast: adopt the copy the network actually delivered to
+            dst = next((n for n in nodes if n["label"] == cap["answered_by"]),
+                       {**dst, "label": cap["answered_by"]})
+            out["target"] = dst["label"]
         out["mode"] = "capture"
         out["counter_estimate"] = counter_estimate
         if counter_estimate["path"] != cap["path"]:
@@ -744,6 +824,11 @@ def _execute(job_id: str, cml, con: Console, spec: dict) -> dict:
                                   "expected here, not a fault.")
     if spec.get("virtual_label"):
         out["virtual_target"] = spec["virtual_label"]
+    if len(spec.get("vip_holders") or []) > 1 and out.get("mode") != "capture":
+        out["findings"].insert(0, f"{spec['virtual_label']} is anycast - {', '.join(spec['vip_holders'])} "
+                                  f"all hold {ip}, and the network picks one per source. Quick mode can't "
+                                  f"tell which answered (it assumed {dst['label']}); run Verified mode to "
+                                  f"see the copy this source actually reaches.")
     if resolved_note:
         out["findings"].insert(0, resolved_note)
     if spec.get("stale_target"):
@@ -985,7 +1070,7 @@ def analyse(nodes, src, dst, ip, count, burst, raw_delta, base, base_dt, dt, can
 
 
 def analyse_capture(nodes, src, dst, ip, packet_log, cand, trace, owners, pre, answering,
-                    sent, recv) -> dict:
+                    sent, recv, holders=None) -> dict:
     """The same shape of result as analyse() - path, per-link classification,
     verdict, findings - but built entirely from packets the capture actually
     proved crossed each link, not from background-corrected byte counts.
@@ -1036,6 +1121,16 @@ def analyse_capture(nodes, src, dst, ip, packet_log, cand, trace, owners, pre, a
             if v not in prev:
                 prev[v] = u
                 q.append(v)
+    # ANYCAST (2026-09-28): the path ends at whichever holder of the VIP the
+    # captured packets actually reached - the network chose it, not NetView.
+    anycast_note = None
+    reached = [h for h in (holders or []) if h in prev]
+    if reached:
+        pick = min(reached, key=lambda k: _depth(prev, k))
+        dst = {**dst, "label": pick}
+        others = [h for h in holders if h != pick]
+        anycast_note = (f"Anycast: {ip} is also held by {', '.join(others)}; the network delivered "
+                        f"this source's packets to {pick}." if others else None)
     path, stop_at = [], None
     if dst["label"] in prev:
         x = dst["label"]
@@ -1058,6 +1153,8 @@ def analyse_capture(nodes, src, dst, ip, packet_log, cand, trace, owners, pre, a
     findings = []
     cand_nodes = set(cand["nodes"])
     path_set = set(path)
+    if anycast_note:
+        findings.append(anycast_note)
     if not packet_log:
         findings.append("No packets matching this test were captured on any candidate link. "
                         "Either the burst never reached the source's own links, or the capture "
@@ -1121,7 +1218,7 @@ def analyse_capture(nodes, src, dst, ip, packet_log, cand, trace, owners, pre, a
             text += " Replies used an equal-cost return branch."
 
     return {"path": path, "stop_at": stop_at, "links": rows, "findings": findings,
-           "verdict": {"level": level, "text": text}}
+           "verdict": {"level": level, "text": text}, "answered_by": dst["label"]}
 
 
 def _depth(prev: dict, k: str) -> int:

@@ -71,8 +71,10 @@ def main() -> int:
         path = " > ".join(p if isinstance(p, str) else str(p.get("label", p)) for p in (res.get("path") or []))
         reached = bool(res.get("received")) and v.get("level") in ("ok", "warn")
         failed += 0 if reached else 1
+        proven = bool(v) and v.get("level") == "ok" or "Reached" in str(v.get("text", ""))
         print(f"\n{'OK ' if reached else 'BAD'} {src} -> {dst}  [{r.get('target_ip')}]"
-              f"  {res.get('received')}/{res.get('sent')} replies\n"
+              f"  {res.get('received')}/{res.get('sent')} replies"
+              f"  capture={res.get('capture_diag')}  {'PROVEN' if proven else 'NOT PROVEN'}\n"
               f"    {verdict}\n    path: {path}", flush=True)
         for f in (res.get("findings") or [])[:4]:
             print(f"    finding: {(f.get('text') if isinstance(f, dict) else str(f))[:220]}")
