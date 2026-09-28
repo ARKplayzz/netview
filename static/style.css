@@ -284,6 +284,7 @@ table.p tr.drift td { background: var(--infobg); }
 .wire.t-both { stroke: var(--ok); stroke-width: 4; }
 .wire.t-one { stroke: var(--warn); stroke-width: 4; stroke-dasharray: 9 3; }
 .wire.t-fwd { stroke: var(--bad); stroke-width: 4; }
+.wire.t-inf { stroke: var(--ok); stroke-width: 3; stroke-dasharray: 2 5; stroke-linecap: round; }
 .wire.pkt-flash { stroke-width: 8; transition: stroke-width 60ms ease-out; }
 .wire.pkt-flash.pkt-req { stroke: var(--sel); }
 .wire.pkt-flash.pkt-reply { stroke: var(--ok); }

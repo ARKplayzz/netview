@@ -237,6 +237,8 @@ def _delta(a: dict, b: dict) -> dict[str, dict]:
 # non-empty value captures 0 packets, verified 2026-09-24), so every link is
 # captured unfiltered and the echo request/reply pair for THIS trace's target
 # IP is picked out client-side by matching source/destination.
+CAPTURE_START_BUDGET_S = 120
+
 _ECHO_ID_SEQ = re.compile(r"id=(0x[0-9a-f]+), seq=(\d+)")
 
 
@@ -270,6 +272,12 @@ def _capture_start_all(cml, link_ids: list[str], maxtime: int) -> dict[str, str 
             return dict(zip(ids, ex.map(status, ids)))
 
     skip: set[str] = set()
+    # Deadline (deep dive 2026-09-28): with the CML host busy (three Windows
+    # servers booting) each capture call took 2-8 s instead of 0.1-0.5 s, and a
+    # 45-link trace sat in "starting packet capture" for 35+ minutes. Past the
+    # deadline no more starts are attempted; the trace runs with what came up
+    # and reports the rest as not captured.
+    deadline = time.monotonic() + CAPTURE_START_BUDGET_S
 
     def start(lid: str) -> None:
         try:
@@ -289,18 +297,24 @@ def _capture_start_all(cml, link_ids: list[str], maxtime: int) -> dict[str, str 
     if leftovers:
         time.sleep(2.5)                       # a start sooner than this silently fails
     for lid in link_ids:
+        if time.monotonic() > deadline:
+            break
         start(lid)
     for lid in skip:
         link_ids.remove(lid)
     starts: dict[str, str | None] = {}
-    for _ in range(3):
+    # 5 rounds, not 3 (deep dive 2026-09-28): a 45-link anycast trace still
+    # had 4 links that never started after 3, one of them on the path.
+    for _ in range(5):
         time.sleep(1.5)
         st = statuses(link_ids)
         starts = {l: s.get("starttime") for l, s in st.items()}
         missing = [l for l, v in starts.items() if not v]
-        if not missing:
+        if not missing or time.monotonic() > deadline:
             break
         for lid in missing:
+            if time.monotonic() > deadline:
+                break
             start(lid)
     return starts
 
@@ -330,35 +344,112 @@ def _parse_pcap(packets: list[dict], lid: str, l: dict, base_t: datetime, ip: st
     resolves to a DIFFERENT, KNOWN node - that's the actual failure mode this
     exists to catch (traffic from some other, identifiable device sharing the
     same target IP), not an unlabelled address."""
+    return [e for e in _parse_echo(packets, lid, l, base_t, owners)
+            if _strict_match(e, ip, src_label)]
+
+
+def _strict_match(e: dict, ip: str, src_label: str) -> bool:
+    """The target IP is one end, and the other end is the source's own
+    address (or an address nothing in the inventory claims)."""
+    if e["dst"] == ip:
+        owner = e["src_owner"]
+    elif e["src"] == ip:
+        owner = e["dst_owner"]
+    else:
+        return False
+    return owner is None or owner == src_label
+
+
+def _parse_echo(packets: list[dict], lid: str, l: dict, base_t: datetime,
+                owners: dict[str, str]) -> list[dict]:
+    """Every ICMP echo request/reply on one link, whoever sent it, with the
+    node owning each end. `_strict_match` picks this test's own packets out;
+    `_nat_events` recovers the ones address translation rewrote."""
     events = []
     for p in packets:
         info = p.get("info") or ""
         if p.get("protocol") != "ICMP" or "Echo" not in info:
-            continue
-        src_ip, dst_ip = p.get("source"), p.get("destination")
-        if dst_ip == ip:
-            other = src_ip
-        elif src_ip == ip:
-            other = dst_ip
-        else:
-            continue
-        owner = owners.get(other)
-        if owner is not None and owner != src_label:
             continue
         m = _ECHO_ID_SEQ.search(info)
         try:
             offset = float(p.get("time") or 0)
         except ValueError:
             offset = 0.0
-        at = base_t.timestamp() + offset
         # CML annotates a reply with "(request in N)", so "request" alone
         # appears in BOTH lines - check which one this line opens with.
         direction = "reply" if info.lstrip().startswith("Echo (ping) reply") else "request"
+        src_ip, dst_ip = p.get("source"), p.get("destination")
         events.append({"link_id": lid, "a": l["a"], "ai": l["ai"], "b": l["b"], "bi": l["bi"],
-                       "at": at, "dir": direction, "no": p.get("no"),
-                       "src": p.get("source"), "dst": p.get("destination"),
+                       "at": base_t.timestamp() + offset, "dir": direction, "no": p.get("no"),
+                       "src": src_ip, "dst": dst_ip,
+                       "src_owner": owners.get(src_ip), "dst_owner": owners.get(dst_ip),
                        "icmp_id": m.group(1) if m else None, "seq": m.group(2) if m else None})
     return events
+
+
+def _nat_events(raw: list[dict], matched: list[dict], ip: str, src_label: str,
+                own_ids: set[str]) -> list[dict]:
+    """The test's own pings AFTER a device rewrote their addresses.
+
+    Deep dive 2026-09-28, measured: Finance PC -> ISP-1 (100.11.0.1) answered
+    60/60, yet the proven path stopped at Firewall-HQ-1 - PAT had replaced the
+    source with the firewall's outside address and the ASA reassigned the
+    ICMP id, so every packet past the firewall failed both checks above. The
+    same holds for the home router's PAT, and static NAT inbound
+    (-> 100.11.0.20) rewrites the DESTINATION instead, so the target IP is
+    not in the header on the inside legs at all.
+
+    Translation keeps the echo SEQUENCE numbers and the timing, and changes
+    only one side of the conversation, so a packet is accepted as this test's
+    when:
+      * source NAT / PAT: the target IP is still one end, the other end is a
+        node this capture has already proven carried the test (the
+        translator), not the source itself;
+      * destination NAT: the source's own address is still one end, the
+        other is not the target IP;
+    AND its ICMP id is the test's own (static NAT keeps it) or - as a whole
+    group sharing one id - at least 80 % of its sequence numbers are the
+    test's and it is at least 30 % of the burst's size, inside the burst's
+    time window. That bar is far above anything a background probe (the
+    carriers' 5 s SLA pings, HSRP-tracking) could clear by accident.
+    Twice-NAT (both ends rewritten) is not recovered."""
+    own = [e for e in matched if src_label in (e["a"], e["b"])]
+    if not own:
+        return []
+    seqs = {e["seq"] for e in own if e["seq"]}
+    src_addrs = {e["src"] if e["dir"] == "request" else e["dst"] for e in own}
+    lo, hi = min(e["at"] for e in matched) - 1.0, max(e["at"] for e in matched) + 3.0
+    have = {(e["link_id"], e["no"]) for e in matched}
+    out: list[dict] = []
+    while True:
+        proven = {n for e in matched + out for n in (e["a"], e["b"])} - {src_label}
+        groups: dict[tuple, list[dict]] = {}
+        for e in raw:
+            if (e["link_id"], e["no"]) in have or not (lo <= e["at"] <= hi):
+                continue
+            src_end, tgt_end = (e["src"], e["dst"]) if e["dir"] == "request" else (e["dst"], e["src"])
+            src_own = e["src_owner"] if e["dir"] == "request" else e["dst_owner"]
+            if tgt_end == ip and src_end not in src_addrs and src_own in proven:
+                groups.setdefault(("snat", src_own, e["icmp_id"]), []).append(e)
+            elif src_end in src_addrs and tgt_end != ip:
+                groups.setdefault(("dnat", tgt_end, e["icmp_id"]), []).append(e)
+        grew = False
+        for (kind, who, icmp_id), g in groups.items():
+            hits = sum(1 for e in g if e["seq"] in seqs)
+            if not ((kind == "dnat" and icmp_id in own_ids) or
+                    (hits >= 0.8 * len(g) and len(g) >= max(3, 0.3 * len(seqs)))):
+                continue
+            for e in g:
+                e["nat"] = kind
+                if kind == "snat":
+                    e["nat_by"] = who
+                else:
+                    e["nat_to"] = who
+                have.add((e["link_id"], e["no"]))
+            out.extend(g)
+            grew = True
+        if not grew:
+            return out
 
 
 def _parse_esp(packets: list[dict], lid: str, l: dict, base_t: datetime,
@@ -445,7 +536,20 @@ def _packet_log(cml, link_ids: list[str], links: dict, starts: dict[str, str | N
             cml.capture_stop(lid)
         except RuntimeError:
             pass
-    events, esp = [], []
+    # Pulls run in parallel (reads are safe - only capture STARTS race):
+    # a 35-link trace pulling up to 10000 packets per link one at a time took
+    # minutes to collect (deep dive 2026-09-28).
+    from concurrent.futures import ThreadPoolExecutor
+
+    def pull(lid: str):
+        try:
+            return cml.pcap_packets(lid)
+        except RuntimeError:
+            return None
+
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        pulled = dict(zip(link_ids, ex.map(pull, link_ids)))
+    raw, esp = [], []
     for lid in link_ids:
         l = links.get(lid)
         start = starts.get(lid)
@@ -455,12 +559,12 @@ def _packet_log(cml, link_ids: list[str], links: dict, starts: dict[str, str | N
             base_t = datetime.strptime(start, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
         except ValueError:
             continue
-        try:
-            packets = cml.pcap_packets(lid)
-        except RuntimeError:
+        packets = pulled.get(lid)
+        if packets is None:
             continue
-        events.extend(_parse_pcap(packets, lid, l, base_t, ip, src_label, owners))
+        raw.extend(_parse_echo(packets, lid, l, base_t, owners))
         esp.extend(_parse_esp(packets, lid, l, base_t, owners))
+    events = [e for e in raw if _strict_match(e, ip, src_label)]
     # The owners check (above) rules out traffic from a different, identified
     # device sharing the same target IP, but not a second ping session
     # between these exact same two endpoints - e.g. someone running the
@@ -475,6 +579,7 @@ def _packet_log(cml, link_ids: list[str], links: dict, starts: dict[str, str | N
               if e["icmp_id"] and src_label in (e["a"], e["b"])}
     if own_ids:
         events = [e for e in events if e["icmp_id"] in own_ids]
+    events += _nat_events(raw, events, ip, src_label, own_ids)
     # Through a VPN the test's pings are encrypted between the two tunnel
     # heads, so the links in between show ESP, not ICMP, and would leave a
     # hole in the proven path (measured 2026-09-27: WFH laptop -> file
@@ -692,7 +797,9 @@ def _execute(job_id: str, cml, con: Console, spec: dict) -> dict:
         # source's own - expired mid-burst and paths "stopped" one hop out.
         # Every capture is stopped explicitly when the trace ends (or fails),
         # so this is only a backstop.
+        t_cap = time.monotonic()
         capture_starts = _capture_start_all(cml, cap_links, maxtime=300)
+        cap_start_s = round(time.monotonic() - t_cap)
         _set(job_id, live_packets=[])
         live_thread = threading.Thread(target=_live_poll, daemon=True,
                                        args=(job_id, cml, cap_links, link_map, capture_starts,
@@ -725,7 +832,12 @@ def _execute(job_id: str, cml, con: Console, spec: dict) -> dict:
             raw_delta = _delta(s2, s3)
             count = attempt_count
             expected = (burst["sent"] or attempt_count) + (burst["received"] or 0)
-            if _calibratable(src, nodes, raw_delta, base, base_dt, dt, expected):
+            # Verified mode proves the path from packets, so an uncalibratable
+            # counter estimate is no reason to send a second, 300-500 ping
+            # burst (deep dive 2026-09-28: that retry added ~60-100 s to every
+            # Linux-sourced Verified trace, only to improve the estimate that
+            # the capture then overrides).
+            if capture or _calibratable(src, nodes, raw_delta, base, base_dt, dt, expected):
                 break
             retried = True
 
@@ -759,7 +871,7 @@ def _execute(job_id: str, cml, con: Console, spec: dict) -> dict:
         _set(job_id, stage="collecting packet capture")
         out["packet_log"] = _packet_log(cml, cap_links, link_map, capture_starts, ip,
                                         src["label"], owners)
-        out["capture_diag"] = {"links": len(cap_links),
+        out["capture_diag"] = {"start_seconds": cap_start_s, "links": len(cap_links),
                                "started": sum(1 for l in cap_links if capture_starts.get(l)),
                                "with_packets": len({e["link_id"] for e in out["packet_log"]})}
         # Capture mode is authoritative when it's on: the diagnosis (path,
@@ -773,9 +885,11 @@ def _execute(job_id: str, cml, con: Console, spec: dict) -> dict:
         counter_estimate = {"path": out["path"], "verdict": out["verdict"]}
         cap = analyse_capture(nodes, src, dst, ip, out["packet_log"], cand, trace, owners,
                               pre, answering, out["sent"], out["received"],
-                              holders=spec.get("vip_holders"))
+                              holders=spec.get("vip_holders"), vip_kind=spec.get("vip_kind"),
+                              uncaptured={l for l in cap_links if not capture_starts.get(l)})
         out["path"], out["stop_at"] = cap["path"], cap["stop_at"]
         out["links"], out["verdict"], out["findings"] = cap["links"], cap["verdict"], cap["findings"]
+        out["return_path"] = cap["return_path"]
         if cap.get("answered_by") and cap["answered_by"] != dst["label"]:
             # anycast: adopt the copy the network actually delivered to
             dst = next((n for n in nodes if n["label"] == cap["answered_by"]),
@@ -783,8 +897,17 @@ def _execute(job_id: str, cml, con: Console, spec: dict) -> dict:
             out["target"] = dst["label"]
         out["mode"] = "capture"
         out["counter_estimate"] = counter_estimate
+        diag = out["capture_diag"]
+        if diag["started"] < diag["links"]:
+            out["findings"].append(
+                f"CML started packet capture on {diag['started']} of {diag['links']} candidate links "
+                f"(start-up took {diag['start_seconds']} s"
+                + ("; CML was slow, so start-up stopped at its time limit" if diag["start_seconds"] >= CAPTURE_START_BUDGET_S else "")
+                + "). Links without a capture can't prove or disprove anything.")
         if counter_estimate["path"] != cap["path"]:
-            out["findings"].insert(0, "The counter-based estimate disagreed with this capture-"
+            # Last, not first (deep dive 2026-09-28): it fired on 5 of 6 unusual
+            # scenarios and pushed the real findings (NAT, return path) down.
+            out["findings"].append("The counter-based estimate disagreed with this capture-"
                                       f"verified result: it suggested {' -> '.join(counter_estimate['path']) or '(no path)'}. "
                                       "That's exactly the kind of noise packet capture exists to rule out - "
                                       "trust the path above.")
@@ -825,10 +948,12 @@ def _execute(job_id: str, cml, con: Console, spec: dict) -> dict:
     if spec.get("virtual_label"):
         out["virtual_target"] = spec["virtual_label"]
     if len(spec.get("vip_holders") or []) > 1 and out.get("mode") != "capture":
-        out["findings"].insert(0, f"{spec['virtual_label']} is anycast - {', '.join(spec['vip_holders'])} "
-                                  f"all hold {ip}, and the network picks one per source. Quick mode can't "
-                                  f"tell which answered (it assumed {dst['label']}); run Verified mode to "
-                                  f"see the copy this source actually reaches.")
+        what = ("an HSRP gateway address - the active router of" if spec.get("vip_kind") == "hsrp"
+                else "anycast - the network picks one per source among")
+        out["findings"].insert(0, f"{spec.get('virtual_label') or ip} is {what} "
+                                  f"{', '.join(spec['vip_holders'])}. Quick mode can't tell which "
+                                  f"answered (it assumed {dst['label']}); run Verified mode to see "
+                                  "the one this source actually reaches.")
     if resolved_note:
         out["findings"].insert(0, resolved_note)
     if spec.get("stale_target"):
@@ -1070,7 +1195,7 @@ def analyse(nodes, src, dst, ip, count, burst, raw_delta, base, base_dt, dt, can
 
 
 def analyse_capture(nodes, src, dst, ip, packet_log, cand, trace, owners, pre, answering,
-                    sent, recv, holders=None) -> dict:
+                    sent, recv, holders=None, vip_kind=None, uncaptured=None) -> dict:
     """The same shape of result as analyse() - path, per-link classification,
     verdict, findings - but built entirely from packets the capture actually
     proved crossed each link, not from background-corrected byte counts.
@@ -1088,6 +1213,11 @@ def analyse_capture(nodes, src, dst, ip, packet_log, cand, trace, owners, pre, a
     for e in packet_log:
         by_link.setdefault(e["link_id"], {"request": 0, "reply": 0, "esp": 0})[e["dir"]] += 1
 
+    # A dead target's burst doesn't wait for replies, so `recv` is None, not
+    # 0 (deep dive 2026-09-28: a ping to Firewall-HQ-1's far interface then
+    # classed request-only links "one-way" and blamed firewall asymmetry).
+    # The capture itself says whether any reply existed.
+    no_replies = recv == 0 or (recv is None and not any(e["dir"] == "reply" for e in packet_log))
     rows = []
     for lid, l in links.items():
         c = by_link.get(lid)
@@ -1097,7 +1227,7 @@ def analyse_capture(nodes, src, dst, ip, packet_log, cand, trace, owners, pre, a
             req = reply = c["esp"]      # both directions ride the same ESP pair
         if not req and not reply:
             cls = "none"
-        elif recv == 0:
+        elif no_replies:
             cls = "forward"          # no replies exist at all this run, by construction
         elif req and reply:
             cls = "both"
@@ -1126,18 +1256,81 @@ def analyse_capture(nodes, src, dst, ip, packet_log, cand, trace, owners, pre, a
     anycast_note = None
     reached = [h for h in (holders or []) if h in prev]
     if reached:
-        pick = min(reached, key=lambda k: _depth(prev, k))
+        # Nearest holder wins; on a tie (an HSRP pair both one hop from the
+        # access switch, one reached only by an ECMP side-branch) the one
+        # whose links carried more of the test's packets is the answerer.
+        touch = {h: sum(1 for e in packet_log if h in (e["a"], e["b"])) for h in reached}
+        pick = min(reached, key=lambda k: (_depth(prev, k), -touch[k]))
         dst = {**dst, "label": pick}
         others = [h for h in holders if h != pick]
-        anycast_note = (f"Anycast: {ip} is also held by {', '.join(others)}; the network delivered "
-                        f"this source's packets to {pick}." if others else None)
-    path, stop_at = [], None
-    if dst["label"] in prev:
-        x = dst["label"]
+        if others and vip_kind == "hsrp":
+            anycast_note = (f"Gateway VIP: {ip} is an HSRP address shared with {', '.join(others)}; "
+                            f"the active router, {pick}, answered.")
+        elif others:
+            anycast_note = (f"Anycast: {ip} is also held by {', '.join(others)}; the network delivered "
+                            f"this source's packets to {pick}.")
+    # NAT (deep dive 2026-09-28): who rewrote what, from the packets
+    # `_nat_events` admitted. Destination NAT means the host that answered is
+    # the translated address's owner, not whatever holds the public address.
+    snat_by = sorted({e["nat_by"] for e in packet_log if e.get("nat") == "snat"})
+    dnat = {(e["nat_to"], e["dst_owner"] if e["dir"] == "request" else e["src_owner"])
+            for e in packet_log if e.get("nat") == "dnat"}
+    if dnat and not reached:
+        inside = [o for _, o in dnat if o in prev]
+        if inside:
+            dst = {**dst, "label": min(inside, key=lambda k: _depth(prev, k))}
+
+    def walk(start: str, carried) -> dict:
+        pv: dict[str, str | None] = {start: None}
+        wq = deque([start])
+        while wq:
+            u = wq.popleft()
+            for v, r in adj.get(u, []):
+                if v not in pv and carried(r):
+                    pv[v] = u
+                    wq.append(v)
+        return pv
+
+    def chain(pv: dict, end: str) -> list[str]:
+        out, x = [], end
         while x:
-            path.append(x)
-            x = prev[x]
-        path.reverse()
+            out.append(x)
+            x = pv[x]
+        return out[::-1]
+
+    # Deep dive 2026-09-28: walking request AND reply links together spliced
+    # the two directions under ECMP (Finance PC -> ISP-1: requests went via
+    # DistSwitch-HQ-2, replies back via DistSwitch-HQ-1, and the drawn path was
+    # half of each). The path is now the REQUESTS' route; the replies' route
+    # is reported separately when it differs.
+    path, stop_at, return_path = [], None, []
+    fwd = walk(src["label"], lambda r: r["write"] > 0)
+    # A link whose capture CML never started (measured 2026-09-28: 4 of 45 on
+    # an anycast trace, one of them the path's 2nd hop) carries no proof
+    # either way. When packets are proven on both sides of such a link and it
+    # is the only thing joining them, bridge it - labelled as inferred -
+    # instead of reporting "no complete path" for a trace that plainly worked.
+    inferred: list[dict] = []
+    if dst["label"] not in fwd and uncaptured:
+        gaps = [r for r in rows if r["id"] in uncaptured and r["use"] == "none"]
+        gap_ids = {r["id"] for r in gaps}
+        for r in gaps:
+            adj.setdefault(r["a"], []).append((r["b"], r))
+            adj.setdefault(r["b"], []).append((r["a"], r))
+        fwd2 = walk(src["label"], lambda r: r["write"] > 0 or r["id"] in gap_ids)
+        if dst["label"] in fwd2:
+            fwd = fwd2
+            on = set(zip(chain(fwd, dst["label"]), chain(fwd, dst["label"])[1:]))
+            inferred = [r for r in gaps if (r["a"], r["b"]) in on or (r["b"], r["a"]) in on]
+            for r in inferred:
+                r["use"] = "inferred"
+    if dst["label"] in fwd:
+        path = chain(fwd, dst["label"])
+        back = walk(dst["label"], lambda r: r["read"] > 0)
+        if src["label"] in back:
+            return_path = chain(back, src["label"])
+    elif dst["label"] in prev:
+        path = chain(prev, dst["label"])
     elif len(prev) > 1:
         far = max(prev, key=lambda k: _depth(prev, k))
         stop_at = far
@@ -1155,13 +1348,35 @@ def analyse_capture(nodes, src, dst, ip, packet_log, cand, trace, owners, pre, a
     path_set = set(path)
     if anycast_note:
         findings.append(anycast_note)
+    if inferred:
+        findings.append("Not captured, inferred: " + ", ".join(f"{r['a']} to {r['b']}" for r in inferred) +
+                        ". CML did not start the capture on this link, but this test's packets were "
+                        "captured on both sides of it and it is the only link joining them.")
+    for n in snat_by:
+        pre_ids = {e["icmp_id"] for e in packet_log if not e.get("nat") and e["dir"] != "esp"}
+        post = [e for e in packet_log if e.get("nat_by") == n]
+        addr = next((e["src"] if e["dir"] == "request" else e["dst"] for e in post), "?")
+        new_id = any(e["icmp_id"] not in pre_ids for e in post)
+        findings.append(f"Address translation at {n}: it rewrote the source to {addr} (NAT/PAT), so "
+                        f"{ip} never sees {src['label']}'s real address. Past {n} the packets were "
+                        + ("matched by echo sequence number and timing, because the translation also "
+                           "changed the ICMP id." if new_id else
+                           "matched by the test's own ICMP id and sequence numbers."))
+    if dnat:
+        dlinks = {e["link_id"] for e in packet_log if e.get("nat") == "dnat"}
+        plinks = {e["link_id"] for e in packet_log if not e.get("nat") and e["dir"] != "esp"}
+        ends = lambda ids: {x for r in rows if r["id"] in ids for x in (r["a"], r["b"])}
+        at = sorted((ends(dlinks) & ends(plinks)) - {src["label"]})
+        findings.append(f"Destination NAT{' at ' + ', '.join(at) if at else ''}: {ip} was translated to "
+                        + ", ".join(f"{a} ({o or 'unknown owner'})" for a, o in sorted(dnat, key=str))
+                        + ". The public address and the host that answered are different devices.")
     if not packet_log:
         findings.append("No packets matching this test were captured on any candidate link. "
                         "Either the burst never reached the source's own links, or the capture "
                         "window closed before the burst did - try again, or check the counter "
                         "estimate below for a rough signal.")
     if cand["paths"] > 1:
-        idle = sorted(cand_nodes - path_set - {src["label"], dst["label"]})
+        idle = sorted(cand_nodes - path_set - set(return_path) - {src["label"], dst["label"]})
         findings.append(f"{cand['paths']} equal-length paths exist between these nodes (by hop count)."
                         + (f" Not used this time: {', '.join(idle)}." if idle and path else ""))
     off = [x for x in path if x not in cand_nodes]
@@ -1181,7 +1396,7 @@ def analyse_capture(nodes, src, dst, ip, packet_log, cand, trace, owners, pre, a
                         ", ".join(f"{r['a']} to {r['b']}" for r in fw_one_way) +
                         " carried captured packets in only one direction. A stateful firewall "
                         "drops replies for requests it never saw - check OSPF costs either side.")
-    elif one_way:
+    elif one_way and not (return_path and return_path[::-1] != path):
         findings.append("Replies returned by a different equal-cost branch (ECMP): " +
                         ", ".join(f"{r['a']} to {r['b']}" for r in one_way) +
                         " carried captured packets in only one direction. Normal for a routed "
@@ -1193,7 +1408,12 @@ def analyse_capture(nodes, src, dst, ip, packet_log, cand, trace, owners, pre, a
                         ", ".join(f"{r['a']} to {r['b']}" for r in tunneled) +
                         ". Encrypted packets can't be matched to the test's ICMP id, so these hops "
                         "are proven by the tunnel, not by the pings themselves.")
-    stray = [r for r in used if r["a"] not in path_set or r["b"] not in path_set]
+    on_path = {frozenset(x) for p_ in (path, return_path) for x in zip(p_, p_[1:])}
+    if return_path and return_path[::-1] != path:
+        findings.append("Replies came back a different way: " + " -> ".join(return_path) +
+                        ". Each direction is routed on its own, so this is normal with equal-cost "
+                        "paths - unless a stateful firewall is on only one of them.")
+    stray = [r for r in used if frozenset((r["a"], r["b"])) not in on_path]
     if stray and path:
         findings.append("Also carried real packets from this test outside the walked path: " +
                         ", ".join(f"{r['a']} to {r['b']}" for r in stray) + ".")
@@ -1203,7 +1423,10 @@ def analyse_capture(nodes, src, dst, ip, packet_log, cand, trace, owners, pre, a
         findings.append("Traceroute named " + ", ".join(missing) +
                         " but no captured packets confirmed traffic through it.")
 
-    if not answering and stop_at:
+    if not answering and path and path[-1] == dst["label"]:
+        level, text = "fail", (f"Requests reached {dst['label']} (captured on the link into it), "
+                               "but it did not answer them.")
+    elif not answering and stop_at:
         level, text = "fail", f"{dst['label']} did not answer. Captured packets got as far as {stop_at}."
     elif not answering:
         level, text = "fail", f"{dst['label']} did not answer, and no captured packets left {src['label']}."
@@ -1212,13 +1435,15 @@ def analyse_capture(nodes, src, dst, ip, packet_log, cand, trace, owners, pre, a
     elif off or fw_one_way:
         level, text = "warn", f"Reached {dst['label']} in {len(path) - 1} hops, not by the expected route."
     else:
-        level, text = "ok", f"Reached {dst['label']} in {len(path) - 1} hops, confirmed by packet capture" + \
-            (f" (one of {cand['paths']} equal paths by hop count)." if cand["paths"] > 1 else ".")
+        level, text = "ok", (f"Reached {dst['label']} in {len(path) - 1} hops, confirmed by packet capture"
+                              + (" (a link with no capture was inferred)" if inferred else "")
+                              + (f" (one of {cand['paths']} equal paths by hop count)." if cand["paths"] > 1 else "."))
         if one_way:
             text += " Replies used an equal-cost return branch."
 
     return {"path": path, "stop_at": stop_at, "links": rows, "findings": findings,
-           "verdict": {"level": level, "text": text}, "answered_by": dst["label"]}
+           "verdict": {"level": level, "text": text}, "answered_by": dst["label"],
+           "return_path": return_path}
 
 
 def _depth(prev: dict, k: str) -> int:

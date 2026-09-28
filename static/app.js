@@ -975,7 +975,7 @@ function nodeListRow(n) {
  * shows the links the packets DID cross, at layer 2 as well as layer 3.  Run
  * it, stop the active core switch in CML, run it again: the path moves. */
 const trace = { source: null, target: null, ip: null, count: 100, repeat: false, dns: false,
-                capture: false, job: null, stage: '', result: null, cand: null, history: [], error: null };
+                capture: true, job: null, stage: '', result: null, cand: null, history: [], error: null };
 let pick = null;           // null | 'source' | 'target'
 
 function startPick(src) {
@@ -1337,7 +1337,9 @@ function packetLogPanel(res) {
     tr.appendChild(el('td', null, e.a));
     tr.appendChild(el('td', null, e.ai));
     tr.appendChild(el('td', null, e.dir === 'request' ? '→' : e.dir === 'esp' ? '⇄' : '←'));
-    tr.appendChild(el('td', null, e.dir === 'esp' ? `esp, encrypted (${e.src} → ${e.dst})` : `${e.dir} (${e.b} ${e.bi})`));
+    const nat = e.nat === 'snat' ? `, translated by ${e.nat_by}: ${e.src} → ${e.dst}`
+      : e.nat === 'dnat' ? `, destination translated: ${e.src} → ${e.dst}` : '';
+    tr.appendChild(el('td', null, e.dir === 'esp' ? `esp, encrypted (${e.src} → ${e.dst})` : `${e.dir} (${e.b} ${e.bi})${nat}`));
     tr.appendChild(el('td', null, e.seq || ''));
     t.appendChild(tr);
   });
@@ -1460,7 +1462,7 @@ function pathDiagram(res, cand, width) {
     let a = pos.get(e.a), b = pos.get(e.b);
     if (a.d > b.d) [a, b] = [b, a];
     const u = e.id && usedBy.get(e.id);
-    const cls = 'wire ' + (e.kind === 'prev' ? 't-prev' : u ? (u.use === 'both' ? 't-both' : u.use === 'forward' ? 't-fwd' : 't-one') : 't-cand');
+    const cls = 'wire ' + (e.kind === 'prev' ? 't-prev' : u ? (u.use === 'both' ? 't-both' : u.use === 'forward' ? 't-fwd' : u.use === 'inferred' ? 't-inf' : 't-one') : 't-cand');
     let lx, ly;
     if (a.seg === b.seg) {
       s.appendChild(svg('line', { x1: a.x, y1: a.y, x2: b.x, y2: b.y, class: cls, 'data-link-id': e.id || '' }));
@@ -1474,7 +1476,7 @@ function pathDiagram(res, cand, width) {
     }
     if (u && u.packets != null) {
       s.appendChild(svg('text', { x: lx, y: ly, class: 'rate' + (u.use === 'forward' ? ' bad' : ''),
-                                  'text-anchor': 'middle' }, u.packets + ' pkts'));
+                                  'text-anchor': 'middle' }, u.use === 'inferred' ? 'no capture' : u.packets + ' pkts'));
     }
   });
   const prevOnly = new Set(prevPath.filter((x) => !onPath.has(x)));
@@ -1541,7 +1543,7 @@ function traceDetails() {
     tr.appendChild(el('td', 'm', `${l.a} ${shortIf(l.ai)}  to  ${l.b} ${shortIf(l.bi)}`));
     tr.appendChild(el('td', 'm', l.packets == null ? '-' : String(l.packets)));
     tr.appendChild(el('td', l.use === 'both' ? 's-ok' : 's-warn',
-      { both: 'both ways', 'one-way': 'one way only', forward: 'requests only' }[l.use]));
+      { both: 'both ways', 'one-way': 'one way only', forward: 'requests only', inferred: 'not captured (inferred)' }[l.use]));
     tr.appendChild(el('td', l.candidate ? null : 's-warn', l.candidate ? 'yes' : 'no'));
     t1.appendChild(tr);
   });

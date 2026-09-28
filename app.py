@@ -15,6 +15,7 @@ Run:
 """
 from __future__ import annotations
 
+import os
 import sys
 import threading
 import time
@@ -224,16 +225,42 @@ def _inventory(force: bool = False) -> dict:
 
 def _address_owners(nodes: list[dict]) -> dict[str, str]:
     """ip -> node label, from every address the inventory knows (CML, config,
-    device reads, manifest).  Used to name traceroute hops."""
+    device reads, manifest).  Used to name traceroute hops and to match
+    captured packets to their sender.
+
+    Live (device-read) addresses are taken from EVERY node before any stored
+    one. Deep dive 2026-09-28: CML's stored configs for the edge routers and
+    Firewall-DR-2 still carry old point-to-point/tunnel addressing, e.g.
+    EdgeRouter-DR-1's stored Gi0/5 claims 10.255.3.1, which is live on
+    EdgeRouter-HQ-1's Tunnel0. Taking each node's live-then-stored in turn
+    let whichever node came first in the list win."""
     out: dict[str, str] = {}
     for n in nodes:
         for a in (n.get("live") or {}).get("addresses") or []:
             out.setdefault(a["ip"], n["label"])
+    for n in nodes:
         for a in n.get("addresses") or []:
             if a.get("kind") and "virtual" in str(a.get("kind")):
                 continue          # an HSRP VIP belongs to whichever peer is active
             out.setdefault(a["value"], n["label"])
     return out
+
+
+def _address_holders(nodes: list[dict], ip: str) -> tuple[list[str], str | None]:
+    """Every node that can answer `ip`, and why it is shared: "hsrp" (a
+    gateway VIP the active router answers), "anycast" (several real copies,
+    the network picks by routing), or None for an ordinary single owner.
+    A stored-config claim is ignored when another node holds the address
+    live - that is stale config, not sharing (see `_address_owners`)."""
+    live = {n["label"] for n in nodes
+            if ip in {a.get("ip") for a in (n.get("live") or {}).get("addresses") or []}}
+    stored = {n["label"]: str(a.get("kind") or "") for n in nodes
+              for a in n.get("addresses") or [] if a.get("value") == ip}
+    hsrp = {k for k, kind in stored.items() if "virtual" in kind}
+    if len(hsrp) > 1:
+        return sorted(hsrp), "hsrp"
+    holders = sorted(live or set(stored))
+    return holders, ("anycast" if len(holders) > 1 else None)
 
 
 # --------------------------------------------------------------------------
@@ -269,6 +296,7 @@ def api_trace():
     if not source["up"]:
         return jsonify({"error": f"{source['label']} is {source['state'] or 'not running'}."}), 409
     virtual_fqdn = None
+    vip_holders, vip_kind = [], None
     if virtual and virtual.get("ip"):
         # Static (anycast) failover: the address never changes, so there is
         # nothing to resolve. Whichever real node currently holds it is found
@@ -280,9 +308,7 @@ def api_trace():
         # Every node that holds the VIP (anycast: one per site). The trace proves
         # whichever copy the network actually delivers to (2026-09-28: the VPN
         # laptop reaches the HQ copy; the address map alone named the DR one).
-        vip_holders = [n["label"] for n in inv["nodes"]
-                       if target_ip in {a.get("ip") for a in (n.get("live") or {}).get("addresses") or []}
-                       | {a.get("value") for a in n.get("addresses") or []}]
+        vip_holders, vip_kind = _address_holders(inv["nodes"], target_ip)
     elif virtual:
         # DNS-based failover: which real backend answers depends on which way
         # the record currently points, so it can only be found by resolving
@@ -295,6 +321,10 @@ def api_trace():
         target_ip = body.get("target_ip") or target.get("live_ip") or target.get("primary_ip")
         if not target_ip:
             return jsonify({"error": f"No address known for {target['label']}."}), 400
+        # Deep dive 2026-09-28: a gateway VIP (HSRP) is answered by whichever
+        # peer is active, not by the node the user clicked - trace it like
+        # anycast so the capture follows the packets to the real answerer.
+        vip_holders, vip_kind = _address_holders(inv["nodes"], target_ip)
     # Confirmed live 2026-09-24: a node whose live harvest never ran (or was
     # lost - it's in-memory, so a dev-server restart empties it) has no
     # live_ip, and everything then falls back to primary_ip/cml-config -
@@ -323,7 +353,8 @@ def api_trace():
                                "capture": bool(body.get("capture")), "virtual_fqdn": virtual_fqdn,
                                "virtual_label": virtual["label"] if virtual else None,
                                "stale_target": stale_target,
-                               "vip_holders": vip_holders if virtual and virtual.get("ip") else None,
+                               "vip_holders": vip_holders if len(vip_holders) > 1 else None,
+                               "vip_kind": vip_kind,
                                "vantage": vantage, "owners": owners})
     job = pathtrace.get(job_id)
     return jsonify({"job_id": job_id, "eta_seconds": job["eta_seconds"], "target_ip": target_ip})
@@ -418,6 +449,21 @@ def api_export_csv():
         "Content-Disposition": f'attachment; filename="p45-inventory-{stamp}.csv"'})
 
 
+def _auto_harvest() -> None:
+    """Read every device's real addresses once at start-up. The harvest is
+    in memory only, so without this each launch (every NetView.exe start)
+    traced against CML's STORED configs - measured 2026-09-28 to be stale
+    for the four edge routers, Firewall-DR-2 and HomeRouter-WFH."""
+    time.sleep(2)
+    try:
+        r = features.harvest_start(_inventory()["nodes"])
+        print("start-up harvest:", r.get("error") or f"reading {r.get('total')} devices", flush=True)
+    except Exception as e:                      # noqa: BLE001 - never stop the UI over it
+        print(f"start-up harvest failed: {type(e).__name__}: {e}", flush=True)
+
+
 if __name__ == "__main__":
+    if os.environ.get("NETVIEW_NO_AUTO_HARVEST") != "1":
+        threading.Thread(target=_auto_harvest, daemon=True).start()
     print(f"NetView on http://127.0.0.1:{PORT}")
     app.run(host="127.0.0.1", port=PORT, debug=False, threaded=True)

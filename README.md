@@ -118,6 +118,26 @@ right.
    (or, for an IOS/ASA source, a Linux node at the same site) and flags an
    answer that differs from the address being traced.
 
+**Verified (capture) is the default mode** (2026-09-28): the counter estimate
+was wrong in 5 of 6 unusual scenarios, so Quick is an opt-in rough guess.
+Verified captures every candidate link and proves the path from the test's
+own packets:
+
+- the drawn path is the **requests'** route; when replies come back another
+  way (ECMP) the return route is reported separately;
+- **NAT is followed**: past a PAT/NAT device (ASA PAT, the home router, static
+  NAT for the public website) packets are matched by ICMP id or, if the id was
+  rewritten, by sequence numbers and timing, and a finding names the
+  translator and the translated address;
+- **shared addresses** (HSRP gateway VIPs, the anycast website) end at the
+  node that actually answered;
+- a link whose capture CML failed to start is bridged only when it is the sole
+  link joining proven segments, drawn dotted as "not captured (inferred)".
+
+The live address harvest runs automatically when NetView starts
+(`NETVIEW_NO_AUTO_HARVEST=1` turns that off); until it finishes, traces use
+CML's stored configs and say so.
+
 If the target does not answer, the counters still show how far the requests
 got ("requests got as far as X"). Every run is kept for the session, and a run
 whose path differs from the previous one says what changed. Tick **Repeat**
