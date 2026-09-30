@@ -40,13 +40,15 @@
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
     --bar: #24272c; --tool: #2a2e33; --panel: #1e2125; --canvas: #1a1c1f;
-      --line: #3a3f45; --line2: #2e3237; --sel: #6aa1ea; --selbg: #263a55; --hover: #262a2f;
+    --ink: #e4e7eb; --ink2: #b3bac2; --ink3: #8a939c;
+    --line: #3a3f45; --line2: #2e3237; --sel: #6aa1ea; --selbg: #263a55; --hover: #262a2f;
     --dev: #4b7fb6; --devoff: #555c64; --wire: #6c747c;
     --ok: #6cc07a; --warn: #e0a54a; --bad: #ef6f69; --infobg: #3a3220; --infoln: #5e5130;
   }
 }
 :root[data-theme="dark"] {
   --bar: #24272c; --tool: #2a2e33; --panel: #1e2125; --canvas: #1a1c1f;
+  --ink: #e4e7eb; --ink2: #b3bac2; --ink3: #8a939c;
   --line: #3a3f45; --line2: #2e3237; --sel: #6aa1ea; --selbg: #263a55; --hover: #262a2f;
   --dev: #4b7fb6; --devoff: #555c64; --wire: #6c747c;
   --ok: #6cc07a; --warn: #e0a54a; --bad: #ef6f69; --infobg: #3a3220; --infoln: #5e5130;
@@ -325,3 +327,33 @@ tr.pkt-row.hl td { background: var(--selbg); }
   .labname, #sel-line, #src-line, .menu-note { display: none; }
   .center { --pane-h: 40vh; }
 }
+
+/* ---- disaster traces (2026-09-29) ---- */
+.dz-toggle.on { color: var(--bad); border-color: var(--bad); font-weight: 600; }
+button.danger { background: var(--bad); border-color: var(--bad); color: #fff; }
+.dz-panel { margin: 10px 14px 4px; border: 1px solid var(--line); border-left: 3px solid var(--bad); background: var(--panel); padding: 10px 12px; display: grid; gap: 8px; }
+.dz-head { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+.dz-head .linkish { margin-left: auto; }
+.dz-chips { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.dz-chip { display: inline-flex; align-items: center; gap: 2px; background: var(--hover); border: 1px solid var(--line); border-radius: 3px; padding: 1px 2px 1px 7px; font-size: 12px; }
+.dz-row { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+.dz-row input[type=search] { width: 180px; max-width: 100%; }
+.dz-list { max-height: 220px; overflow-y: auto; border: 1px solid var(--line2); padding: 6px 8px; display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 4px 16px; }
+.dz-site-h { font-weight: 600; color: var(--ink2); font-size: 12px; margin: 2px 0; text-transform: uppercase; letter-spacing: .04em; }
+.dz-item { display: block; font-size: 12.5px; padding: 1px 0; cursor: pointer; }
+.dz-warn { color: var(--warn); font-size: 12.5px; }
+.dz-confirm { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; background: var(--infobg); border: 1px solid var(--infoln); padding: 8px 10px; }
+.dz-confirm > div { flex: 1 1 260px; }
+.dz-result { margin: 14px 14px 10px; border-top: 2px solid var(--bad); padding-top: 8px; display: grid; gap: 6px; }
+.dz-title { font-weight: 600; font-size: 14px; }
+.dz-outage { display: grid; gap: 4px; }
+.dz-strip { display: flex; flex-wrap: wrap; gap: 1px; }
+.dz-strip i { width: 7px; height: 16px; background: var(--devoff); display: block; }
+.dz-strip i.ok { background: var(--ok); }
+.dz-strip i.lost { background: var(--bad); }
+.dz-strip i.mark { box-shadow: -2px 0 0 var(--ink); }
+.dz-changed { display: grid; gap: 2px; font-size: 13px; }
+.node.dead .body { fill: var(--devoff); }
+.node.dead .lbl { text-decoration: line-through; fill: var(--bad); }
+.dz-banner { padding: 7px 14px; display: flex; gap: 12px; align-items: center; flex-wrap: wrap; font-size: 13px; background: var(--infobg); border-bottom: 1px solid var(--infoln); color: var(--ink); }
+.dz-banner.stuck { border-bottom: 2px solid var(--bad); }

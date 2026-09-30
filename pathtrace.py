@@ -639,6 +639,9 @@ def submit(spec: dict) -> str:
            "created": datetime.now(timezone.utc).isoformat(), "result": None, "error": None,
            "eta_seconds": int(probe_engine.COST_OPEN_S + BASELINE_S + 3 * probe_engine.COST_ATTACH_S
                               + count * per + 12 + (8 if spec.get("capture") else 0))}
+    if spec.get("disaster"):
+        # two traces + power-off + outage window + restore/boot
+        job["eta_seconds"] = job["eta_seconds"] * 2 + spec["disaster"]["settle_s"] + 60 + 90
     with _jobs_lock:
         _jobs[job_id] = job
         while len(_jobs) > 100:
@@ -674,7 +677,11 @@ def _run(job_id: str) -> None:
                 cml = cml_api.connect()
                 _set(job_id, status="running", stage="opening console session")
                 with Console(cml) as con:
-                    result = _execute(job_id, cml, con, spec)
+                    if spec.get("disaster"):
+                        import disaster          # noqa: PLC0415 - optional feature module
+                        result = disaster.run(job_id, cml, con, spec, _execute, _set, spec["respec"])
+                    else:
+                        result = _execute(job_id, cml, con, spec)
             finally:
                 for lk in reversed(locks):
                     lk.release()
@@ -866,6 +873,7 @@ def _execute(job_id: str, cml, con: Console, spec: dict) -> dict:
     out = analyse(nodes, src, dst, ip, count, burst, raw_delta, base, base_dt, dt, cand, trace,
                   owners, pre, answering)
     out["retried"] = retried
+    out["target_ip"] = ip                  # the address actually pinged (resolved for DNS failover)
     out["mode"] = "counters"
     if capture:
         _set(job_id, stage="collecting packet capture")
@@ -962,6 +970,15 @@ def _execute(job_id: str, cml, con: Console, spec: dict) -> dict:
                                   "the one this source actually reaches.")
     if resolved_note:
         out["findings"].insert(0, resolved_note)
+    try:
+        import disaster          # noqa: PLC0415
+        act = disaster.status()["active"]
+    except Exception:            # noqa: BLE001
+        act = None
+    if act and not spec.get("disaster") and not spec.get("_in_disaster"):
+        out["findings"].insert(0, f"A disaster test is running: {', '.join(act['nodes'])} "
+                                  f"{'is' if len(act['nodes']) == 1 else 'are'} deliberately powered off, "
+                                  "so this result reflects a degraded network.")
     if spec.get("stale_target"):
         out["findings"].insert(0, f"{dst['label']} has no live-harvested address right now - "
                                   f"{ip} came from CML's stored config, which can silently drift "

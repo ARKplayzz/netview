@@ -33,6 +33,7 @@ import cml_api          # noqa: E402
 import cmlsource        # noqa: E402
 import features         # noqa: E402
 import model            # noqa: E402
+import disaster         # noqa: E402
 import pathtrace        # noqa: E402
 import probes           # noqa: E402
 
@@ -219,6 +220,14 @@ def _inventory(force: bool = False) -> dict:
         "manifest": model.MANIFEST.exists(),
     }
     inv["virtual_targets"] = VIRTUAL_TARGETS
+    # Zones from the manifest (label globs), resolved to node labels - the
+    # disaster picker's "quick add" (2026-09-29).
+    import fnmatch
+    zones = (model.load_manifest().get("zones") or {}) if model.MANIFEST.exists() else {}
+    labels = [n["label"] for n in inv["nodes"]]
+    inv["zones"] = [{"name": zn, "nodes": sorted({l for l in labels for g in (z.get("match_labels") or [])
+                                                  if fnmatch.fnmatch(l, g)})}
+                    for zn, z in zones.items()]
     inv["layers"].append({"key": "virtual", "title": "Virtual (DNS/anycast failover)"})
     return inv
 
@@ -277,9 +286,10 @@ def api_inventory():
     return jsonify(_inventory(force=request.args.get("fresh") == "1"))
 
 
-@app.post("/api/trace")
-def api_trace():
-    body = request.get_json(force=True) or {}
+def _trace_spec(body: dict) -> tuple[dict | None, tuple[dict, int] | None]:
+    """The trace job spec for a request body, or (None, (error, status)).
+    Split out of api_trace (2026-09-29) so a disaster job can rebuild it from a
+    fresh inventory after the power-off."""
     inv = _inventory(force=True)       # trace against the lab as it is right now
     by_label = {n["label"]: n for n in inv["nodes"]}
     owners = _address_owners(inv["nodes"])
@@ -289,12 +299,12 @@ def api_trace():
     if not target:
         virtual = next((v for v in VIRTUAL_TARGETS if v["label"] == body.get("target")), None)
     if not source or not (target or virtual):
-        return jsonify({"error": "unknown source or target node"}), 404
+        return None, ({"error": "unknown source or target node"}, 404)
     if not source["can_source_probe"]:
-        return jsonify({"error": f"{source['label']} has no console this tool can drive, "
-                                 f"so it cannot send the test traffic."}), 400
+        return None, ({"error": f"{source['label']} has no console this tool can drive, "
+                                 f"so it cannot send the test traffic."}, 400)
     if not source["up"]:
-        return jsonify({"error": f"{source['label']} is {source['state'] or 'not running'}."}), 409
+        return None, ({"error": f"{source['label']} is {source['state'] or 'not running'}."}, 409)
     virtual_fqdn = None
     vip_holders, vip_kind = [], None
     if virtual and virtual.get("ip"):
@@ -309,6 +319,12 @@ def api_trace():
         # whichever copy the network actually delivers to (2026-09-28: the VPN
         # laptop reaches the HQ copy; the address map alone named the DR one).
         vip_holders, vip_kind = _address_holders(inv["nodes"], target_ip)
+        # A powered-off holder answers nothing (disaster traces, 2026-09-30:
+        # the after-trace named the downed DR web server as the answerer).
+        up_holders = [h for h in vip_holders if (by_label.get(h) or {}).get("up")]
+        if up_holders and target.get("label") not in up_holders:
+            target = by_label.get(up_holders[0]) or target
+        vip_holders = up_holders or vip_holders
     elif virtual:
         # DNS-based failover: which real backend answers depends on which way
         # the record currently points, so it can only be found by resolving
@@ -320,11 +336,12 @@ def api_trace():
     else:
         target_ip = body.get("target_ip") or target.get("live_ip") or target.get("primary_ip")
         if not target_ip:
-            return jsonify({"error": f"No address known for {target['label']}."}), 400
+            return None, ({"error": f"No address known for {target['label']}."}, 400)
         # Deep dive 2026-09-28: a gateway VIP (HSRP) is answered by whichever
         # peer is active, not by the node the user clicked - trace it like
         # anycast so the capture follows the packets to the real answerer.
         vip_holders, vip_kind = _address_holders(inv["nodes"], target_ip)
+        vip_holders = [h for h in vip_holders if (by_label.get(h) or {}).get("up")] or vip_holders
     # Confirmed live 2026-09-24: a node whose live harvest never ran (or was
     # lost - it's in-memory, so a dev-server restart empties it) has no
     # live_ip, and everything then falls back to primary_ip/cml-config -
@@ -347,17 +364,69 @@ def api_trace():
     if virtual_fqdn or (body.get("dns") and (target.get("dns") or {}).get("fqdn")):
         vantage = probes.pick_dns_vantage(source, inv["nodes"], source.get("site"))
         if virtual_fqdn and not vantage:
-            return jsonify({"error": f"No running Linux node available to resolve {virtual_fqdn}."}), 409
-    job_id = pathtrace.submit({"source": source, "target": target, "target_ip": target_ip,
+            return None, ({"error": f"No running Linux node available to resolve {virtual_fqdn}."}, 409)
+    return ({"source": source, "target": target, "target_ip": target_ip,
                                "count": count, "nodes": inv["nodes"], "dns": bool(body.get("dns")),
                                "capture": bool(body.get("capture")), "virtual_fqdn": virtual_fqdn,
                                "virtual_label": virtual["label"] if virtual else None,
                                "stale_target": stale_target,
                                "vip_holders": vip_holders if len(vip_holders) > 1 else None,
                                "vip_kind": vip_kind,
-                               "vantage": vantage, "owners": owners})
+                               "vantage": vantage, "owners": owners}), None
+
+
+@app.post("/api/trace")
+def api_trace():
+    body = request.get_json(force=True) or {}
+    spec, err = _trace_spec(body)
+    if err:
+        return jsonify(err[0]), err[1]
+    warnings: list[str] = []
+    dz = body.get("disaster") or {}
+    if dz.get("nodes"):
+        by_label = {n["label"]: n for n in spec["nodes"]}
+        error, warnings = disaster.validate(list(dz["nodes"]), by_label, spec["source"]["label"],
+                                            (spec.get("target") or {}).get("label"))
+        if error:
+            return jsonify({"error": error}), 409
+        spec["disaster"] = {"nodes": list(dz["nodes"]),
+                            "settle_s": max(15, min(int(dz.get("settle_s", 30)), 120)),
+                            "restore": bool(dz.get("restore", True)), "warnings": warnings}
+        plain = {k: v for k, v in body.items() if k != "disaster"}
+
+        def respec():
+            s2, e2 = _trace_spec(plain)
+            if e2:
+                raise RuntimeError(e2[0].get("error"))
+            s2["_in_disaster"] = True
+            return s2
+        spec["respec"] = respec
+    job_id = pathtrace.submit(spec)
     job = pathtrace.get(job_id)
-    return jsonify({"job_id": job_id, "eta_seconds": job["eta_seconds"], "target_ip": target_ip})
+    return jsonify({"job_id": job_id, "eta_seconds": job["eta_seconds"], "target_ip": spec["target_ip"],
+                    "warnings": warnings})
+
+
+@app.post("/api/trace/<job_id>/cancel")
+def api_trace_cancel(job_id: str):
+    return jsonify({"cancelled": disaster.cancel(job_id)})
+
+
+@app.get("/api/disaster")
+def api_disaster():
+    return jsonify(disaster.status())
+
+
+@app.post("/api/disaster/restore")
+def api_disaster_restore():
+    st = disaster.status()
+    if st["active"]:
+        return jsonify({"error": "a disaster test is still running; it restores its own nodes"}), 409
+    rec = st["interrupted"]
+    if not rec:
+        return jsonify({"restored": {}})
+    res = disaster.restore(cml_api.connect(), rec["nodes"])
+    return jsonify({"restored": res})
 
 
 @app.get("/api/trace/<job_id>")

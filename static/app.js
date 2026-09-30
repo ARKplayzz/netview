@@ -97,6 +97,7 @@ async function loadInventory(fresh) {
 async function poll(fresh) {
   try {
     await loadInventory(fresh);
+    if (typeof pollDisaster === 'function') pollDisaster();
     countdown = REFRESH_S;
     renderPathBody(); renderNodeList(); renderStatus(); renderPaneTabs();
     if (!$('#path-head').contains(document.activeElement)) renderPathHead();
@@ -975,7 +976,10 @@ function nodeListRow(n) {
  * shows the links the packets DID cross, at layer 2 as well as layer 3.  Run
  * it, stop the active core switch in CML, run it again: the path moves. */
 const trace = { source: null, target: null, ip: null, count: 100, repeat: false, dns: false,
-                capture: true, job: null, stage: '', result: null, cand: null, history: [], error: null };
+                capture: true, job: null, stage: '', result: null, cand: null, history: [], error: null,
+                // Disaster trace (2026-09-29, docs/disaster-spec.md): nodes to power off
+                // between a baseline trace and a second one.
+                disaster: { open: false, nodes: [], settle: 30, restore: true, confirming: false, filter: '' } };
 let pick = null;           // null | 'source' | 'target'
 
 function startPick(src) {
@@ -1046,8 +1050,8 @@ function setTraceEnds(src, dst, ip) {
 
 /* Every node and link on SOME shortest path, over running nodes and started
  * links: the set of routes the traffic could take. */
-function candidates(src, dst) {
-  const up = (n) => n && (n.up || n.label === src);
+function candidates(src, dst, exclude) {
+  const up = (n) => n && (n.up || n.label === src) && !(exclude && exclude.has(n.label));
   const adj = new Map();
   NODES.forEach((n) => {
     if (!up(n)) return;
@@ -1093,10 +1097,15 @@ async function runTrace() {
     const r = await fetch('/api/trace', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ source: trace.source, target: trace.target, target_ip: trace.ip,
-                             count: trace.count, dns: trace.dns, capture: trace.capture }),
+                             count: trace.count, dns: trace.dns, capture: trace.capture,
+                             disaster: trace.disaster.nodes.length ? { nodes: trace.disaster.nodes,
+                               settle_s: trace.disaster.settle, restore: trace.disaster.restore } : undefined }),
     });
     const j = await r.json();
     if (!r.ok) throw new Error(j.error);
+    trace.job.id = j.job_id;
+    trace.job.disaster = !!trace.disaster.nodes.length;
+    trace.disaster.confirming = false;
     trace.job.eta = j.eta_seconds || 30;
     // Capture mode polls faster: CML lets a link's packets be read WHILE its
     // capture is still running (verified live), so each tick can flash the
@@ -1129,6 +1138,10 @@ async function runTrace() {
     }
   } catch (e) { trace.error = String(e.message || e); }
   trace.job = null;
+  // Draw the result straight away; the inventory refresh below can take tens of
+  // seconds when CML is slow, and the page used to show neither the progress
+  // bar nor the result for that long (UI test 2026-09-30).
+  renderPathHead(); renderPathBody(); renderPaneTabs();
   await poll(false);           // the lab may have changed; refresh before drawing
   if (trace.source && trace.target) trace.cand = candidates(trace.source, effectiveTarget());
   renderPathHead(); renderPathBody(); renderPaneTabs();
@@ -1197,13 +1210,26 @@ function renderPathHead() {
   cnt.addEventListener('change', () => { trace.count = Math.max(20, Math.min(500, +cnt.value || 100)); });
   lc.appendChild(cnt);
   head.appendChild(lc);
-  const run = el('button', 'default', trace.job ? 'Tracing...' : 'Run trace');
+  const dzOn = trace.disaster.nodes.length > 0;
+  const run = el('button', 'default', trace.job ? 'Tracing...' : dzOn ? 'Run disaster trace' : 'Run trace');
   // A DNS failover name has no address until the trace resolves it, live, from
   // the source's own site - so it is runnable without one.
   run.disabled = !!trace.job || !trace.source || !trace.target ||
     (!trace.ip && !(BY.get(trace.target) || {}).virtual);
-  run.addEventListener('click', runTrace);
+  run.addEventListener('click', () => {
+    if (trace.disaster.nodes.length) {        // confirmation lives in the disaster panel
+      trace.disaster.open = true; trace.disaster.confirming = true;
+      renderPathBody();
+      return;
+    }
+    runTrace();
+  });
   head.appendChild(run);
+  const dzb = el('button', dzOn ? 'dz-toggle on' : 'dz-toggle', dzOn ? `Disaster (${trace.disaster.nodes.length})` : 'Disaster...');
+  dzb.title = 'Power off chosen nodes between two traces and compare the results';
+  dzb.disabled = !!trace.job || !trace.source || !trace.target;
+  dzb.addEventListener('click', () => { trace.disaster.open = !trace.disaster.open; trace.disaster.confirming = false; renderPathHead(); renderPathBody(); });
+  head.appendChild(dzb);
   const dl = el('label');
   const dc = el('input'); dc.type = 'checkbox'; dc.checked = trace.dns;
   dc.disabled = !t || !(t.dns || {}).fqdn;
@@ -1230,6 +1256,7 @@ function renderPathHead() {
   head.appendChild(ml);
   const rl = el('label');
   const rc = el('input'); rc.type = 'checkbox'; rc.checked = trace.repeat;
+  rc.disabled = trace.disaster.nodes.length > 0;
   rc.addEventListener('change', () => { trace.repeat = rc.checked; if (rc.checked && !trace.job) runTrace(); });
   rl.appendChild(rc); rl.appendChild(document.createTextNode('Repeat'));
   rl.title = 'Run again 5 s after each trace finishes. Leave it on while you stop and start nodes in CML to watch the path move.';
@@ -1250,6 +1277,7 @@ function renderPathBody() {
   }
   const res = resultFor();
   const cand = trace.cand || { nodes: [], links: [], paths: 0 };
+  if (trace.disaster.open && !trace.job) body.appendChild(disasterPanel());
   const top = el('div', 'path-status');
   if (trace.job) {
     const st = el('span', 's-dim', trace.stage);
@@ -1261,6 +1289,16 @@ function renderPathBody() {
     fill.style.width = pct();
     const iv = setInterval(() => { if (!fill.isConnected || !trace.job) clearInterval(iv); else fill.style.width = pct(); }, 500);
     top.appendChild(bar);
+    if (trace.job.disaster && trace.job.id) {
+      const cx = el('button', 'linkish', 'Cancel');
+      cx.title = 'Stop after the current step. Powered-off nodes are always started again.';
+      cx.addEventListener('click', async () => {
+        cx.disabled = true; cx.textContent = 'Cancelling (nodes will be restored)...';
+        try { await fetch(`/api/trace/${trace.job.id}/cancel`, { method: 'POST' }); } catch (e) { /* next poll shows it */ }
+      });
+      top.appendChild(document.createTextNode(' '));
+      top.appendChild(cx);
+    }
     if (trace.capture) {
       const lc = el('span', 's-dim');
       lc.dataset.liveCount = '1';
@@ -1304,6 +1342,7 @@ function renderPathBody() {
     res.findings.forEach((x) => f.appendChild(el('div', null, x)));
     if (res.findings.length) body.appendChild(f);
     if (res.packet_log && res.packet_log.length) body.appendChild(packetLogPanel(res));
+    if (res.disaster) body.appendChild(disasterResult(res, body.clientWidth));
   }
   markPathSelection();
 }
@@ -1395,7 +1434,8 @@ function hoverPath(label) {
  * source.  Parallel boxes in one column are redundant alternatives.  After a
  * failover, the previous path's nodes stay on the diagram, dotted, so the
  * swap is visible rather than just described. */
-function pathDiagram(res, cand, width) {
+function pathDiagram(res, cand, width, opts) {
+  const down = (opts && opts.down) || new Set();
   const set = new Set(cand.nodes || []);
   const used = res ? res.links.filter((l) => l.use !== 'none') : [];
   if (res) { res.path.forEach((x) => set.add(x)); used.forEach((l) => { set.add(l.a); set.add(l.b); }); }
@@ -1484,7 +1524,8 @@ function pathDiagram(res, cand, width) {
     const n = BY.get(u);
     if (!n) return;
     const cls = ['node'];
-    if (!n.up) cls.push('off');
+    if (!n.up || down.has(u)) cls.push('off');
+    if (down.has(u)) cls.push('dead');
     if (res && !onPath.has(u) && !used.some((l) => l.a === u || l.b === u)) cls.push('t-idle');
     if (prevOnly.has(u)) cls.push('t-was');
     if (u === trace.source || u === dstLabel) cls.push('t-end');

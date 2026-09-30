@@ -6,3 +6,7 @@ run.err
 # NetView.exe build output - the exe ships as a GitHub Release asset, not in git
 packaging/build/
 packaging/dist/
+
+# UI test artefacts
+tests/ui_*.png
+tests/*.log

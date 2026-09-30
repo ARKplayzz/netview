@@ -138,6 +138,32 @@ The live address harvest runs automatically when NetView starts
 (`NETVIEW_NO_AUTO_HARVEST=1` turns that off); until it finishes, traces use
 CML's stored configs and say so.
 
+### Disaster traces
+
+After choosing From and To, press **Disaster...** and tick the nodes to take
+offline (or add a whole zone). Pressing **Run disaster trace** asks for an
+in-page confirmation. NetView then:
+
+1. runs the trace as normal (the baseline);
+2. powers the chosen nodes off in CML;
+3. pings the target once a second, drawn as an outage strip, until 5 in a row
+   answer or the wait (15-120 s) runs out;
+4. traces again on the degraded network;
+5. powers the nodes back on and waits for them to boot.
+
+The result shows the baseline, then an "After the disaster" section with the
+outage figures, what changed (path, verdict, replies, who answered) and the
+second path diagram with the downed nodes crossed out.
+
+Safety: the source can't be selected; only running nodes are listed; one
+disaster at a time; restore always runs, even on error or **Cancel**. The nodes
+are recorded to `%LOCALAPPDATA%\NetView\disaster.json` before anything is
+powered off. If NetView is killed mid-test, the next start shows a banner with
+**Restore now**. Every open NetView page shows a banner while a disaster is
+running, and ordinary traces started meanwhile say the network is deliberately
+degraded. Spec: `docs/disaster-spec.md`. Tests: `tests/test_disaster.py`
+(offline) and `tests/ui_disaster_e2e.py --run` (real browser, real disaster).
+
 If the target does not answer, the counters still show how far the requests
 got ("requests got as far as X"). Every run is kept for the session, and a run
 whose path differs from the previous one says what changed. Tick **Repeat**
