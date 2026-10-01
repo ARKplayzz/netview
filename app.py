@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import os
 import sys
+import copy
 import threading
 import time
 from datetime import datetime, timezone
@@ -59,9 +60,12 @@ VIRTUAL_TARGETS = [
 ]
 
 PORT = 5057
-TOPOLOGY_TTL_S = 5       # how long a live topology pull is reused; short, so a
-                         # change made in CML shows on the page's next refresh
+TOPOLOGY_TTL_S = 30      # the topology carries every node's stored config
+                         # (~280 KB); it changes only when the lab is edited,
+                         # and forced reads (traces, ?fresh=1) still pull it live
 STATE_TTL_S = 4          # how long node states are reused
+INVENTORY_TTL_S = 10     # one built inventory serves every tab refreshing
+                         # within this window (see _inventory)
 
 _cache: dict = {"topology": None, "topology_at": 0, "topology_source": None,
                 "states": None, "states_at": 0, "error": None}
@@ -87,7 +91,7 @@ def _fetch_topology(force: bool = False) -> tuple[dict, str, str | None]:
 
     topo, source, error = None, None, None
     try:
-        cml = cml_api.connect()
+        cml = cml_api.shared()
         topo = cml.topology()
         source = "live"
     except Exception as e:                     # noqa: BLE001
@@ -112,10 +116,14 @@ def _fetch_states(force: bool = False) -> tuple[dict[str, str], str | None]:
         if not force and _cache["states"] is not None and _now() - _cache["states_at"] < STATE_TTL_S:
             return _cache["states"], None
     try:
-        cml = cml_api.connect()
-        full = cml.nodes_full()
+        # The same nodes?data=true read cmlsource makes for the inventory -
+        # one request, not two (2026-09-30).
+        lab = cmlsource.fetch(cml_api.shared(), force)
+        full = lab["nodes_full"]
+        err = lab["reads"].get("nodes")
+        if err:
+            raise RuntimeError(err)
         states = {n["label"].rstrip(): n.get("state") for n in full.values()}
-        err = None
     except Exception as e:                     # noqa: BLE001
         states, err = {}, f"{type(e).__name__}: {e}"
     with _cache_lock:
@@ -163,7 +171,32 @@ def _live_primary(n: dict) -> str | None:
     return addrs[0]["ip"]
 
 
+_inv_cache: dict = {"data": None, "at": 0.0}
+_inv_lock = threading.Lock()
+
+
 def _inventory(force: bool = False) -> dict:
+    """The built inventory, shared by every caller.
+
+    Single-flight (2026-09-30): each browser tab refreshes every 15 s and
+    every refresh used to rebuild from CML on its own - topology, node states
+    twice, layer-3 addresses, links and three logins, ~4-5 s of controller
+    work. A few open tabs kept the CML controller saturated (every API call
+    3-11 s, so packet captures couldn't start in time). Now concurrent
+    refreshes wait for the one in flight and reuse it for INVENTORY_TTL_S.
+    A forced read always builds fresh, after this call arrived, and the
+    caller gets its own copy, so a trace may change it freely."""
+    with _inv_lock:
+        cached, at = _inv_cache["data"], _inv_cache["at"]
+        if not force and cached is not None and _now() - at < INVENTORY_TTL_S:
+            return cached
+        started = _now()
+        inv = _build_inventory(force)
+        _inv_cache.update(data=inv, at=started)
+    return copy.deepcopy(inv) if force else inv
+
+
+def _build_inventory(force: bool = False) -> dict:
     topo, source, topo_error = _fetch_topology(force)
     states, state_error = _fetch_states(force)
     inv = model.build_inventory(topology=topo)
@@ -174,8 +207,8 @@ def _inventory(force: bool = False) -> dict:
     lab_at = None
     if source == "live":
         try:
-            cml = cml_api.connect()
-            lab = cmlsource.fetch(cml, force)
+            cml = cml_api.shared()
+            lab = cmlsource.fetch(cml)       # just read by _fetch_states (same force)
             configs, cfg_err = cmlsource.node_configs(cml, topo.get("nodes", []), force)
             cml_reads = dict(lab["reads"], topology=None, configs=cfg_err)
             lab_at = lab["at"]
@@ -425,7 +458,7 @@ def api_disaster_restore():
     rec = st["interrupted"]
     if not rec:
         return jsonify({"restored": {}})
-    res = disaster.restore(cml_api.connect(), rec["nodes"])
+    res = disaster.restore(cml_api.shared(), rec["nodes"])
     return jsonify({"restored": res})
 
 
@@ -472,7 +505,7 @@ def api_console_log(label: str):
     line = int(request.args.get("line", 0))
     lines = max(1, min(int(request.args.get("lines", 60)), 400))
     try:
-        cml = cml_api.connect()
+        cml = cml_api.shared()
         node = next((n for n in cml.nodes_full().values()
                      if n["label"].rstrip() == label), None)
         if not node:

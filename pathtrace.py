@@ -674,7 +674,7 @@ def _run(job_id: str) -> None:
             for lk in locks:
                 lk.acquire()
             try:
-                cml = cml_api.connect()
+                cml = cml_api.shared()
                 _set(job_id, status="running", stage="opening console session")
                 with Console(cml) as con:
                     if spec.get("disaster"):

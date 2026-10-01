@@ -109,7 +109,7 @@ def _matrix_eta(count: int) -> int:
 def _matrix_run(count: int) -> None:
     defs = matrix_definition()
     try:
-        cml = cml_api.connect()
+        cml = cml_api.shared()
         # State check BEFORE attaching.  A stopped node has no console on
         # the terminal server at all, so attaching to one spends the full
         # 90s retry loop to learn what one REST call says instantly — the
@@ -159,7 +159,7 @@ def _matrix_run(count: int) -> None:
             if not bucket:
                 return
             with probe_engine._CONSOLE_SLOTS:
-                wcml = cml_api.connect()
+                wcml = cml_api.shared()
                 with Console(wcml) as con:
                     for i, d in bucket:
                         row = _matrix_one(con, d, count)
@@ -270,7 +270,7 @@ def read_lease(node: dict) -> dict:
         return {"error": f"{node['label']} is not running"}
 
     with probe_engine._CONSOLE_LOCK:
-        cml = cml_api.connect()
+        cml = cml_api.shared()
         with Console(cml) as con:
             raw = con.exec(node["label"], "show dhcp lease", timeout_ms=25000)
 
@@ -367,7 +367,7 @@ def _dns_audit_run(plan: list[dict]) -> None:
         # sessions never touch the same console (the measured-safe case).
         def worker(p: dict) -> None:
             with probe_engine._CONSOLE_SLOTS:
-                cml = cml_api.connect()
+                cml = cml_api.shared()
                 with Console(cml) as con:
                     # Batched: linux_exec re-attaches the console on EVERY
                     # call (~5-8s each), which is where the first audit's
@@ -548,7 +548,7 @@ def _harvest_run(targets: list[dict]) -> None:
             if not bucket:
                 return
             with probe_engine._CONSOLE_SLOTS:
-                cml = cml_api.connect()
+                cml = cml_api.shared()
                 with Console(cml) as con:
                     for n in bucket:
                         rec = _harvest_one(con, n)
@@ -586,7 +586,7 @@ def _harvest_windows(n: dict) -> list[dict]:
     if ws not in sys.path:
         sys.path.insert(0, ws)
     from win_console import WinConsole
-    w = WinConsole(cml_api.connect(), n["label"])
+    w = WinConsole(cml_api.shared(), n["label"])
     w.open()
     try:
         if not w.sac_prompt():
