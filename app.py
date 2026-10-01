@@ -357,8 +357,13 @@ def _trace_spec(body: dict) -> tuple[dict | None, tuple[dict, int] | None]:
         # whichever copy the network actually delivers to (2026-09-28: the VPN
         # laptop reaches the HQ copy; the address map alone named the DR one).
         vip_holders, vip_kind = _address_holders(inv["nodes"], target_ip)
-        if not vip_holders and virtual.get("holders"):
-            vip_holders, vip_kind = list(virtual["holders"]), "anycast"
+        # Declared holders always count, primary first (2026-10-01): the live
+        # harvest only sees whichever holders were up when it ran - an eval
+        # file server in its hourly shutdown then dropped out of the list, the
+        # trace saw ONE holder, and the reachable-holder fallback never ran.
+        if virtual.get("holders"):
+            vip_holders = list(dict.fromkeys(list(virtual["holders"]) + vip_holders))
+            vip_kind = "anycast" if len(vip_holders) > 1 else vip_kind
         # A powered-off holder answers nothing (disaster traces, 2026-09-30:
         # the after-trace named the downed DR web server as the answerer).
         up_holders = [h for h in vip_holders if (by_label.get(h) or {}).get("up")]
