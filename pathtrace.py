@@ -731,6 +731,25 @@ def _execute(job_id: str, cml, con: Console, spec: dict) -> dict:
         resolved_note = (f"{fqdn} currently resolves to {owner or ip} ({ip}), via "
                          f"{vantage['label']} asking {resolver}.")
     cand = candidates(nodes, src["label"], dst["label"])
+    # ANYCAST holder that is powered on but CUT OFF (2026-10-01, disaster WFH ->
+    # fileserver.p45.nz with HQ's edges + cores down): FileServer-HQ-1 stayed the
+    # assumed answerer because only powered-off holders are dropped, so the
+    # after-trace looked for paths to a server nothing can reach - 0 candidates,
+    # capture silently off, verdict "no complete path" while 0% of pings were
+    # lost (FileServer-DR-1 answered). A holder no running path reaches cannot be
+    # the one answering; take the first, in the declared (primary-first) order,
+    # that is reachable.
+    if not cand["paths"] and len(spec.get("vip_holders") or []) > 1:
+        by_label = {n["label"]: n for n in nodes}
+        for h in spec["vip_holders"]:
+            if h != dst["label"] and h in by_label:
+                alt = candidates(nodes, src["label"], h)
+                if alt["paths"]:
+                    resolved_note = ((resolved_note + " ") if resolved_note else "") + (
+                        f"{dst['label']} also holds {ip} but no running path reaches it; "
+                        f"the reachable holder is {h}.")
+                    dst, cand = by_label[h], alt
+                    break
 
     _set(job_id, stage="checking the target answers")
     pre = probe_engine._ping(con, src, ip, 3)
