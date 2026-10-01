@@ -47,12 +47,17 @@ app = Flask(__name__)
 # only: what answers depends on which real backend currently holds the name
 # or address, which is exactly the thing a trace to one is meant to reveal.
 VIRTUAL_TARGETS = [
-    {"label": "fileserver.p45.nz", "fqdn": "fileserver.p45.nz", "kind": "dns-failover",
-     "note": "DNS-based failover: normally FileServer-HQ-1, fails over to FileServer-DR-1 "
-             "on a failed SMB/445 health check (probed from DC-DR-1 every 1 min, "
-             "3-consecutive-check hysteresis both ways). The record itself flips, TTL 45s - "
-             "tracing this resolves it fresh from the source's own site resolver, the same way "
-             "a real client would, so the answer reflects whichever way it's currently pointed."},
+    # 2026-10-01: was a DNS-failover name (~205 s to move after HQ core loss). Now
+    # an internal anycast VIP (manifest internal_anycast:): HQ primary, DR's route
+    # floats at AD 250 and appears when HQ's /32 is withdrawn from OSPF. The
+    # Windows servers hold it as a SkipAsSource /32 that no harvest reports, so
+    # the members are named here, primary first.
+    {"label": "fileserver.p45.nz", "ip": "10.60.0.70", "kind": "anycast-vip",
+     "holders": ["FileServer-HQ-1", "FileServer-DR-1"],
+     "note": "Network-layer (anycast) failover: always 10.60.0.70. Normally FileServer-HQ-1; "
+             "when HQ's route to it is withdrawn from OSPF, FileServer-DR-1's takes over. "
+             "No DNS lookup involved. DC-DR-1's SMB health check still repoints the name at "
+             "FileServer-DR-1's real address if the HQ server dies while HQ's network is up."},
     {"label": "(company)website.p45.nz", "ip": "10.50.100.20", "kind": "anycast-vip",
      "note": "Network-layer (anycast) failover: always the same address, 10.50.100.20 - "
              "whichever site currently advertises the best route to it is who answers. "
@@ -352,6 +357,8 @@ def _trace_spec(body: dict) -> tuple[dict | None, tuple[dict, int] | None]:
         # whichever copy the network actually delivers to (2026-09-28: the VPN
         # laptop reaches the HQ copy; the address map alone named the DR one).
         vip_holders, vip_kind = _address_holders(inv["nodes"], target_ip)
+        if not vip_holders and virtual.get("holders"):
+            vip_holders, vip_kind = list(virtual["holders"]), "anycast"
         # A powered-off holder answers nothing (disaster traces, 2026-09-30:
         # the after-trace named the downed DR web server as the answerer).
         up_holders = [h for h in vip_holders if (by_label.get(h) or {}).get("up")]
