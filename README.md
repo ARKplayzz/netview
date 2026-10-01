@@ -9,24 +9,29 @@ a live address harvest, open-issue badges and CSV export.
 1. Go to **[Releases](https://github.com/ARKplayzz/netview/releases/latest)** and download **`NetView.exe`**.
 2. Double-click it. Windows may say *"Windows protected your PC"* (the file isn't
    code-signed): click **More info → Run anyway**.
-3. The first time, a black window asks four things — have them ready:
-   - the **CML server address** (e.g. `https://10.0.0.5`),
-   - your **CML username and password**,
-   - which **lab** to use (pick from the list it shows),
-   - the **lab device password** (ask the lab owner — NetView logs in to the routers to run traces).
+3. A black window offers **P45 resume** and picks it after 5 seconds (or press
+   **P**): it signs straight into the P45 lab with the sign-in built into the
+   exe, so there is nothing to type. Press **S** to use a different CML server
+   instead; that asks for its address, your login, which lab, and the lab
+   device password, and remembers them (press **R** next time to use them).
 4. NetView opens in your browser at **http://127.0.0.1:5057**. Keep the black
    window open while you use it; close it to stop NetView.
 
-Next time, just double-click — it remembers your answers. To change them, run
-`NetView.exe --setup` (or delete `%LOCALAPPDATA%\NetView\netview.env`). The
-download carries **no credentials**: yours are saved only on your own PC, in
-that file. Nothing to install and no Python needed; you must be on a network
-that can reach the CML server.
+`NetView.exe --p45` skips the menu; `NetView.exe --setup` re-enters your own
+server's details (saved only on your PC, in `%LOCALAPPDATA%\NetView\netview.env`).
+Nothing to install and no Python needed; you must be on a network that can
+reach the CML server.
+
+> The exe carries the **P45 lab's sign-in** (CML address, user, lab, device and
+> Windows console passwords). That is deliberate — it is a local CML instance —
+> so treat the download like the lab password. It carries no routing keys or VPN
+> pre-shared keys.
 
 Maintainers: build a new `NetView.exe` from the full project checkout with
 `py -3.11 netview/packaging/build_exe.py` (needs `pyinstaller flask pyyaml
-jinja2 paramiko`), then attach it to a new GitHub Release. The build refuses to
-run if any value from the project `.env` would end up inside the exe.
+jinja2 paramiko`), then attach it to a new GitHub Release. It bundles the P45
+resume preset from `.env` (`--no-p45` builds without it) and refuses to run if
+any `.env` value would end up anywhere else inside the exe.
 
 ## Running from source
 

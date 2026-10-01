@@ -194,6 +194,7 @@ function disasterResult(res, width) {
     const f = el('div', 'path-findings');
     (a.findings || []).forEach((x) => f.appendChild(el('div', null, x)));
     if ((a.findings || []).length) box.appendChild(f);
+    if (a.packet_log && a.packet_log.length) box.appendChild(packetLogPanel(a));
   } else if (d.after_error) {
     box.appendChild(el('div', 's-bad', 'The trace after the disaster failed: ' + d.after_error));
   }

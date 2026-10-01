@@ -10,6 +10,13 @@ What it does:
      http://127.0.0.1:5057 in your browser.
   3. Keep the black window open while you use NetView; closing it stops NetView.
 
+P45 resume (v1.2.0): the build carries the P45 lab's own sign-in (CML address,
+user, lab, device and Windows console passwords - Andrew's call, 2026-10-01:
+it is a local CML instance). On start NetView offers "P45 resume", which signs
+straight into the P45 lab; it is the default and is picked automatically after
+a few seconds. `NetView.exe --p45` skips the menu. Your own saved settings and
+--setup still work as before.
+
 The exe carries NetView, the lab helper scripts it imports and the lab's data
 files, laid out exactly as in the project repo, and runs them from there.
 """
@@ -35,7 +42,7 @@ import socket
 import ssl
 import sys
 import threading
-import time  # noqa: F401
+import time
 import typing  # noqa: F401
 import urllib.error
 import urllib.request
@@ -53,6 +60,16 @@ PORT = 5057
 APP_URL = f"http://127.0.0.1:{PORT}"
 CONFIG_DIR = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "NetView"
 CONFIG = CONFIG_DIR / "netview.env"
+P45_WAIT_S = 5
+
+
+def read_env(path: Path) -> dict[str, str]:
+    cfg = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if "=" in line and not line.lstrip().startswith("#"):
+            k, v = line.split("=", 1)
+            cfg[k.strip()] = v.strip()
+    return cfg
 
 
 def bundle_root() -> Path:
@@ -135,12 +152,83 @@ def setup() -> dict[str, str]:
 def load_config() -> dict[str, str] | None:
     if not CONFIG.exists():
         return None
-    cfg = {}
-    for line in CONFIG.read_text(encoding="utf-8").splitlines():
-        if "=" in line and not line.lstrip().startswith("#"):
-            k, v = line.split("=", 1)
-            cfg[k.strip()] = v.strip()
+    cfg = read_env(CONFIG)
     return cfg if cfg.get("CML_URL") else None
+
+
+def load_p45() -> dict[str, str] | None:
+    """The P45 lab preset build_exe.py bundles (absent in a build made with --no-p45)."""
+    f = bundle_root() / "netview" / "p45-preset.env"
+    if not f.exists():
+        return None
+    cfg = read_env(f)
+    return cfg if cfg.get("CML_URL") else None
+
+
+def p45_resume(cfg: dict[str, str]) -> dict[str, str]:
+    """Sign in with the preset and say what state the lab is in. NetView runs
+    either way - it reports an unreachable CML on the page - so this only informs."""
+    url, verify = cfg["CML_URL"].rstrip("/"), cfg.get("CML_VERIFY_SSL", "false") == "true"
+    print(f"\nP45 resume: signing in to {url} as {cfg.get('CML_USERNAME')} ...")
+    try:
+        token = cml_call(url, "/api/v0/authenticate", verify,
+                         body={"username": cfg["CML_USERNAME"], "password": cfg["CML_PASSWORD"]})
+        lab = cml_call(url, f"/api/v0/labs/{cfg['CML_LAB_ID']}", verify, token) or {}
+        state = lab.get("state", "?")
+        print(f"  signed in; lab '{lab.get('lab_title', cfg['CML_LAB_ID'])}' is {state}")
+        if state != "STARTED":
+            print("  The lab is not fully started - start it in CML for live traces.")
+    except urllib.error.HTTPError as e:
+        print(f"  CML refused the P45 sign-in (HTTP {e.code}) - run 'NetView.exe --setup' to enter it by hand.")
+    except Exception as e:  # noqa: BLE001
+        print(f"  Could not reach {url}: {e}\n  NetView will start anyway and show what it can.")
+    return cfg
+
+
+def timed_choice(prompt: str, default: str, wait_s: int) -> str:
+    """One keypress, or `default` after wait_s seconds (Windows console);
+    a plain input() elsewhere."""
+    try:
+        import msvcrt
+    except ImportError:
+        return (input(prompt).strip() or default)[:1].upper()
+    print(prompt, end="", flush=True)
+    end = time.time() + wait_s
+    while time.time() < end:
+        if msvcrt.kbhit():
+            k = msvcrt.getwch()
+            print(k if k.isprintable() else "")
+            return default if k in ("\r", "\n") else k.upper()
+        time.sleep(0.05)
+    print(default)
+    return default
+
+
+def choose() -> dict[str, str]:
+    saved, p45 = load_config(), load_p45()
+    if "--setup" in sys.argv:
+        return setup()
+    if p45 and "--p45" in sys.argv:
+        return p45_resume(p45)
+    if not p45:
+        return saved or setup()
+    print("\n  P  P45 resume - straight into the P45 lab")
+    # Only offer R when the saved settings point somewhere other than P45.
+    same = lambda k: saved.get(k) == p45.get(k)  # noqa: E731
+    if saved and not (same("CML_URL") and same("CML_LAB_ID")):
+        print(f"  R  Resume my saved settings ({saved['CML_URL']})")
+    else:
+        saved = None
+    print("  S  Set up a different CML server")
+    while True:
+        k = timed_choice(f"\nChoose [P] (P45 resume in {P45_WAIT_S} s): ", "P", P45_WAIT_S)
+        if k == "P":
+            return p45_resume(p45)
+        if k == "R" and saved:
+            return saved
+        if k == "S":
+            return setup()
+        print("  P, R or S.")
 
 
 def port_in_use() -> bool:
@@ -150,9 +238,7 @@ def port_in_use() -> bool:
 
 def main() -> int:
     print("NetView - P45 lab network viewer")
-    cfg = None if "--setup" in sys.argv else load_config()
-    if cfg is None:
-        cfg = setup()
+    cfg = choose()
     if port_in_use():
         print(f"NetView already seems to be running - opening {APP_URL}")
         webbrowser.open(APP_URL)

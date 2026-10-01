@@ -1264,9 +1264,23 @@ function renderPathHead() {
 }
 
 /* ---------------------------------------------------------- the view --- */
+// The 30 s inventory poll redraws this whole pane, and emptying it reset every
+// scroll position to the top while someone was reading a result. Keep the pane's
+// own scroll and that of the scrolling boxes inside it, restored in DOM order.
+const PATH_SCROLLERS = ['.pkt-log-wrap', '.dz-list'];
 function renderPathBody() {
   const body = $('#path-body');
+  const scroll = body.scrollTop;
+  const inner = PATH_SCROLLERS.map((q) => [...body.querySelectorAll(q)].map((x) => x.scrollTop));
   body.innerHTML = '';
+  drawPathBody(body);
+  body.scrollTop = scroll;
+  PATH_SCROLLERS.forEach((q, i) => body.querySelectorAll(q).forEach((x, j) => {
+    if (inner[i][j] != null) x.scrollTop = inner[i][j];
+  }));
+}
+
+function drawPathBody(body) {
   if (!trace.source || !trace.target) {
     const e = el('div', 'path-empty');
     e.appendChild(el('div', 'pe-t', trace.source ? `From ${trace.source}. Choose a destination.` : 'Choose two nodes to see the path between them.'));
@@ -1360,18 +1374,22 @@ function packetLogPanel(res) {
                                             : `Packets captured (showing ${log.length} of ${full.length})`));
   head.appendChild(el('span', 's-dim', ' — real ICMP echoes seen on each candidate link, by timestamp'));
   const btn = el('button', 'default', 'Replay on topology');
-  btn.addEventListener('click', () => replayPackets(log, btn));
+  btn.addEventListener('click', () => replayPackets(log, btn, box));
   head.appendChild(btn);
   box.appendChild(head);
 
   const wrap = el('div', 'pkt-log-wrap');
   const t = el('table', 'g');
   const thead = el('tr');
-  ['t (ms)', 'link', 'iface', '', 'direction', 'seq'].forEach((h) => thead.appendChild(el('th', null, h)));
+  ['time', 't (ms)', 'link', 'iface', '', 'direction', 'seq'].forEach((h) => thead.appendChild(el('th', null, h)));
   t.appendChild(thead);
   log.forEach((e, i) => {
     const tr = el('tr', 'row pkt-row ' + e.dir);
     tr.dataset.pktIndex = String(i);
+    const at = e.at ? new Date(e.at) : null;
+    const td = el('td', 's-dim', at ? pktClock(at) : '');
+    if (at) td.title = at.toLocaleString() + ` (${at.toISOString()})`;
+    tr.appendChild(td);
     tr.appendChild(el('td', null, String(e.t_ms)));
     tr.appendChild(el('td', null, e.a));
     tr.appendChild(el('td', null, e.ai));
@@ -1387,6 +1405,13 @@ function packetLogPanel(res) {
   return box;
 }
 
+/* Local wall-clock time a packet was seen, to the millisecond, so a capture
+ * can be lined up with device logs and the disaster outage strip. */
+function pktClock(d) {
+  const p = (n, w = 2) => String(n).padStart(w, '0');
+  return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}.${p(d.getMilliseconds(), 3)}`;
+}
+
 function flashLink(linkId, dir) {
   const w = document.querySelector(`.pdiag [data-link-id="${linkId}"]`);
   if (!w) return;
@@ -1394,7 +1419,20 @@ function flashLink(linkId, dir) {
   setTimeout(() => w.classList.remove('pkt-flash', 'pkt-req', 'pkt-reply'), 220);
 }
 
-function replayPackets(log, btn) {
+/* Follow the replay inside the packet table only. scrollIntoView() also
+ * scrolls every scrolling ancestor, which pulled the results pane down to the
+ * table and hid the topology the replay is drawing on. */
+function keepRowInView(row) {
+  const wrap = row.closest('.pkt-log-wrap');
+  if (!wrap) return;
+  const head = wrap.querySelector('th');
+  const top = row.offsetTop - (head ? head.offsetHeight : 0);
+  const bottom = row.offsetTop + row.offsetHeight - wrap.clientHeight;
+  if (wrap.scrollTop > top) wrap.scrollTop = top;
+  else if (wrap.scrollTop < bottom) wrap.scrollTop = bottom;
+}
+
+function replayPackets(log, btn, scope) {
   if (!log.length) return;
   btn.disabled = true;
   const origText = btn.textContent;
@@ -1408,10 +1446,10 @@ function replayPackets(log, btn) {
   log.forEach((e, i) => {
     setTimeout(() => {
       flashLink(e.link_id, e.dir);
-      const row = document.querySelector(`tr.pkt-row[data-pkt-index="${i}"]`);
+      const row = (scope || document).querySelector(`tr.pkt-row[data-pkt-index="${i}"]`);
       if (row) {
         row.classList.add('hl');
-        row.scrollIntoView({ block: 'nearest' });
+        keepRowInView(row);
         setTimeout(() => row.classList.remove('hl'), 220);
       }
       done++;

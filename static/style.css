@@ -291,9 +291,18 @@ table.p tr.drift td { background: var(--infobg); }
 .wire.pkt-flash.pkt-req { stroke: var(--sel); }
 .wire.pkt-flash.pkt-reply { stroke: var(--ok); }
 .pkt-log-head { display: flex; align-items: center; gap: 8px; padding: 8px 14px 0; flex-wrap: wrap; }
-.pkt-log-wrap { max-height: 220px; overflow: auto; margin: 6px 14px 12px; border: 1px solid var(--line2); }
+.pkt-log-wrap { position: relative; max-height: 220px; overflow: auto; margin: 6px 14px 12px; border: 1px solid var(--line2); }
 .pkt-log-wrap table.g { table-layout: fixed; }
 .pkt-log-wrap table.g td, .pkt-log-wrap table.g th { padding: 1px 8px; }
+/* time | t (ms) | link | iface | arrow | direction | seq: short columns fixed,
+ * link and direction share the rest (direction gets more - it carries NAT text). */
+.pkt-log-wrap table.g th:nth-child(1) { width: 96px; }
+.pkt-log-wrap table.g th:nth-child(2) { width: 58px; }
+.pkt-log-wrap table.g th:nth-child(3) { width: 30%; }
+.pkt-log-wrap table.g th:nth-child(4) { width: 70px; }
+.pkt-log-wrap table.g th:nth-child(5) { width: 28px; }
+.pkt-log-wrap table.g th:nth-child(7) { width: 48px; }
+.pkt-log-wrap table.g td { overflow: hidden; text-overflow: ellipsis; }
 tr.pkt-row.reply td { color: var(--ink2); }
 tr.pkt-row.hl td { background: var(--selbg); }
 .mode-tag { font: 700 10px var(--sans); letter-spacing: .04em; padding: 1px 6px; border-radius: 3px;
