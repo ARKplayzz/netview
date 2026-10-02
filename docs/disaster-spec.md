@@ -1,5 +1,8 @@
 # NetView: "Disaster" trace (spec, 2026-09-29)
 
+> The **Failover capture** mode (a toggle in the Disaster panel) is specified in
+> [failover-capture-spec.md](failover-capture-spec.md).
+
 ## What it does
 After choosing **From** and **To**, the user can add a **disaster**: pick any running
 nodes to power off. NetView then:

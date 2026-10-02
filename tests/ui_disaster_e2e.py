@@ -22,7 +22,7 @@ import websocket
 CHROME = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
 PORT = 9223
 OUT = Path(__file__).resolve().parent
-SRC, DST, IP, VICTIM = "Finance PC", "ISP-1 (Terrestrial Fibre)", "100.11.0.1", "EdgeRouter-HQ-2"
+SRC, DST, IP, VICTIM = "Tech/support dept PC", "ISP-1 (Terrestrial Fibre)", "100.11.0.1", "EdgeRouter-HQ-2"
 
 
 class Page:

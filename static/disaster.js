@@ -57,21 +57,24 @@ function disasterPanel() {
     redraw();
   });
   row.appendChild(zs);
-  const sl = el('label', null, 'Wait up to ');
-  const ss = el('select'); ss.id = 'dz-settle';
-  [15, 30, 60, 120].forEach((v) => { const o = el('option', null, `${v} s`); o.value = v; ss.appendChild(o); });
-  ss.value = D.settle;
-  ss.addEventListener('change', () => { D.settle = +ss.value; });
-  sl.appendChild(ss);
-  sl.title = 'The longest NetView waits for the path to recover before the second trace. ' +
-             'It moves on as soon as 5 pings in a row are answered.';
-  row.appendChild(sl);
+  if (D.mode !== 'failover') {
+    const sl = el('label', null, 'Wait up to ');
+    const ss = el('select'); ss.id = 'dz-settle';
+    [15, 30, 60, 120].forEach((v) => { const o = el('option', null, `${v} s`); o.value = v; ss.appendChild(o); });
+    ss.value = D.settle;
+    ss.addEventListener('change', () => { D.settle = +ss.value; });
+    sl.appendChild(ss);
+    sl.title = 'The longest NetView waits for the path to recover before the second trace. ' +
+               'It moves on as soon as 5 pings in a row are answered.';
+    row.appendChild(sl);
+  }
   const rl = el('label');
   const rc = el('input'); rc.type = 'checkbox'; rc.checked = D.restore; rc.id = 'dz-restore';
   rc.addEventListener('change', () => { D.restore = rc.checked; D.confirming = false; renderPathBody(); });
   rl.appendChild(rc); rl.appendChild(document.createTextNode(' Power them back on afterwards'));
   row.appendChild(rl);
   box.appendChild(row);
+  box.appendChild(failoverOptions(D, redraw));     // failover.js
 
   const list = el('div', 'dz-list');
   const renderList = () => {
@@ -124,7 +127,9 @@ function disasterPanel() {
   if (D.confirming && D.nodes.length) {
     const cf = el('div', 'dz-confirm');
     cf.appendChild(el('div', null, `Power off ${D.nodes.length} node${D.nodes.length > 1 ? 's' : ''}: ${D.nodes.join(', ')}. ` +
-      (D.restore ? 'They are powered on again when the test ends.' : 'They stay powered off afterwards.')));
+      (D.restore ? 'They are powered on again when the test ends.' : 'They stay powered off afterwards.') +
+      (D.mode === 'failover' ? ` Records packets for up to ${D.window} s after they have stopped` +
+        (D.stopEarly ? '; stops early once traffic is stable on a path.' : '.') : '')));
     const go = el('button', 'default danger', 'Power off and run');
     go.id = 'dz-confirm-go';
     go.addEventListener('click', () => { D.confirming = false; runTrace(); });
@@ -157,6 +162,7 @@ function outageStrip(o) {
 
 function disasterResult(res, width) {
   const d = res.disaster;
+  if (d.mode === 'failover') return failoverResult(res, width);   // failover.js
   const box = el('div', 'dz-result');
   box.appendChild(el('div', 'dz-title', `After the disaster: ${d.nodes.join(', ')} powered off`));
   (d.warnings || []).forEach((w) => box.appendChild(el('div', 'dz-warn', w)));

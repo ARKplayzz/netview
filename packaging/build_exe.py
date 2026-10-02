@@ -35,7 +35,7 @@ INCLUDE = [
     ("netview", "*.py"), ("netview/static", "*"), ("netview/templates", "*"),
     (".claude/skills/cml/scripts", "cml_api.py"), (".claude/skills/cml/scripts", "console.py"),
     (".claude/skills/cml/scripts", "render_configs.py"), (".claude/skills/cml/scripts", "probe_matrix.py"),
-    (".claude/skills/cml/scripts", "dhcp_check.py"),
+    (".claude/skills/cml/scripts", "dhcp_check.py"), (".claude/skills/cml/scripts", "log_annotator.py"),
     (".claude/skills/winserver/scripts", "win_console.py"),
     ("data", "manifest.yml"), ("data", "address-lock.json"),
 ]

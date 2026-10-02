@@ -218,26 +218,41 @@ def run(job_id: str, cml, con, spec: dict, execute, set_, respec) -> dict:
                 _active["stage"] = txt
 
     out: dict = {"nodes": sel, "settle_s": settle, "restore": do_restore, "warnings": d.get("warnings", [])}
+    failover_mode = d.get("mode") == "failover"
+    if failover_mode:
+        out.update(mode="failover", window_s=d.get("window_s"), stop_early=d.get("stop_early", True),
+                   device_logs=bool(d.get("device_logs")), after_trace=bool(d.get("after_trace")))
     powered_off = False
     baseline = None
+    result = None
     try:
         try:
             stage("baseline trace (before the disaster)")
             baseline = execute(job_id, cml, con, spec)
             if stop.is_set():
                 raise RuntimeError("cancelled before any node was powered off")
-            powered_off = _disaster(job_id, cml, spec, baseline, sel, settle, do_restore, stop, stage, out)
+            if failover_mode:
+                import failover                    # noqa: PLC0415 - failover capture (spec: failover-capture-spec.md)
+                failover.run(job_id, cml, con, spec, baseline, d, stop, stage, set_, out,
+                             write_record=lambda: _write({"job_id": job_id, "nodes": sel, "restore": do_restore,
+                                                          "started": datetime.now(timezone.utc).isoformat()}))
+                powered_off = bool(out.get("power_off"))
+            else:
+                powered_off = _disaster(job_id, cml, spec, baseline, sel, settle, do_restore, stop, stage, out)
             if stop.is_set():
                 raise RuntimeError("cancelled after the power-off")
-            stage("trace after the disaster")
-            try:
-                after = execute(job_id, cml, con, respec())
-                out["after"] = after
-                out["diff"] = path_diff(_complete(baseline), _complete(after))
-                out["verdict_change"] = [(baseline.get("verdict") or {}).get("level"),
-                                         (after.get("verdict") or {}).get("level")]
-            except Exception as e:                # noqa: BLE001 - reported; restore still runs
-                out["after_error"] = f"{type(e).__name__}: {e}"
+            # Failover mode reads the after-path from its own capture; the full
+            # second trace is optional there ("also run a full trace afterwards").
+            if not failover_mode or d.get("after_trace"):
+                stage("trace after the disaster")
+                try:
+                    after = execute(job_id, cml, con, respec())
+                    out["after"] = after
+                    out["diff"] = path_diff(_complete(baseline), _complete(after))
+                    out["verdict_change"] = [(baseline.get("verdict") or {}).get("level"),
+                                             (after.get("verdict") or {}).get("level")]
+                except Exception as e:            # noqa: BLE001 - reported; restore still runs
+                    out["after_error"] = f"{type(e).__name__}: {e}"
         except Exception as e:
             if baseline is None:
                 raise                             # failed before anything was powered off
@@ -253,7 +268,11 @@ def run(job_id: str, cml, con, spec: dict, execute, set_, respec) -> dict:
                 out["restored"] = restore(cml, sel)
             elif out.get("power_off"):
                 out["restored"] = {x: "left powered off (restore was not selected)" for x in sel}
+            if failover_mode and result is not None and out.get("failover"):
+                import failover                    # noqa: PLC0415
+                failover.save(result)              # history + pcaps; after restore so it records the restore
         finally:
+            out.pop("_pcaps", None)
             with _lock:
                 _active = None
             _cancel.pop(job_id, None)

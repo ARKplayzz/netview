@@ -979,7 +979,9 @@ const trace = { source: null, target: null, ip: null, count: 100, repeat: false,
                 capture: true, job: null, stage: '', result: null, cand: null, history: [], error: null,
                 // Disaster trace (2026-09-29, docs/disaster-spec.md): nodes to power off
                 // between a baseline trace and a second one.
-                disaster: { open: false, nodes: [], settle: 30, restore: true, confirming: false, filter: '' } };
+                disaster: { open: false, nodes: [], settle: 30, restore: true, confirming: false, filter: '',
+                            // Failover capture (2026-10-01, docs/failover-capture-spec.md)
+                            mode: 'standard', window: 20, stopEarly: true, deviceLogs: false, afterTrace: false } };
 let pick = null;           // null | 'source' | 'target'
 
 function startPick(src) {
@@ -1099,12 +1101,17 @@ async function runTrace() {
       body: JSON.stringify({ source: trace.source, target: trace.target, target_ip: trace.ip,
                              count: trace.count, dns: trace.dns, capture: trace.capture,
                              disaster: trace.disaster.nodes.length ? { nodes: trace.disaster.nodes,
-                               settle_s: trace.disaster.settle, restore: trace.disaster.restore } : undefined }),
+                               settle_s: trace.disaster.settle, restore: trace.disaster.restore,
+                               ...(trace.disaster.mode === 'failover' ? {
+                                 mode: 'failover', window_s: trace.disaster.window, stop_early: trace.disaster.stopEarly,
+                                 device_logs: trace.disaster.deviceLogs, after_trace: trace.disaster.afterTrace } : {}) }
+                               : undefined }),
     });
     const j = await r.json();
     if (!r.ok) throw new Error(j.error);
     trace.job.id = j.job_id;
     trace.job.disaster = !!trace.disaster.nodes.length;
+    trace.job.failover = trace.job.disaster && trace.disaster.mode === 'failover';
     trace.disaster.confirming = false;
     trace.job.eta = j.eta_seconds || 30;
     // Capture mode polls faster: CML lets a link's packets be read WHILE its
@@ -1125,6 +1132,7 @@ async function runTrace() {
         const c = document.querySelector('[data-live-count]');
         if (c) c.textContent = `${liveCount} packets captured so far`;
       }
+      if (st.failover_live) failoverLive(st.failover_live);     // failover.js
       if (st.status === 'error') throw new Error(st.error);
       if (st.status === 'done') {
         const res = st.result;
@@ -1318,6 +1326,11 @@ function drawPathBody(body) {
       lc.dataset.liveCount = '1';
       top.appendChild(document.createTextNode(' '));
       top.appendChild(lc);
+    }
+    if (trace.job.failover) {
+      const fl = el('div', 'fo-live');
+      fl.dataset.failoverLive = '1';
+      top.appendChild(fl);
     }
   } else if (trace.error) {
     top.appendChild(el('span', 's-bad', 'Trace failed: ' + trace.error));

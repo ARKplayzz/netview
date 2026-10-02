@@ -27,17 +27,21 @@ from __future__ import annotations
 import argparse  # noqa: F401
 import base64  # noqa: F401
 import collections  # noqa: F401
+import concurrent.futures  # noqa: F401
+import dataclasses  # noqa: F401  (log_annotator, failover device logs)
 import csv  # noqa: F401
 import datetime  # noqa: F401
 import getpass
 import hashlib  # noqa: F401
 import io  # noqa: F401
 import ipaddress  # noqa: F401
+import math  # noqa: F401
 import json
 import os
 import re  # noqa: F401
 import runpy
 import secrets  # noqa: F401
+import statistics  # noqa: F401  (failover capture)
 import socket
 import ssl
 import sys
@@ -48,6 +52,7 @@ import urllib.error
 import urllib.request
 import uuid  # noqa: F401
 import webbrowser
+import zipfile  # noqa: F401  (failover pcaps)
 from pathlib import Path
 
 import flask  # noqa: F401

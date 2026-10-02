@@ -23,7 +23,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from flask import Flask, Response, jsonify, render_template, request
+from flask import Flask, Response, jsonify, render_template, request, send_file
 
 REPO = Path(__file__).resolve().parent.parent
 SKILL_SCRIPTS = REPO / ".claude" / "skills" / "cml" / "scripts"
@@ -35,6 +35,7 @@ import cmlsource        # noqa: E402
 import features         # noqa: E402
 import model            # noqa: E402
 import disaster         # noqa: E402
+import failover         # noqa: E402
 import pathtrace        # noqa: E402
 import probes           # noqa: E402
 
@@ -437,6 +438,18 @@ def api_trace():
         spec["disaster"] = {"nodes": list(dz["nodes"]),
                             "settle_s": max(15, min(int(dz.get("settle_s", 30)), 120)),
                             "restore": bool(dz.get("restore", True)), "warnings": warnings}
+        if dz.get("mode") == "failover":
+            # Failover capture (spec: docs/failover-capture-spec.md). It needs packet
+            # capture, so the baseline runs in Verified mode whatever the page asked.
+            window = int(dz.get("window_s") or failover.DEFAULT_WINDOW_S)
+            if window not in failover.WINDOWS_S:
+                return jsonify({"error": f"window must be one of {failover.WINDOWS_S} s"}), 400
+            spec["capture"] = True
+            spec["disaster"].update(mode="failover", window_s=window,
+                                    stop_early=bool(dz.get("stop_early", True)),
+                                    device_logs=bool(dz.get("device_logs", False)),
+                                    after_trace=bool(dz.get("after_trace", False)),
+                                    settle_s=window + 90)   # only feeds the progress ETA
         plain = {k: v for k, v in body.items() if k != "disaster"}
 
         def respec():
@@ -480,6 +493,36 @@ def api_trace_get(job_id: str):
     if not job:
         return jsonify({"error": "unknown job"}), 404
     return jsonify({k: v for k, v in job.items() if k != "spec"})
+
+
+@app.get("/api/failover/history")
+def api_failover_history():
+    """Saved failover-capture runs, newest first (the testing log)."""
+    return jsonify({"runs": failover.history(), "folder": str(failover.HISTORY_DIR)})
+
+
+@app.get("/api/failover/run/<name>")
+def api_failover_run(name: str):
+    r = failover.load(name)
+    return jsonify(r) if r else (jsonify({"error": "no such run"}), 404)
+
+
+@app.get("/api/failover/run/<name>/<kind>.csv")
+def api_failover_csv(name: str, kind: str):
+    r = failover.load(name)
+    txt = failover.to_csv(r, kind) if r else None
+    if txt is None:
+        return jsonify({"error": "no such run or export"}), 404
+    return app.response_class(txt, mimetype="text/csv",
+                              headers={"Content-Disposition": f"attachment; filename={name}_{kind}.csv"})
+
+
+@app.get("/api/failover/run/<name>/pcaps.zip")
+def api_failover_pcaps(name: str):
+    f = failover.pcap_zip(name)
+    if not f:
+        return jsonify({"error": "no pcaps saved for this run"}), 404
+    return send_file(f, as_attachment=True, download_name=f.name)
 
 
 @app.get("/api/matrix")

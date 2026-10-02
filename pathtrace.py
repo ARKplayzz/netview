@@ -242,7 +242,8 @@ CAPTURE_START_BUDGET_S = 120
 _ECHO_ID_SEQ = re.compile(r"id=(0x[0-9a-f]+), seq=(\d+)")
 
 
-def _capture_start_all(cml, link_ids: list[str], maxtime: int) -> dict[str, str | None]:
+def _capture_start_all(cml, link_ids: list[str], maxtime: int, bpfilter: str = "",
+                       maxpackets: int = 10000) -> dict[str, str | None]:
     """Start a FRESH, RUNNING capture on every candidate link.
     Returns {link_id: starttime} so each link's packet offsets can be put on one
     shared timeline. Links to stopped nodes are dropped from `link_ids`.
@@ -281,7 +282,10 @@ def _capture_start_all(cml, link_ids: list[str], maxtime: int) -> dict[str, str 
 
     def start(lid: str) -> None:
         try:
-            cml.capture_start(lid, maxpackets=10000, maxtime=maxtime)
+            if bpfilter:                      # failover capture (2026-10-01)
+                cml.capture_start(lid, maxpackets=maxpackets, maxtime=maxtime, bpfilter=bpfilter)
+            else:
+                cml.capture_start(lid, maxpackets=maxpackets, maxtime=maxtime)
         except RuntimeError as e:
             if "not running" in str(e):
                 skip.add(lid)                 # a link to a stopped node carries nothing to prove
