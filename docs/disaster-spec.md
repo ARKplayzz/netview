@@ -86,8 +86,21 @@ with its own path diagram, the outage figures and a "what changed" summary.
     and reports it;
   - a baseline failure (source down, no console) aborts before anything is powered off.
 
-## Not in scope (v1)
-Link-level failures (shutting a single interface); scheduling; more than one target.
+## Cable cuts (added 2026-10-06)
+A disaster can also cut links: CML's link `state/stop` unplugs the cable at both
+ends while both nodes keep running (a fibre cut, not a box failure). The panel
+lists the cables of any node matching the filter; chips show them with a scissors
+mark. Request field `disaster.links` is a list of link ids; the server names them
+"A - B" from the live link map. Rules: at most 8 links; both ends must be running
+and neither may also be powered off in the same disaster. The record written
+before the first stop carries `links: {name: id}`, so Restore (and the banner's
+Restore now) re-plugs them; cables are re-plugged before nodes are started.
+In failover-capture mode the cut links are captured and snapshotted like the
+links into a powered-off node, and F is the last test packet seen on a cut link.
+Diagrams draw a cut cable red and dashed, labelled CUT.
+
+## Not in scope
+Shutting an interface from the device side; scheduling; more than one target.
 
 ## Tests
 - **Unit** (`tests/test_disaster.py`, mocked CML and console):

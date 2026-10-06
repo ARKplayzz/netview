@@ -979,7 +979,8 @@ const trace = { source: null, target: null, ip: null, count: 100, repeat: false,
                 capture: true, job: null, stage: '', result: null, cand: null, history: [], error: null,
                 // Disaster trace (2026-09-29, docs/disaster-spec.md): nodes to power off
                 // between a baseline trace and a second one.
-                disaster: { open: false, nodes: [], settle: 30, restore: true, confirming: false, filter: '',
+                // links: cable cuts (2026-10-06) - link ids unplugged in CML, the nodes stay up.
+                disaster: { open: false, nodes: [], links: [], settle: 30, restore: true, confirming: false, filter: '',
                             // Failover capture (2026-10-01, docs/failover-capture-spec.md)
                             mode: 'standard', window: 20, stopEarly: true, deviceLogs: false, afterTrace: false } };
 let pick = null;           // null | 'source' | 'target'
@@ -1052,12 +1053,13 @@ function setTraceEnds(src, dst, ip) {
 
 /* Every node and link on SOME shortest path, over running nodes and started
  * links: the set of routes the traffic could take. */
-function candidates(src, dst, exclude) {
+function candidates(src, dst, exclude, cutIds) {
   const up = (n) => n && (n.up || n.label === src) && !(exclude && exclude.has(n.label));
   const adj = new Map();
   NODES.forEach((n) => {
     if (!up(n)) return;
-    adj.set(n.label, (n.links || []).filter((l) => up(BY.get(l.peer)) && l.state !== 'STOPPED'));
+    adj.set(n.label, (n.links || []).filter((l) => up(BY.get(l.peer)) && l.state !== 'STOPPED' &&
+                                                   !(cutIds && cutIds.has(l.link_id))));
   });
   const bfs = (start) => {
     const d = new Map([[start, 0]]);
@@ -1100,7 +1102,7 @@ async function runTrace() {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ source: trace.source, target: trace.target, target_ip: trace.ip,
                              count: trace.count, dns: trace.dns, capture: trace.capture,
-                             disaster: trace.disaster.nodes.length ? { nodes: trace.disaster.nodes,
+                             disaster: dzCount() ? { nodes: trace.disaster.nodes, links: trace.disaster.links,
                                settle_s: trace.disaster.settle, restore: trace.disaster.restore,
                                ...(trace.disaster.mode === 'failover' ? {
                                  mode: 'failover', window_s: trace.disaster.window, stop_early: trace.disaster.stopEarly,
@@ -1110,7 +1112,7 @@ async function runTrace() {
     const j = await r.json();
     if (!r.ok) throw new Error(j.error);
     trace.job.id = j.job_id;
-    trace.job.disaster = !!trace.disaster.nodes.length;
+    trace.job.disaster = !!dzCount();
     trace.job.failover = trace.job.disaster && trace.disaster.mode === 'failover';
     trace.disaster.confirming = false;
     trace.job.eta = j.eta_seconds || 30;
@@ -1218,14 +1220,14 @@ function renderPathHead() {
   cnt.addEventListener('change', () => { trace.count = Math.max(20, Math.min(500, +cnt.value || 100)); });
   lc.appendChild(cnt);
   head.appendChild(lc);
-  const dzOn = trace.disaster.nodes.length > 0;
+  const dzOn = dzCount() > 0;
   const run = el('button', 'default', trace.job ? 'Tracing...' : dzOn ? 'Run disaster trace' : 'Run trace');
   // A DNS failover name has no address until the trace resolves it, live, from
   // the source's own site - so it is runnable without one.
   run.disabled = !!trace.job || !trace.source || !trace.target ||
     (!trace.ip && !(BY.get(trace.target) || {}).virtual);
   run.addEventListener('click', () => {
-    if (trace.disaster.nodes.length) {        // confirmation lives in the disaster panel
+    if (dzCount()) {                          // confirmation lives in the disaster panel
       trace.disaster.open = true; trace.disaster.confirming = true;
       renderPathBody();
       return;
@@ -1233,8 +1235,8 @@ function renderPathHead() {
     runTrace();
   });
   head.appendChild(run);
-  const dzb = el('button', dzOn ? 'dz-toggle on' : 'dz-toggle', dzOn ? `Disaster (${trace.disaster.nodes.length})` : 'Disaster...');
-  dzb.title = 'Power off chosen nodes between two traces and compare the results';
+  const dzb = el('button', dzOn ? 'dz-toggle on' : 'dz-toggle', dzOn ? `Disaster (${dzCount()})` : 'Disaster...');
+  dzb.title = 'Power off chosen nodes or cut chosen links between two traces and compare the results';
   dzb.disabled = !!trace.job || !trace.source || !trace.target;
   dzb.addEventListener('click', () => { trace.disaster.open = !trace.disaster.open; trace.disaster.confirming = false; renderPathHead(); renderPathBody(); });
   head.appendChild(dzb);
@@ -1264,7 +1266,7 @@ function renderPathHead() {
   head.appendChild(ml);
   const rl = el('label');
   const rc = el('input'); rc.type = 'checkbox'; rc.checked = trace.repeat;
-  rc.disabled = trace.disaster.nodes.length > 0;
+  rc.disabled = dzCount() > 0;
   rc.addEventListener('change', () => { trace.repeat = rc.checked; if (rc.checked && !trace.job) runTrace(); });
   rl.appendChild(rc); rl.appendChild(document.createTextNode('Repeat'));
   rl.title = 'Run again 5 s after each trace finishes. Leave it on while you stop and start nodes in CML to watch the path move.';
@@ -1510,16 +1512,28 @@ function pathDiagram(res, cand, width, opts) {
     const k = pairKey(prevPath[i - 1], prevPath[i]);
     if (!drawn.has(k)) { drawn.add(k); edges.push({ a: prevPath[i - 1], b: prevPath[i], kind: 'prev' }); }
   }
-  // hop depth over the drawn edges
+  // Cut cables (opts.cut: [{id, a, b}]): drawn red and dashed wherever both ends are shown.
+  ((opts && opts.cut) || []).forEach((c) => {
+    if (!set.has(c.a) || !set.has(c.b)) return;
+    const k = pairKey(c.a, c.b);
+    const ex = edges.find((e) => e.id === c.id || (!e.id && pairKey(e.a, e.b) === k));
+    if (ex) ex.cut = true;
+    else { drawn.add(k); edges.push({ a: c.a, b: c.b, id: c.id, kind: 'prev', cut: true }); }
+  });
+  // hop depth over the drawn edges - the live path first, so a previous path or
+  // a cut cable cannot pull a node out of line (2026-10-06: after a DCI cut the
+  // far core sat beside HQ via the dead fibre and every failover line crossed)
   const depth = new Map([[trace.source, 0]]);
-  const q = [trace.source];
-  while (q.length) {
-    const u = q.shift();
-    edges.forEach((e) => {
-      const v = e.a === u ? e.b : e.b === u ? e.a : null;
-      if (v && !depth.has(v)) { depth.set(v, depth.get(u) + 1); q.push(v); }
-    });
-  }
+  [edges.filter((e) => e.kind !== 'prev'), edges].forEach((es) => {
+    const q = [...depth.keys()];
+    while (q.length) {
+      const u = q.shift();
+      es.forEach((e) => {
+        const v = e.a === u ? e.b : e.b === u ? e.a : null;
+        if (v && !depth.has(v)) { depth.set(v, depth.get(u) + 1); q.push(v); }
+      });
+    }
+  });
   let maxD = Math.max(0, ...depth.values());
   [...set].forEach((u) => { if (!depth.has(u)) depth.set(u, ++maxD); });
   const cols = [];
@@ -1553,7 +1567,7 @@ function pathDiagram(res, cand, width, opts) {
     let a = pos.get(e.a), b = pos.get(e.b);
     if (a.d > b.d) [a, b] = [b, a];
     const u = e.id && usedBy.get(e.id);
-    const cls = 'wire ' + (e.kind === 'prev' ? 't-prev' : u ? (u.use === 'both' ? 't-both' : u.use === 'forward' ? 't-fwd' : u.use === 'inferred' ? 't-inf' : 't-one') : 't-cand');
+    const cls = 'wire ' + (e.cut ? 't-cut' : e.kind === 'prev' ? 't-prev' : u ? (u.use === 'both' ? 't-both' : u.use === 'forward' ? 't-fwd' : u.use === 'inferred' ? 't-inf' : 't-one') : 't-cand');
     let lx, ly;
     if (a.seg === b.seg) {
       s.appendChild(svg('line', { x1: a.x, y1: a.y, x2: b.x, y2: b.y, class: cls, 'data-link-id': e.id || '' }));
@@ -1565,7 +1579,9 @@ function pathDiagram(res, cand, width, opts) {
       s.appendChild(svg('polyline', { points: `${a.x},${a.y} ${r},${a.y} ${r},${gapY} ${l},${gapY} ${l},${b.y} ${b.x},${b.y}`, class: cls, 'data-link-id': e.id || '' }));
       lx = (r + l) / 2; ly = gapY - 6;
     }
-    if (u && u.packets != null) {
+    if (e.cut) {
+      s.appendChild(svg('text', { x: lx, y: ly, class: 'rate bad', 'text-anchor': 'middle' }, '\u2702 CUT'));
+    } else if (u && u.packets != null) {
       s.appendChild(svg('text', { x: lx, y: ly, class: 'rate' + (u.use === 'forward' ? ' bad' : ''),
                                   'text-anchor': 'middle' }, u.use === 'inferred' ? 'no capture' : u.packets + ' pkts'));
     }

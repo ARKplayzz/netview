@@ -261,6 +261,13 @@ def main():
     for kind in ("packets", "probes", "paths"):
         txt = fo.to_csv(res, kind)
         ok &= check(f"csv: {kind}", txt and txt.count("\n") > 2)
+    # 7. cable cut: F is the last test packet seen on the cut link
+    ev = [{"kind": "echo", "probe": 1, "dir": "request", "link_id": "CUT", "a": "X", "b": "Y", "t": 5.0},
+          {"kind": "echo", "probe": 2, "dir": "request", "link_id": "CUT", "a": "X", "b": "Y", "t": 5.2},
+          {"kind": "echo", "probe": 3, "dir": "request", "link_id": "OTHER", "a": "X", "b": "Z", "t": 6.0}]
+    ok &= check("cut: F = last packet on the cut link", fo.failure_moment([], ev, set(), {"CUT"}) == 5.2)
+    ok &= check("cut: nothing cut, nothing down -> no F", fo.failure_moment([], ev, set(), set()) is None)
+
     print("ALL FAILOVER TESTS OK" if ok else "FAILURES ABOVE")
     return 0 if ok else 1
 

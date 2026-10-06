@@ -30,6 +30,20 @@ class FakeCML:
         self.calls.append(("start", nid))
         self.nodes[nid]["state"] = "BOOTED"
 
+    links: dict = {}
+
+    def stop_link(self, lid):
+        self.calls.append(("cut", lid))
+        assert dz.STATE_FILE.exists(), "record must be written BEFORE the first cut"
+        self.links[lid] = "STOPPED"
+
+    def start_link(self, lid):
+        self.calls.append(("plug", lid))
+        self.links[lid] = "STARTED"
+
+    def link_state(self, lid):
+        return self.links.get(lid, "STARTED")
+
 
 class FakePing:
     """Replays a mark pattern: marks before the power-off, then after it."""
@@ -154,4 +168,30 @@ except RuntimeError as e:
     assert "already running" in str(e)
 dz._active = None
 print("single-disaster lock OK")
+
+# ---- cable cuts: validate, cut, record, restore re-plugs
+LM = {"L1": {"a": "A", "b": "B"}, "L2": {"a": "A", "b": "DOWN"}}
+assert dz.validate([], BY, "PC", "T", {"A - B": "L1"}, LM)[0] is None
+assert "Nothing chosen" in dz.validate([], BY, "PC", "T", {}, LM)[0]
+assert "Unknown link" in dz.validate([], BY, "PC", "T", {"x": "L9"}, LM)[0]
+assert "not running" in dz.validate([], BY, "PC", "T", {"A - DOWN": "L2"}, LM)[0]
+assert "also being powered off" in dz.validate(["A"], BY, "PC", "T", {"A - B": "L1"}, LM)[0]
+cml = FakeCML(["A", "B", "PC", "T"])
+cml.links = {}
+res = dz.run("j6", cml, None, spec([], links={"A - B": "L1"}), execute, lambda *a, **k: None,
+             lambda: {"_in_disaster": True, "source": {"label": "PC"}})
+d = res["disaster"]
+assert d["power_off"] == {"A - B": "STOPPED"} and d["restored"] == {"A - B": "STARTED"}, d
+assert cml.calls == [("cut", "L1"), ("plug", "L1")], cml.calls
+assert all(n["state"] == "BOOTED" for n in cml.nodes.values()) and not dz.STATE_FILE.exists()
+# left cut: the record keeps the link and restore() re-plugs it
+cml = FakeCML(["A", "B", "PC", "T"])
+cml.links = {}
+dz.run("j7", cml, None, spec([], links={"A - B": "L1"}, restore=False), execute, lambda *a, **k: None,
+       lambda: {"_in_disaster": True})
+rec = dz.status()["interrupted"]
+assert rec["links"] == {"A - B": "L1"} and cml.links["L1"] == "STOPPED", rec
+assert dz.restore(cml, rec["nodes"], links=rec["links"]) == {"A - B": "STARTED"} and not dz.STATE_FILE.exists()
+assert dz.describe(["A"], {"A - B": "L1"}) == "powering off 1 node: A; cutting 1 link: A - B"
+print("cable cuts OK")
 print("ALL DISASTER TESTS OK")

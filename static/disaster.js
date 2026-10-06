@@ -4,6 +4,28 @@
  * back on - always, even on error or Cancel. Loaded after app.js and uses its
  * globals (trace, BY, NODES, INV, el, $, getJSON, candidates, pathDiagram...). */
 
+/* Nodes + cut links chosen. */
+function dzCount() { return trace.disaster.nodes.length + (trace.disaster.links || []).length; }
+
+/* A link id -> {id, a, b, name} from the inventory. */
+function dzLink(id) {
+  for (const n of NODES) {
+    const l = (n.links || []).find((x) => x.link_id === id);
+    if (l) return { id, a: n.label, b: l.peer, name: `${n.label} - ${l.peer}`, ai: l.local_iface, bi: l.peer_iface };
+  }
+  return { id, a: null, b: null, name: id };
+}
+
+/* The disaster's cut links as [{id, a, b}] (d.links is {name: id}). */
+function dzCut(d) { return Object.values((d && d.links) || {}).map(dzLink).filter((l) => l.a); }
+
+/* "A, B powered off; X - Y cut" */
+function dzWhat(d) {
+  const ln = Object.keys((d && d.links) || {});
+  return [d.nodes && d.nodes.length ? `${d.nodes.join(', ')} powered off` : '',
+          ln.length ? `${ln.join(', ')} cut` : ''].filter(Boolean).join('; ');
+}
+
 function disasterPanel() {
   const D = trace.disaster;
   const selectable = (x) => { const n = BY.get(x); return n && n.up && !n.ghost && x !== trace.source; };
@@ -12,15 +34,16 @@ function disasterPanel() {
 
   const h = el('div', 'dz-head');
   h.appendChild(el('b', null, 'Disaster'));
-  h.appendChild(el('span', 's-dim', '  Run the trace, power these nodes off, measure the outage, run the trace again, ' +
-    'then power them back on.'));
+  h.appendChild(el('span', 's-dim', '  Run the trace, power these nodes off and/or cut these cables, measure the outage, ' +
+    'run the trace again, then put everything back.'));
   const close = el('button', 'linkish', 'Close');
   close.addEventListener('click', () => { D.open = false; redraw(); });
   h.appendChild(close);
   box.appendChild(h);
 
   const chips = el('div', 'dz-chips');
-  if (!D.nodes.length) chips.appendChild(el('span', 's-dim', 'No nodes chosen. Tick nodes below, or add a zone.'));
+  D.links = D.links || [];
+  if (!dzCount()) chips.appendChild(el('span', 's-dim', 'Nothing chosen. Tick nodes or links below, or add a zone.'));
   D.nodes.forEach((x) => {
     const c = el('span', 'dz-chip', x);
     const b = el('button', 'linkish', '×');
@@ -30,16 +53,25 @@ function disasterPanel() {
     c.appendChild(b);
     chips.appendChild(c);
   });
-  if (D.nodes.length) {
+  D.links.forEach((id) => {
+    const c = el('span', 'dz-chip dz-cut', '\u2702 ' + dzLink(id).name);
+    const b = el('button', 'linkish', '×');
+    b.title = `Keep ${dzLink(id).name} connected`;
+    b.setAttribute('aria-label', b.title);
+    b.addEventListener('click', () => { D.links = D.links.filter((y) => y !== id); redraw(); });
+    c.appendChild(b);
+    chips.appendChild(c);
+  });
+  if (dzCount()) {
     const clr = el('button', 'linkish', 'Clear all');
-    clr.addEventListener('click', () => { D.nodes = []; redraw(); });
+    clr.addEventListener('click', () => { D.nodes = []; D.links = []; redraw(); });
     chips.appendChild(clr);
   }
   box.appendChild(chips);
 
   const row = el('div', 'dz-row');
   const f = el('input');
-  f.type = 'search'; f.placeholder = 'Filter nodes'; f.value = D.filter; f.id = 'dz-filter';
+  f.type = 'search'; f.placeholder = 'Filter nodes and links'; f.value = D.filter; f.id = 'dz-filter';
   f.setAttribute('aria-label', 'Filter nodes');
   row.appendChild(f);
   const zs = el('select');
@@ -71,7 +103,7 @@ function disasterPanel() {
   const rl = el('label');
   const rc = el('input'); rc.type = 'checkbox'; rc.checked = D.restore; rc.id = 'dz-restore';
   rc.addEventListener('change', () => { D.restore = rc.checked; D.confirming = false; renderPathBody(); });
-  rl.appendChild(rc); rl.appendChild(document.createTextNode(' Power them back on afterwards'));
+  rl.appendChild(rc); rl.appendChild(document.createTextNode(' Put them back afterwards (power on / reconnect)'));
   row.appendChild(rl);
   box.appendChild(row);
   box.appendChild(failoverOptions(D, redraw));     // failover.js
@@ -109,6 +141,40 @@ function disasterPanel() {
       list.appendChild(g);
     });
     if (!list.children.length) list.appendChild(el('div', 's-dim', 'No running node matches.'));
+    // Cables: every started link whose two ends are running, matched on either end.
+    const seenL = new Set();
+    const cables = [];
+    NODES.filter((n) => !n.ghost && n.up).forEach((n) => (n.links || []).forEach((l) => {
+      const p = BY.get(l.peer);
+      if (!l.link_id || seenL.has(l.link_id) || !p || !p.up || p.ghost || l.state === 'STOPPED') return;
+      seenL.add(l.link_id);
+      const name = `${n.label} - ${l.peer}`;
+      if (q && !name.toLowerCase().includes(q)) return;
+      cables.push({ id: l.link_id, name, ifs: `${l.local_iface} - ${l.peer_iface}` });
+    }));
+    if (q && cables.length) {
+      const g = el('div', 'dz-site dz-links');
+      g.appendChild(el('div', 'dz-site-h', 'Links (cut the cable; both ends stay powered on)'));
+      cables.sort((a, b) => a.name.localeCompare(b.name)).forEach((c) => {
+        const lab = el('label', 'dz-item');
+        const cb = el('input'); cb.type = 'checkbox'; cb.dataset.link = c.id;
+        cb.checked = D.links.includes(c.id);
+        cb.addEventListener('change', () => {
+          if (cb.checked) { if (!D.links.includes(c.id)) D.links.push(c.id); }
+          else D.links = D.links.filter((y) => y !== c.id);
+          D.confirming = false;
+          renderPathHead();
+          renderPathBody();
+        });
+        lab.appendChild(cb);
+        lab.appendChild(document.createTextNode(' \u2702 ' + c.name));
+        lab.appendChild(el('span', 's-dim', ` (${c.ifs})`));
+        g.appendChild(lab);
+      });
+      list.appendChild(g);
+    } else if (!q) {
+      list.appendChild(el('div', 's-dim', 'Links: type part of a node name in the filter to list its cables.'));
+    }
   };
   f.addEventListener('input', () => { D.filter = f.value; renderList(); });
   renderList();
@@ -121,16 +187,19 @@ function disasterPanel() {
   const win = D.nodes.filter((x) => (BY.get(x) || {}).node_definition === 'win2025');
   if (win.length) warns.push(`${win.join(', ')}: Windows servers take about 6 minutes to boot again.`);
   if (D.nodes.length > 8) warns.push(`${D.nodes.length} nodes is a large disaster; the restore takes longer.`);
-  if (!D.restore && D.nodes.length) warns.push('These nodes will be LEFT powered off. The banner offers Restore later.');
+  if (!D.restore && dzCount()) warns.push('These will be LEFT powered off / disconnected. The banner offers Restore later.');
   warns.forEach((w) => box.appendChild(el('div', 'dz-warn', w)));
 
-  if (D.confirming && D.nodes.length) {
+  if (D.confirming && dzCount()) {
     const cf = el('div', 'dz-confirm');
-    cf.appendChild(el('div', null, `Power off ${D.nodes.length} node${D.nodes.length > 1 ? 's' : ''}: ${D.nodes.join(', ')}. ` +
-      (D.restore ? 'They are powered on again when the test ends.' : 'They stay powered off afterwards.') +
+    const what = [D.nodes.length ? `Power off ${D.nodes.length} node${D.nodes.length > 1 ? 's' : ''}: ${D.nodes.join(', ')}.` : '',
+                  D.links.length ? `Cut ${D.links.length} link${D.links.length > 1 ? 's' : ''}: ${D.links.map((x) => dzLink(x).name).join(', ')}.` : '']
+      .filter(Boolean).join(' ');
+    cf.appendChild(el('div', null, what + ' ' +
+      (D.restore ? 'Everything is put back when the test ends.' : 'They stay down afterwards.') +
       (D.mode === 'failover' ? ` Records packets for up to ${D.window} s after they have stopped` +
         (D.stopEarly ? '; stops early once traffic is stable on a path.' : '.') : '')));
-    const go = el('button', 'default danger', 'Power off and run');
+    const go = el('button', 'default danger', D.nodes.length ? 'Power off and run' : 'Cut and run');
     go.id = 'dz-confirm-go';
     go.addEventListener('click', () => { D.confirming = false; runTrace(); });
     const no = el('button', null, 'Cancel');
@@ -164,11 +233,12 @@ function disasterResult(res, width) {
   const d = res.disaster;
   if (d.mode === 'failover') return failoverResult(res, width);   // failover.js
   const box = el('div', 'dz-result');
-  box.appendChild(el('div', 'dz-title', `After the disaster: ${d.nodes.join(', ')} powered off`));
+  box.appendChild(el('div', 'dz-title', `After the disaster: ${dzWhat(d)}`));
   (d.warnings || []).forEach((w) => box.appendChild(el('div', 'dz-warn', w)));
   if (d.error) box.appendChild(el('div', 's-bad', 'Stopped early: ' + d.error));
   const po = d.power_off || {};
   const notOff = Object.entries(po).filter(([, v]) => v !== 'STOPPED' && v !== 'DEFINED_ON_CORE');
+  // (a cut link reports STOPPED too)
   if (Object.keys(po).length) {
     box.appendChild(el('div', notOff.length ? 's-warn' : 's-dim', `Power-off took ${d.power_off_seconds ?? '?'} s.` +
       (notOff.length ? ` Not confirmed stopped: ${notOff.map(([k, v]) => `${k} (${v})`).join(', ')}.` : '')));
@@ -195,8 +265,9 @@ function disasterResult(res, width) {
     st.appendChild(el('span', a.verdict.level === 'ok' ? 's-ok' : a.verdict.level === 'fail' ? 's-bad' : 's-warn', a.verdict.text));
     box.appendChild(st);
     const down = new Set(d.nodes);
-    const c2 = candidates(trace.source, a.virtual_target ? a.target : trace.target, down);
-    box.appendChild(pathDiagram(a, c2, width, { down }));
+    const cut = dzCut(d);
+    const c2 = candidates(trace.source, a.virtual_target ? a.target : trace.target, down, new Set(cut.map((l) => l.id)));
+    box.appendChild(pathDiagram(a, c2, width, { down, cut }));
     const f = el('div', 'path-findings');
     (a.findings || []).forEach((x) => f.appendChild(el('div', null, x)));
     if ((a.findings || []).length) box.appendChild(f);
@@ -205,12 +276,12 @@ function disasterResult(res, width) {
     box.appendChild(el('div', 's-bad', 'The trace after the disaster failed: ' + d.after_error));
   }
   const r = d.restored || {};
-  const bad = Object.entries(r).filter(([, v]) => v !== 'BOOTED');
+  const bad = Object.entries(r).filter(([, v]) => v !== 'BOOTED' && v !== 'STARTED');
   if (Object.keys(po).length) {
     box.appendChild(el('div', 'dz-restore ' + (d.restore === false || bad.length ? 's-warn' : 's-ok'),
       d.restore === false ? `Left powered off, as chosen: ${d.nodes.join(', ')}.`
         : bad.length ? `Restore incomplete: ${bad.map(([k, v]) => `${k} (${v})`).join(', ')}. Use Restore in the banner.`
-          : `Restored: ${Object.keys(r).length} node${Object.keys(r).length === 1 ? '' : 's'} running again.`));
+          : `Restored: ${Object.keys(r).length} item${Object.keys(r).length === 1 ? '' : 's'} back in service.`));
   }
   return box;
 }
@@ -223,12 +294,12 @@ async function pollDisaster() {
   b.innerHTML = '';
   if (st.active) {
     b.hidden = false; b.className = 'dz-banner run';
-    b.appendChild(el('span', null, `Disaster test running: ${st.active.nodes.join(', ')} (${st.active.stage}). ` +
+    b.appendChild(el('span', null, `Disaster test running: ${[...st.active.nodes, ...Object.keys(st.active.links || {})].join(', ')} (${st.active.stage}). ` +
       'Traces started now see a deliberately degraded network.'));
   } else if (st.interrupted) {
     b.hidden = false; b.className = 'dz-banner stuck';
-    const n = st.interrupted.nodes;
-    b.appendChild(el('span', null, `A disaster test left ${n.length} node${n.length === 1 ? '' : 's'} powered off: ${n.join(', ')}.`));
+    const n = [...st.interrupted.nodes, ...Object.keys(st.interrupted.links || {})];
+    b.appendChild(el('span', null, `A disaster test left ${n.length} item${n.length === 1 ? '' : 's'} down (powered off or cut): ${n.join(', ')}.`));
     const btn = el('button', 'default', 'Restore now');
     btn.addEventListener('click', async () => {
       btn.disabled = true; btn.textContent = 'Restoring (waits for them to boot)...';

@@ -32,7 +32,11 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 
-BPF = "icmp or esp or udp port 500 or udp port 4500"
+_BPF_L3 = "icmp or esp or udp port 500 or udp port 4500"
+# The second half matters: a bare `icmp` only matches UNTAGGED frames, so every
+# 802.1Q trunk (core <-> server room, core <-> core) came back as an empty pcap
+# and the path walk stopped at the first switch (live run 2026-10-06, DCI cut).
+BPF = f"{_BPF_L3} or (vlan and ({_BPF_L3}))"
 CONFIRM_S = 2.0                 # replies needed in a row (as time) before stopping early
 LINUX_INTERVAL_S = 0.2          # `ping -i 0.2`: 5 probes a second (verified on BusyBox)
 IOS_INTERVAL_S = 1.0            # IOS/ASA can't set an interval: one `repeat 1` per second
@@ -48,7 +52,7 @@ _ECHO_ID_SEQ = re.compile(r"id=(0x[0-9a-f]+), seq=(\d+)")
 
 # =========================================================== capture scope ===
 def capture_scope(nodes: list[dict], src: str, targets: list[str], baseline_links: list[str],
-                  down: set[str]) -> list[str]:
+                  down: set[str], cut: set[str] = frozenset()) -> list[str]:
     """Every link worth recording: the baseline's proven links, every shortest
     path to every target/holder BEFORE and AFTER the disaster nodes go, tunnel
     underlays, every leg of any firewall in scope, and the links into the
@@ -56,13 +60,14 @@ def capture_scope(nodes: list[dict], src: str, targets: list[str], baseline_link
     whose two ends are running NOW are returned (a capture on a link to a
     stopped node fails)."""
     import pathtrace                                       # noqa: PLC0415 - avoid an import cycle
-    after = [dict(n, up=bool(n.get("up")) and n["label"] not in down) for n in nodes]
+    after = [dict(n, up=bool(n.get("up")) and n["label"] not in down,
+                  links=[l for l in n.get("links") or [] if l.get("link_id") not in cut]) for n in nodes]
     scope: set[str] = {src}
     for t in targets:
         for ns in (nodes, after):
             scope |= set(pathtrace.candidates(ns, src, t)["nodes"])
     link_map = pathtrace._link_map(nodes)
-    for lid in baseline_links:
+    for lid in [*baseline_links, *cut]:
         l = link_map.get(lid)
         if l:
             scope |= {l["a"], l["b"]}
@@ -84,7 +89,7 @@ def capture_scope(nodes: list[dict], src: str, targets: list[str], baseline_link
     up = {n["label"] for n in nodes if n.get("up")}
     out = [lid for lid, l in link_map.items()
            if l["a"] in scope and l["b"] in scope and l["a"] in up and l["b"] in up]
-    return sorted(set(out) | {l for l in baseline_links if l in link_map})
+    return sorted(set(out) | {l for l in [*baseline_links, *cut] if l in link_map})
 
 
 # ================================================================ parsing ===
@@ -476,7 +481,7 @@ def fill_missing(probes: list[dict], console: dict[int, float], interval: float,
 
 
 # =========================================================== the analysis ===
-def failure_moment(probes: list[dict], sel: list[dict], down: set[str]) -> float | None:
+def failure_moment(probes: list[dict], sel: list[dict], down: set[str], cut: set[str] = frozenset()) -> float | None:
     """F: the last moment a now-dead node FORWARDED this test's traffic - the
     same packet (a probe's echo, or an ESP packet by SPI + sequence number)
     seen on two different links of the same disaster node, at the later of the
@@ -496,6 +501,11 @@ def failure_moment(probes: list[dict], sel: list[dict], down: set[str]) -> float
             links = {e["link_id"] for e in on}
             if len(links) >= 2:
                 best = max(best or on[-1]["t"], on[-1]["t"])
+    # A cut cable: the last of this test's packets seen on it (a link is one
+    # capture point, so no second sighting is needed - nothing else writes it).
+    for e in sel:
+        if e["link_id"] in cut and e["kind"] in ("echo", "esp"):
+            best = max(best or e["t"], e["t"])
     return best
 
 
@@ -511,7 +521,8 @@ def _runs(flags: list[bool]) -> int:
 def analyse(pcaps: dict, link_map: dict, owners: dict, *, src: str, ip: str,
             endpoints: set[str], down: set[str], baseline_path: list[str], single_id: bool,
             interval: float, console: dict[int, float], times_local: dict, window_s: int,
-            completed_by: str, coverage: dict, device_logs: list[dict] | None = None) -> dict:
+            completed_by: str, coverage: dict, device_logs: list[dict] | None = None,
+            cut: dict[str, str] | None = None) -> dict:
     """Everything the result shows, from the raw pulls. `times_local` holds local
     epoch times: T0 (stop requested), stopped {label: t}, T1 (all stopped),
     end (recording stopped), probe_started. Returns the `failover` dict (spec §8)."""
@@ -553,12 +564,16 @@ def analyse(pcaps: dict, link_map: dict, owners: dict, *, src: str, ip: str,
         return None if t_local is None or l2c is None else t_local - l2c
     probes = fill_missing(probes, {s: (to_c(t) or t) for s, t in console.items()}, interval, single_id)
 
-    F = failure_moment(probes, sel, down)
+    cut = cut or {}
+    F = failure_moment(probes, sel, down, set(cut.values()))
     T0c, T1c = to_c(times_local.get("T0")), to_c(times_local.get("T1"))
-    F_src = "last packet a disaster node forwarded"
+    F_src = ("last packet a disaster node forwarded" if not cut else
+             "last packet across a cut link" if not down else
+             "last packet a disaster node forwarded or a cut link carried")
     if F is None:
         F = T1c if T1c is not None else (probes[0]["sent"] if probes else 0.0)
-        F_src = "no packet crossed a disaster node; power-off completion used" if T1c is not None \
+        F_src = ("no packet crossed a disaster node; power-off completion used" if not cut else
+                 "no packet crossed the failure; the moment CML reported it done used") if T1c is not None \
             else "no reference available"
 
     def rel(t):
@@ -663,12 +678,18 @@ def analyse(pcaps: dict, link_map: dict, owners: dict, *, src: str, ip: str,
     # events (timeline markers), relative to F
     ev = []
     if T0c is not None:
-        ev.append({"t": rel(T0c), "kind": "power_off_requested", "text": "Power-off requested (click)"})
+        ev.append({"t": rel(T0c), "kind": "power_off_requested",
+                   "text": ("Cable cut requested (click)" if cut and not down else
+                            "Power-off and cable cut requested (click)" if cut else "Power-off requested (click)")})
     for lab, t in sorted((times_local.get("stopped") or {}).items(), key=lambda kv: kv[1] or 0):
         if to_c(t) is not None:
-            ev.append({"t": rel(to_c(t)), "kind": "node_stopped", "text": f"{lab} reported STOPPED by CML"})
+            ev.append({"t": rel(to_c(t)), "kind": "node_stopped",
+                       "text": f"{lab} cable cut (link STOPPED by CML)" if lab in cut
+                       else f"{lab} reported STOPPED by CML"})
     if T1c is not None:
-        ev.append({"t": rel(T1c), "kind": "all_stopped", "text": "All nodes stopped: the window starts"})
+        ev.append({"t": rel(T1c), "kind": "all_stopped",
+                   "text": ("All links cut" if cut and not down else "All nodes stopped" +
+                            (" and links cut" if cut else "")) + ": the window starts"})
     ev.append({"t": 0.0, "kind": "failure", "text": f"Failure observed (F): {F_src}"})
     if first_lost:
         ev.append({"t": rel(first_lost["sent"]), "kind": "first_loss", "text": f"First lost probe ({first_lost['key']})"})
@@ -742,6 +763,8 @@ def run(job_id: str, cml, con, spec: dict, baseline: dict, d: dict, stop: thread
     from console import BackgroundPing, Console, ContinuousPing   # noqa: PLC0415
 
     sel = d["nodes"]
+    cut = dict(d.get("links") or {})                       # {name: link_id}: cables to unplug
+    cut_ids = set(cut.values())
     window = int(d.get("window_s") or DEFAULT_WINDOW_S)
     stop_early = bool(d.get("stop_early", True))
     src, nodes = spec["source"], spec["nodes"]
@@ -756,7 +779,7 @@ def run(job_id: str, cml, con, spec: dict, baseline: dict, d: dict, stop: thread
     down = set(sel)
 
     # -- arm capture
-    scope = capture_scope(nodes, src["label"], sorted(endpoints), base_links, down)
+    scope = capture_scope(nodes, src["label"], sorted(endpoints), base_links, down, cut_ids)
     stage(f"arming packet capture on {len(scope)} links")
     t_arm = time.time()
     starts = pathtrace._capture_start_all(cml, scope, maxtime=window + 240, bpfilter=BPF, maxpackets=20000)
@@ -773,7 +796,8 @@ def run(job_id: str, cml, con, spec: dict, baseline: dict, d: dict, stop: thread
             return lid, None
     with ThreadPoolExecutor(max_workers=8) as ex:
         keys = dict(ex.map(key_of, started))
-    doomed = [l for l in started if keys.get(l) and (link_map[l]["a"] in down or link_map[l]["b"] in down)]
+    doomed = [l for l in started if keys.get(l) and (link_map[l]["a"] in down or link_map[l]["b"] in down
+                                                    or l in cut_ids)]
     snapshots: dict[str, bytes] = {}
     snap_stop = threading.Event()
 
@@ -864,13 +888,15 @@ def run(job_id: str, cml, con, spec: dict, baseline: dict, d: dict, stop: thread
         # -- power off
         ids = {n["label"]: n["id"] for n in cml.nodes_full().values() if n["label"] in sel}
         write_record()
-        stage(f"powering off {len(sel)} node{'s' if len(sel) > 1 else ''}: {', '.join(sel)}")
+        stage(disaster.describe(sel, cut))
         T0 = time.time()
-        out["power_off"] = {x: "requested" for x in sel}
+        out["power_off"] = {x: "requested" for x in [*sel, *cut]}
         stopped: dict[str, float] = {}
 
         def power():
-            res = disaster._power(cml, ids, "stop", {"STOPPED", "DEFINED_ON_CORE"}, 180)
+            res = disaster._cut(cml, cut, "stop") if cut else {}
+            if ids:
+                res.update(disaster._power(cml, ids, "stop", {"STOPPED", "DEFINED_ON_CORE"}, 180))
             out["power_off"] = res
         pt = threading.Thread(target=power, daemon=True)
         if doomed:
@@ -891,12 +917,20 @@ def run(job_id: str, cml, con, spec: dict, baseline: dict, d: dict, stop: thread
             refresh_sent(now)
             if T1 is None and now - last_state >= 1.0:
                 last_state = now
-                for n in cml.nodes_full().values():
-                    if n["label"] in sel and n["label"] not in stopped and n.get("state") in ("STOPPED", "DEFINED_ON_CORE"):
-                        stopped[n["label"]] = time.time()
-                if len(stopped) == len(sel) or not pt.is_alive():
+                if sel:
+                    for n in cml.nodes_full().values():
+                        if n["label"] in sel and n["label"] not in stopped and n.get("state") in ("STOPPED", "DEFINED_ON_CORE"):
+                            stopped[n["label"]] = time.time()
+                for name, lid in cut.items():
+                    if name not in stopped:
+                        try:
+                            if cml.link_state(lid) == "STOPPED":
+                                stopped[name] = time.time()
+                        except Exception:              # noqa: BLE001 - polled again next second
+                            pass
+                if len(stopped) == len(sel) + len(cut) or not pt.is_alive():
                     T1 = time.time()
-                    for x in sel:
+                    for x in [*sel, *cut]:
                         stopped.setdefault(x, T1)
             if T1 is not None and now - last_poll >= 1.0 and live_links and not new_path_seen:
                 last_poll = now
@@ -981,7 +1015,8 @@ def run(job_id: str, cml, con, spec: dict, baseline: dict, d: dict, stop: thread
         logs = []
         if d.get("device_logs"):
             stage("collecting device logs")
-            logs = collect_device_logs(cml, spec, baseline, sel, T0 - 10, T_end + 5)
+            ends = [e for lid in cut_ids for e in (link_map[lid]["a"], link_map[lid]["b"])]
+            logs = collect_device_logs(cml, spec, baseline, sel, T0 - 10, T_end + 5, first=ends)
 
         stage("building the failover timeline")
         fo = analyse(pcaps, link_map, spec.get("owners") or {}, src=src["label"], ip=ip,
@@ -993,7 +1028,7 @@ def run(job_id: str, cml, con, spec: dict, baseline: dict, d: dict, stop: thread
                                   "capture_started_cml": max((v for l, v in starts.items() if v and l in src_links),
                                                              default=None)},
                      window_s=window, completed_by=completed_by or "window end", coverage=coverage,
-                     device_logs=logs)
+                     device_logs=logs, cut=cut)
         fo["link_names"] = {lid: f"{l['a']} - {l['b']}" for lid, l in link_map.items() if lid in scope}
         if probe_err:
             fo["probe_error"] = probe_err["error"]
@@ -1059,12 +1094,14 @@ def parse_device_log(node: str, clock_line: str, t_cmd_local: float, log_text: s
     return out
 
 
-def collect_device_logs(cml, spec, baseline, down, lo_local, hi_local, max_nodes: int = 8) -> list[dict]:
+def collect_device_logs(cml, spec, baseline, down, lo_local, hi_local, max_nodes: int = 8,
+                        first: list[str] | None = None) -> list[dict]:
     """`show clock` + `show logging` from the running IOS devices on the baseline
-    path (and their neighbours in scope), up to 6 consoles in parallel."""
+    path (and their neighbours in scope), up to 6 consoles in parallel. `first`:
+    nodes to read before the path (the two ends of a cut cable see it first)."""
     from console import Console                            # noqa: PLC0415
     by = {n["label"]: n for n in spec["nodes"]}
-    cand = [x for x in (baseline.get("path") or []) if x not in down
+    cand = [x for x in [*(first or []), *(baseline.get("path") or [])] if x not in down
             and (by.get(x) or {}).get("probe_family") == "ios" and (by.get(x) or {}).get("up")]
     for h in spec.get("vip_holders") or []:
         pass

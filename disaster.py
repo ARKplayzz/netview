@@ -22,6 +22,7 @@ from pathlib import Path
 from console import BackgroundPing
 
 MAX_NODES = 12
+MAX_LINKS = 8
 STATE_FILE = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "NetView" / "disaster.json"
 
 _lock = threading.Lock()
@@ -69,10 +70,24 @@ def cancel(job_id: str) -> bool:
 
 
 # ----------------------------------------------------------- validation ---
-def validate(sel: list[str], by_label: dict, source: str, target: str | None) -> tuple[str | None, list[str]]:
-    """(error, warnings). An error refuses the request before anything runs."""
-    if not sel:
-        return "No nodes chosen for the disaster.", []
+def validate(sel: list[str], by_label: dict, source: str, target: str | None,
+             links: dict[str, str] | None = None, link_map: dict | None = None) -> tuple[str | None, list[str]]:
+    """(error, warnings). An error refuses the request before anything runs.
+    `links` is {name: link_id} of cables to cut (the nodes stay running)."""
+    links = links or {}
+    if not sel and not links:
+        return "Nothing chosen for the disaster: pick nodes to power off or links to cut.", []
+    if len(links) > MAX_LINKS:
+        return f"At most {MAX_LINKS} links per disaster.", []
+    for name, lid in links.items():
+        l = (link_map or {}).get(lid)
+        if not l:
+            return f"Unknown link: {name}.", []
+        for end in (l["a"], l["b"]):
+            if not (by_label.get(end) or {}).get("up"):
+                return f"{name}: {end} is not running, so the link carries nothing to cut.", []
+            if end in sel:
+                return f"{name}: {end} is also being powered off; cutting its cable as well measures nothing extra.", []
     if len(set(sel)) != len(sel):
         return "A node is listed twice.", []
     if len(sel) > MAX_NODES:
@@ -140,16 +155,57 @@ def _power(cml, ids: dict[str, str], action: str, want: set[str], deadline_s: in
     return res
 
 
-def restore(cml, labels: list[str], deadline_s: int = 600) -> dict[str, str]:
-    """Start every node that is not running; the record is cleared only if all boot."""
+def _cut(cml, links: dict[str, str], action: str, deadline_s: int = 60) -> dict[str, str]:
+    """Stop (unplug) or start (re-plug) each link, then poll until it reports
+    the wanted state. Same shape as _power: a failed call is re-checked by state."""
+    want = "STOPPED" if action == "stop" else "STARTED"
+    res: dict[str, str] = {}
+    for name, lid in links.items():
+        try:
+            (cml.stop_link if action == "stop" else cml.start_link)(lid)
+        except Exception as e:                    # noqa: BLE001 - verified by state below
+            res[name] = f"call failed ({type(e).__name__}); checking state"
+    t0 = time.time()
+    pending = set(links)
+    while pending and time.time() - t0 < deadline_s:
+        for name in list(pending):
+            try:
+                if cml.link_state(links[name]) == want:
+                    res[name] = want
+                    pending.discard(name)
+            except Exception:                     # noqa: BLE001
+                continue
+        if pending:
+            time.sleep(1)
+    for name in pending:
+        res[name] = f"not {want} after {deadline_s} s"
+    return res
+
+
+def restore(cml, labels: list[str], deadline_s: int = 600, links: dict[str, str] | None = None) -> dict[str, str]:
+    """Start every node that is not running and re-plug every cut link; the
+    record is cleared only if all of them come back."""
+    links = links or {}
     ids = {n["label"]: n["id"] for n in cml.nodes_full().values() if n["label"] in labels}
     down = {k: v for k, v in ids.items() if _state(cml, v) != "BOOTED"}
     res = {k: "BOOTED" for k in ids if k not in down}
+    if links:                                     # cables first: they are instant, the nodes are not
+        res.update(_cut(cml, links, "start"))
     if down:
         res.update(_power(cml, down, "start", {"BOOTED"}, deadline_s))
-    if all(v == "BOOTED" for v in res.values()) and set(res) == set(labels):
+    if all(v in ("BOOTED", "STARTED") for v in res.values()) and set(res) == set(labels) | set(links):
         _write(None)
     return res
+
+
+def describe(sel: list[str], links: dict[str, str]) -> str:
+    """'powering off A, B; cutting X - Y' for stage lines."""
+    parts = []
+    if sel:
+        parts.append(f"powering off {len(sel)} node{'s' if len(sel) > 1 else ''}: {', '.join(sel)}")
+    if links:
+        parts.append(f"cutting {len(links)} link{'s' if len(links) > 1 else ''}: {', '.join(links)}")
+    return "; ".join(parts)
 
 
 # ------------------------------------------------------------ analysis ---
@@ -203,11 +259,12 @@ def run(job_id: str, cml, con, spec: dict, execute, set_, respec) -> dict:
     global _active
     d = spec["disaster"]
     sel, settle, do_restore = d["nodes"], int(d.get("settle_s", 30)), bool(d.get("restore", True))
+    links = dict(d.get("links") or {})
     stop = threading.Event()
     with _lock:
         if _active is not None:
             raise RuntimeError("another disaster test is already running")
-        _active = {"job_id": job_id, "nodes": sel, "stage": "baseline trace",
+        _active = {"job_id": job_id, "nodes": sel, "links": links, "stage": "baseline trace",
                    "since": datetime.now(timezone.utc).isoformat(), "restore": do_restore}
     _cancel[job_id] = stop
 
@@ -217,7 +274,7 @@ def run(job_id: str, cml, con, spec: dict, execute, set_, respec) -> dict:
             if _active:
                 _active["stage"] = txt
 
-    out: dict = {"nodes": sel, "settle_s": settle, "restore": do_restore, "warnings": d.get("warnings", [])}
+    out: dict = {"nodes": sel, "links": links, "settle_s": settle, "restore": do_restore, "warnings": d.get("warnings", [])}
     failover_mode = d.get("mode") == "failover"
     if failover_mode:
         out.update(mode="failover", window_s=d.get("window_s"), stop_early=d.get("stop_early", True),
@@ -234,11 +291,12 @@ def run(job_id: str, cml, con, spec: dict, execute, set_, respec) -> dict:
             if failover_mode:
                 import failover                    # noqa: PLC0415 - failover capture (spec: failover-capture-spec.md)
                 failover.run(job_id, cml, con, spec, baseline, d, stop, stage, set_, out,
-                             write_record=lambda: _write({"job_id": job_id, "nodes": sel, "restore": do_restore,
+                             write_record=lambda: _write({"job_id": job_id, "nodes": sel, "links": links,
+                                                          "restore": do_restore,
                                                           "started": datetime.now(timezone.utc).isoformat()}))
                 powered_off = bool(out.get("power_off"))
             else:
-                powered_off = _disaster(job_id, cml, spec, baseline, sel, settle, do_restore, stop, stage, out)
+                powered_off = _disaster(job_id, cml, spec, baseline, sel, links, settle, do_restore, stop, stage, out)
             if stop.is_set():
                 raise RuntimeError("cancelled after the power-off")
             # Failover mode reads the after-path from its own capture; the full
@@ -263,11 +321,14 @@ def run(job_id: str, cml, con, spec: dict, execute, set_, respec) -> dict:
         return result
     finally:
         try:
+            n_back = len(sel) + len(links)
             if out.get("power_off") and do_restore:
-                stage(f"restoring {len(sel)} node{'s' if len(sel) > 1 else ''} and waiting for them to boot")
-                out["restored"] = restore(cml, sel)
+                stage(f"restoring {n_back} item{'s' if n_back > 1 else ''}" +
+                      (" and waiting for the nodes to boot" if sel else ""))
+                out["restored"] = restore(cml, sel, links=links)
             elif out.get("power_off"):
                 out["restored"] = {x: "left powered off (restore was not selected)" for x in sel}
+                out["restored"].update({x: "left cut (restore was not selected)" for x in links})
             if failover_mode and result is not None and out.get("failover"):
                 import failover                    # noqa: PLC0415
                 failover.save(result)              # history + pcaps; after restore so it records the restore
@@ -278,8 +339,8 @@ def run(job_id: str, cml, con, spec: dict, execute, set_, respec) -> dict:
             _cancel.pop(job_id, None)
 
 
-def _disaster(job_id, cml, spec, baseline, sel, settle, do_restore, stop, stage, out) -> bool:
-    """Power the nodes off while a paced probe watches source -> target."""
+def _disaster(job_id, cml, spec, baseline, sel, links, settle, do_restore, stop, stage, out) -> bool:
+    """Power the nodes off / cut the links while a paced probe watches source -> target."""
     ids = {n["label"]: n["id"] for n in cml.nodes_full().values() if n["label"] in sel}
     src = spec["source"]
     # BusyBox resolves a DNS-failover NAME on every ping, the way a client would;
@@ -305,13 +366,16 @@ def _disaster(job_id, cml, spec, baseline, sel, settle, do_restore, stop, stage,
     t_wait = time.time()
     while len(seen) < 3 and time.time() - t_wait < 60 and not stop.is_set():
         time.sleep(0.5)
-    _write({"job_id": job_id, "nodes": sel, "started": datetime.now(timezone.utc).isoformat(),
+    _write({"job_id": job_id, "nodes": sel, "links": links, "started": datetime.now(timezone.utc).isoformat(),
             "restore": do_restore})
-    stage(f"powering off {len(sel)} node{'s' if len(sel) > 1 else ''}: {', '.join(sel)}")
+    stage(describe(sel, links))
     t_off = time.time()
     pre = len(seen)
-    out["power_off"] = {x: "requested" for x in sel}   # restore is owed from this point on
-    out["power_off"] = _power(cml, ids, "stop", {"STOPPED", "DEFINED_ON_CORE"}, 180)
+    out["power_off"] = {x: "requested" for x in [*sel, *links]}   # restore is owed from this point on
+    res = _cut(cml, links, "stop") if links else {}
+    if ids:
+        res.update(_power(cml, ids, "stop", {"STOPPED", "DEFINED_ON_CORE"}, 180))
+    out["power_off"] = res
     out["power_off_seconds"] = round(time.time() - t_off)
     off_at["i"] = len(seen)
     stage(f"measuring the outage (up to {settle} s after the power-off)")

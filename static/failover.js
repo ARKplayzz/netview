@@ -146,7 +146,7 @@ function failoverResult(res, width) {
   const d = res.disaster;
   const fo = d.failover;
   const box = el('div', 'dz-result fo-result');
-  box.appendChild(el('div', 'dz-title', `Failover capture: ${d.nodes.join(', ')} powered off`));
+  box.appendChild(el('div', 'dz-title', `Failover capture: ${dzWhat(d)}`));
   (d.warnings || []).forEach((w) => box.appendChild(el('div', 'dz-warn', w)));
   if (d.error) box.appendChild(el('div', 's-bad', 'Stopped early: ' + d.error));
   if (!fo) {
@@ -204,9 +204,10 @@ function failoverResult(res, width) {
     }
     const synth = { path: fin.hops, links, target: fin.hops[fin.hops.length - 1], virtual_target: res.virtual_target,
                     changed: base && base !== fin ? { from: base.hops, at: null } : null };
-    box.appendChild(pathDiagram(synth, { nodes: [], links: [] }, width, { down: new Set(d.nodes) }));
+    box.appendChild(pathDiagram(synth, { nodes: [], links: [] }, width, { down: new Set(d.nodes), cut: dzCut(d) }));
     box.appendChild(el('div', 's-dim', `Solid: the path after the failover (${fin.id}), packet counts after the failure. ` +
-      (base && base !== fin ? `Dotted: the path before (${base.id}). ` : '') + 'Crossed out: powered off.'));
+      (base && base !== fin ? `Dotted: the path before (${base.id}). ` : '') + 'Crossed out: powered off.' +
+      (dzCut(d).length ? ' Red dashed: cut cable.' : '')));
     const rp = el('button', 'default', 'Replay the failover on the topology');
     rp.addEventListener('click', () => {
       const t0 = fo.packets.length ? fo.packets[0].t : 0;
@@ -341,11 +342,11 @@ function foCause(p) {
 
 function restoreLine(d) {
   const r = d.restored || {};
-  const bad = Object.entries(r).filter(([, v]) => v !== 'BOOTED');
+  const bad = Object.entries(r).filter(([, v]) => v !== 'BOOTED' && v !== 'STARTED');
   return el('div', 'dz-restore ' + (d.restore === false || bad.length ? 's-warn' : 's-ok'),
     d.restore === false ? `Left powered off, as chosen: ${d.nodes.join(', ')}.`
       : bad.length ? `Restore incomplete: ${bad.map(([k, v]) => `${k} (${v})`).join(', ')}. Use Restore in the banner.`
-        : Object.keys(r).length ? `Restored: ${Object.keys(r).length} node${Object.keys(r).length === 1 ? '' : 's'} running again.` : '');
+        : Object.keys(r).length ? `Restored: ${Object.keys(r).length} item${Object.keys(r).length === 1 ? '' : 's'} back in service.` : '');
 }
 
 /* ------------------------------------------------------------ timeline */
@@ -482,7 +483,7 @@ function failoverPacketLog(fo) {
   q.addEventListener('input', () => { f.text = q.value.toLowerCase(); draw(); });
   bar.appendChild(q);
   box.appendChild(bar);
-  const wrap = el('div', 'pkt-log-wrap');
+  const wrap = el('div', 'pkt-log-wrap fo-pkt-wrap');
   box.appendChild(wrap);
   const rec = (fo.events.find((e) => e.kind === 'first_reply_new') || {}).t;
   const near = (t) => Math.abs(t) <= 2 || (rec != null && Math.abs(t - rec) <= 2);

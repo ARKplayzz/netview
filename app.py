@@ -429,13 +429,20 @@ def api_trace():
         return jsonify(err[0]), err[1]
     warnings: list[str] = []
     dz = body.get("disaster") or {}
-    if dz.get("nodes"):
+    if dz.get("nodes") or dz.get("links"):
         by_label = {n["label"]: n for n in spec["nodes"]}
-        error, warnings = disaster.validate(list(dz["nodes"]), by_label, spec["source"]["label"],
-                                            (spec.get("target") or {}).get("label"))
+        # Cables to cut, by link id; named "A - B" from the live link map so the
+        # page cannot rename what it cuts.
+        lmap = pathtrace._link_map(spec["nodes"])
+        links = {}
+        for lid in dz.get("links") or []:
+            l = lmap.get(lid)
+            links[f"{l['a']} - {l['b']}" if l else lid] = lid
+        error, warnings = disaster.validate(list(dz.get("nodes") or []), by_label, spec["source"]["label"],
+                                            (spec.get("target") or {}).get("label"), links, lmap)
         if error:
             return jsonify({"error": error}), 409
-        spec["disaster"] = {"nodes": list(dz["nodes"]),
+        spec["disaster"] = {"nodes": list(dz.get("nodes") or []), "links": links,
                             "settle_s": max(15, min(int(dz.get("settle_s", 30)), 120)),
                             "restore": bool(dz.get("restore", True)), "warnings": warnings}
         if dz.get("mode") == "failover":
@@ -483,7 +490,7 @@ def api_disaster_restore():
     rec = st["interrupted"]
     if not rec:
         return jsonify({"restored": {}})
-    res = disaster.restore(cml_api.shared(), rec["nodes"])
+    res = disaster.restore(cml_api.shared(), rec["nodes"], links=rec.get("links") or {})
     return jsonify({"restored": res})
 
 

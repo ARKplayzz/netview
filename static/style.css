@@ -278,6 +278,8 @@ table.p tr.drift td { background: var(--infobg); }
 .node.t-idle { opacity: .45; }
 .node.t-was { opacity: .55; }
 .wire.t-prev { stroke: var(--ink3); stroke-dasharray: 2 4; stroke-width: 2; }
+.wire.t-cut { stroke: var(--bad); stroke-dasharray: 7 5; stroke-width: 2.5; }
+.dz-chip.dz-cut { border-color: var(--bad); }
 .node.t-end .sel-box { stroke: var(--sel); stroke-width: 2; stroke-dasharray: none; }
 .node.t-stop .sel-box { stroke: var(--bad); stroke-width: 2.5; stroke-dasharray: none; }
 .t-tag { font: 700 9.5px var(--sans); fill: var(--sel); text-anchor: middle; letter-spacing: .04em;
@@ -303,6 +305,15 @@ table.p tr.drift td { background: var(--infobg); }
 .pkt-log-wrap table.g th:nth-child(5) { width: 28px; }
 .pkt-log-wrap table.g th:nth-child(7) { width: 48px; }
 .pkt-log-wrap table.g td { overflow: hidden; text-overflow: ellipsis; }
+/* the failover packet log has its own columns: t, link, dir, kind, probe, src-dst, note */
+.fo-pkt-wrap { max-height: 360px; }
+.fo-pkt-wrap table.g th:nth-child(1) { width: 78px; }
+.fo-pkt-wrap table.g th:nth-child(2) { width: auto; }
+.fo-pkt-wrap table.g th:nth-child(3) { width: 34px; }
+.fo-pkt-wrap table.g th:nth-child(4) { width: 96px; }
+.fo-pkt-wrap table.g th:nth-child(5) { width: 84px; }
+.fo-pkt-wrap table.g th:nth-child(6) { width: 200px; }
+.fo-pkt-wrap table.g th:nth-child(7) { width: 12%; }
 tr.pkt-row.reply td { color: var(--ink2); }
 tr.pkt-row.hl td { background: var(--selbg); }
 .mode-tag { font: 700 10px var(--sans); letter-spacing: .04em; padding: 1px 6px; border-radius: 3px;
