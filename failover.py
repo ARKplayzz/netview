@@ -37,6 +37,83 @@ _BPF_L3 = "icmp or esp or udp port 500 or udp port 4500"
 # 802.1Q trunk (core <-> server room, core <-> core) came back as an empty pcap
 # and the path walk stopped at the first switch (live run 2026-10-06, DCI cut).
 BPF = f"{_BPF_L3} or (vlan and ({_BPF_L3}))"
+
+
+BPF_MAX = 128                   # CML 2.10 rejects a longer bpfilter (HTTP 400 string_too_long, 2026-10-07)
+
+
+def bpf_for(checks: list[dict] | None) -> str:
+    """The capture filter, widened for this run's service checks: DNS (53) and
+    each checked TCP port, tagged and untagged alike. libpcap carries a missing
+    qualifier forward (`udp port 500 or 4500` = both UDP ports), which keeps it
+    short; if it is still over CML's 128-character limit, the IKE ports go first
+    (they only add tunnel-negotiation markers to the timeline)."""
+    dns = any(c.get("kind") == "dns" for c in checks or [])
+    tcp = sorted({int(c["port"]) for c in checks or [] if c.get("kind") == "tcp"})
+    if not dns and not tcp:
+        return BPF
+
+    def build(ike: bool, tcp_ports: list[int]) -> str:
+        udp = (["500", "4500"] if ike else []) + (["53"] if dns else [])
+        parts = ["icmp", "esp"]
+        if udp:
+            parts.append("udp port " + " or ".join(udp))
+        if tcp_ports:
+            parts.append("tcp port " + " or ".join(str(x) for x in tcp_ports))
+        l3 = " or ".join(parts)
+        return f"{l3} or (vlan and ({l3}))"
+    for ike in (True, False):
+        f = build(ike, tcp)
+        if len(f) <= BPF_MAX:
+            return f
+    for n in range(len(tcp) - 1, -1, -1):     # last resort: fewer TCP ports
+        f = build(False, tcp[:n])
+        if len(f) <= BPF_MAX:
+            return f
+    return BPF
+
+
+def _dns_name(buf: bytes, off: int) -> tuple[str, int]:
+    """A (possibly compressed) DNS name at `off` -> (name, offset after it)."""
+    labels, jumped, end, hops = [], False, off, 0
+    while off < len(buf) and hops < 40:
+        n = buf[off]
+        hops += 1
+        if n == 0:
+            off += 1
+            break
+        if n & 0xC0 == 0xC0:
+            if off + 1 >= len(buf):
+                break
+            if not jumped:
+                end = off + 2
+            off = ((n & 0x3F) << 8) | buf[off + 1]
+            jumped = True
+            continue
+        labels.append(buf[off + 1:off + 1 + n].decode("ascii", "replace"))
+        off += 1 + n
+    return ".".join(labels), (end if jumped else off)
+
+
+def parse_dns(msg: bytes) -> dict | None:
+    """Minimal DNS: id, query/response, rcode, first question, A answers."""
+    if len(msg) < 12:
+        return None
+    did, flags, qd, an = struct.unpack(">HHHH", msg[:8])
+    name, answers = "", []
+    try:
+        name, off = _dns_name(msg, 12)
+        off += 4 * qd if qd else 0
+        for _ in range(an):
+            _, off = _dns_name(msg, off)
+            typ, _cls, _ttl, rdlen = struct.unpack(">HHIH", msg[off:off + 10])
+            off += 10
+            if typ == 1 and rdlen == 4:
+                answers.append(socket.inet_ntoa(msg[off:off + 4]))
+            off += rdlen
+    except (struct.error, IndexError):
+        pass                                      # truncated: keep what was read
+    return {"id": did, "response": bool(flags & 0x8000), "rcode": flags & 15, "name": name, "answers": answers}
 CONFIRM_S = 2.0                 # replies needed in a row (as time) before stopping early
 LINUX_INTERVAL_S = 0.2          # `ping -i 0.2`: 5 probes a second (verified on BusyBox)
 IOS_INTERVAL_S = 1.0            # IOS/ASA can't set an interval: one `repeat 1` per second
@@ -195,8 +272,32 @@ def parse_pcap(data: bytes, lid: str, meta: dict, owners: dict) -> list[dict]:
                 e.update(kind="esp", dir="esp", spi=f"{spi:#x}", esp_seq=eseq)
             elif 500 in (sp, dp) or 4500 in (sp, dp):
                 e.update(kind="ike", dir="ike", info=f"IKE UDP {sp}->{dp}")
+            elif 53 in (sp, dp):
+                d = parse_dns(pkt[pl + 8:])
+                if not d:
+                    continue
+                if d["response"]:
+                    rc = {0: "", 2: " SERVFAIL", 3: " NXDOMAIN", 5: " REFUSED"}.get(d["rcode"], f" rcode {d['rcode']}")
+                    info = f"DNS answer {d['name']} -> {','.join(d['answers']) or '(none)'}{rc}"
+                else:
+                    info = f"DNS query {d['name']}"
+                e.update(kind="dns", dir="response" if d["response"] else "query", seq=d["id"], info=info,
+                         dns_name=d["name"], dns_answers=d["answers"], dns_rcode=d["rcode"])
             else:
                 continue
+        elif proto == 6 and len(pkt) >= pl + 14:
+            sp, dp = struct.unpack(">HH", pkt[pl:pl + 4])
+            fl = pkt[pl + 13]
+            syn, ack, rst = bool(fl & 2), bool(fl & 16), bool(fl & 4)
+            if syn and not ack:
+                d = "syn"
+            elif syn and ack:
+                d = "synack"
+            elif rst:
+                d = "rst"
+            else:
+                continue                          # data and plain ACKs: not needed to prove who answered
+            e.update(kind="tcp", dir=d, info=f"TCP {d.upper()} {sp}->{dp}", tcp_ports=(sp, dp))
         else:
             continue
         out.append(e)
@@ -522,7 +623,7 @@ def analyse(pcaps: dict, link_map: dict, owners: dict, *, src: str, ip: str,
             endpoints: set[str], down: set[str], baseline_path: list[str], single_id: bool,
             interval: float, console: dict[int, float], times_local: dict, window_s: int,
             completed_by: str, coverage: dict, device_logs: list[dict] | None = None,
-            cut: dict[str, str] | None = None) -> dict:
+            cut: dict[str, str] | None = None, services: tuple | None = None) -> dict:
     """Everything the result shows, from the raw pulls. `times_local` holds local
     epoch times: T0 (stop requested), stopped {label: t}, T1 (all stopped),
     end (recording stopped), probe_started. Returns the `failover` dict (spec §8)."""
@@ -532,6 +633,16 @@ def analyse(pcaps: dict, link_map: dict, owners: dict, *, src: str, ip: str,
         if meta and data:
             events += parse_pcap(data, lid, meta, owners)
     src_links = {lid for lid, l in link_map.items() if src in (l["a"], l["b"])}
+    # The source's own addresses are what it actually sent from on its own link -
+    # never trust a stale owner map for them (a DHCP desk can hold an address the
+    # inventory still credits to another node).
+    src_ips = {e["src"] for e in events if e["link_id"] in src_links and e["kind"] == "echo"
+               and e["dir"] == "request" and e["dst"] == ip}
+    for e in events:
+        if e["src"] in src_ips:
+            e["src_owner"] = src
+        if e["dst"] in src_ips:
+            e["dst_owner"] = src
     sel = select(events, ip, src, src_links)
     for e in sel:
         e["t"] = e["at"]                  # one CML host clock, microseconds, on every link
@@ -627,8 +738,37 @@ def analyse(pcaps: dict, link_map: dict, owners: dict, *, src: str, ip: str,
         p["path_id"] = pid.get(tuple(p["req_path"]) + ("|",) + tuple(p["rep_path"])) if p["req_path"] else None
 
     # metrics
+    # Probes sent once recording had stopped cannot have their replies captured
+    # (2026-10-07: the bridge's last probe went out 0.3 s after the stop and read
+    # as a lost reply, which made a clean failover "unstable").
+    end_c = to_c(times_local.get("end"))
+    if end_c is not None:
+        after = [p for p in after if p["sent"] <= end_c - min(interval, 0.5)]
     lost_flags = [p["outcome"] != "ok" and p["outcome"] != "unknown" for p in after]
-    lost_after = [p for p in after if p["outcome"] not in ("ok", "unknown")]
+    # Isolated losses after a SUSTAINED recovery (2 s answered in a row) are blips,
+    # reported separately; only a real second outage (3+ probes) is "unstable".
+    sustain = max(3, int(round(2.0 / interval)))
+    rec_i = None
+    if any(lost_flags):
+        i0 = lost_flags.index(True)
+        streak = 0
+        for i in range(i0, len(after)):
+            streak = streak + 1 if after[i]["outcome"] == "ok" else 0
+            if streak >= sustain:
+                rec_i = i - sustain + 1
+                break
+    blip_runs, run = [], 0
+    if rec_i is not None:
+        for f in lost_flags[rec_i:] + [False]:
+            if f:
+                run += 1
+            elif run:
+                blip_runs.append(run)
+                run = 0
+    blips = sum(blip_runs) if blip_runs and max(blip_runs) <= 2 else 0
+    if blips:
+        lost_flags = lost_flags[:rec_i] + [False] * (len(lost_flags) - rec_i)
+    lost_after = [p for p, f in zip(after, lost_flags) if f]
     first_lost = lost_after[0] if lost_after else None
     last_lost = lost_after[-1] if lost_after else None
     first_ok_after_loss = next((p for p in after if last_lost and p["sent"] > last_lost["sent"]
@@ -667,7 +807,7 @@ def analyse(pcaps: dict, link_map: dict, owners: dict, *, src: str, ip: str,
         "detection_s": round(detect["sent"] - F, 3) if detect else None,
         "from_click_s": round(reply_t - T0c, 3) if (reply_t is not None and T0c is not None and
                                                      (lost_after or changed)) else None,
-        "sent_after_F": len(after), "lost": len(lost_after), "outage_periods": periods,
+        "sent_after_F": len(after), "lost": len(lost_after) + blips, "outage_periods": periods, "blips": blips,
         "rtt_before_ms": round(statistics.median(rtt_b), 2) if rtt_b else None,
         "rtt_after_ms": round(statistics.median(rtt_a), 2) if rtt_a else None,
         "path_changed": changed,
@@ -715,6 +855,28 @@ def analyse(pcaps: dict, link_map: dict, owners: dict, *, src: str, ip: str,
                   "answered_by": p["answered_by"], "rtt_ms": p["rtt_ms"],
                   "died_at": dict(p["died_at"], t=rel(p["died_at"]["t"])) if p["died_at"] else None,
                   "inferred": p.get("inferred", False)} for p in probes]
+    svc_out = []
+    if services:
+        import services as svc_mod                          # noqa: PLC0415
+        checks, results = services
+        names = {c["name"].lower() for c in checks if c["kind"] == "dns"}
+        hosts = {(c["host"], c["port"]) for c in checks if c["kind"] == "tcp"}
+        sev = []
+        for e in events:
+            if e.get("kind") == "dns" and (e.get("dns_name") or "").lower() in names:
+                sev.append(e)
+            elif e.get("kind") == "tcp" and any(h in (e["src"], e["dst"]) and port in (e.get("tcp_ports") or ())
+                                                for h, port in hosts):
+                sev.append(e)
+        for e in sev:
+            e["t"] = rel(e["at"])
+        svc_out = svc_mod.summarise(checks, results, lambda t: rel(to_c(t)), sev, endpoints, owners)
+        for e in sev:
+            packets.append({"t": e["t"], "link_id": e["link_id"], "a": e["a"], "ai": e["ai"], "b": e["b"],
+                            "bi": e["bi"], "kind": e["kind"], "dir": e["dir"], "seq": e.get("seq"),
+                            "icmp_id": None, "spi": None, "src": e["src"], "dst": e["dst"], "probe": None,
+                            "info": e.get("info")})
+        packets.sort(key=lambda x: x["t"] if x["t"] is not None else 0)
     dl = []
     for d in device_logs or []:
         t = to_c(d.get("t_local"))
@@ -731,7 +893,7 @@ def analyse(pcaps: dict, link_map: dict, owners: dict, *, src: str, ip: str,
         "probe": {"interval_s": interval, "sent": len(probes), "family": "linux" if single_id else "ios",
                   "dest": ip},
         "metrics": metrics, "paths": plist, "probes": probe_out, "events": ev, "packets": packets,
-        "coverage": coverage, "device_logs": dl,
+        "coverage": coverage, "device_logs": dl, "services": svc_out,
     }
 
 
@@ -772,17 +934,35 @@ def run(job_id: str, cml, con, spec: dict, baseline: dict, d: dict, stop: thread
     holders = list(spec.get("vip_holders") or [])
     tgt = baseline.get("target") or (spec.get("target") or {}).get("label")
     endpoints = set(holders) | ({tgt} if tgt else set())
-    linux = src.get("probe_family") == "linux"
-    interval = LINUX_INTERVAL_S if linux else IOS_INTERVAL_S
+    fam = src.get("probe_family")
+    linux = fam == "linux"
+    windows = fam == "windows"
+    stream = linux or windows                              # one ICMP id, consecutive seq, 5/s
+    interval = LINUX_INTERVAL_S if stream else IOS_INTERVAL_S
+    checks = list(d.get("checks") or [])
+    owners = spec.get("owners") or {}
     link_map = pathtrace._link_map(nodes)
     base_links = [l["id"] for l in (baseline.get("links") or []) if l.get("use") not in (None, "none")]
     down = set(sel)
 
     # -- arm capture
-    scope = capture_scope(nodes, src["label"], sorted(endpoints), base_links, down, cut_ids)
+    # Service checks name servers (DNS) and hosts (TCP): capture their paths too.
+    svc_targets = {owners.get(x) for c in checks for x in (c.get("server"), c.get("host")) if x} - {None}
+    # ...and every node HOLDING a checked address: an anycast VIP (e.g. DNS on
+    # 10.60.0.53) has no single owner, but each DC that carries it must be captured.
+    for c in checks:
+        svc_targets |= set(c.get("holders") or [])
+    for x in {x for c in checks for x in (c.get("server"), c.get("host")) if x}:
+        for n_ in nodes:
+            addrs = {a_.get("ip") for a_ in (n_.get("live") or {}).get("addresses") or []} | \
+                    {a_.get("value") for a_ in n_.get("addresses") or []}
+            if x in addrs:
+                svc_targets.add(n_["label"])
+    scope = capture_scope(nodes, src["label"], sorted(endpoints | svc_targets), base_links, down, cut_ids)
     stage(f"arming packet capture on {len(scope)} links")
     t_arm = time.time()
-    starts = pathtrace._capture_start_all(cml, scope, maxtime=window + 240, bpfilter=BPF, maxpackets=20000)
+    starts = pathtrace._capture_start_all(cml, scope, maxtime=window + 240, bpfilter=bpf_for(checks),
+                                          maxpackets=20000)
     started = [l for l, v in starts.items() if v]
 
     # Capture keys NOW, while every node is up (live run 2026-10-02: CML tears
@@ -834,9 +1014,22 @@ def run(job_id: str, cml, con, spec: dict, baseline: dict, d: dict, stop: thread
     console_ok: dict = {}
     sent_times: list[float] = []
     probe_err = {}
-    if linux:
-        cp = ContinuousPing(cml, src["label"], ip, interval, line=src.get("console_line", 0),
-                            on_reply=lambda s, t: console_ok.__setitem__(s, t))
+    runner = None
+    if checks:
+        import services                                    # noqa: PLC0415 - service checks (services.py)
+        runner = services.Runner(cml, checks, src["label"], fam)
+        stage(f"service checks: starting {len(checks)}")
+        runner.start()
+    if stream:
+        if windows:
+            from winclient import WinContinuousPing         # noqa: PLC0415
+            cp = WinContinuousPing(cml, src["label"], ip, interval,
+                                   on_reply=lambda s, t: console_ok.__setitem__(s, t),
+                                   checks=[services.token(c) for c in runner.folded] if runner else None,
+                                   on_line=runner.feed if runner else None)
+        else:
+            cp = ContinuousPing(cml, src["label"], ip, interval, line=src.get("console_line", 0),
+                                on_reply=lambda s, t: console_ok.__setitem__(s, t))
         stage("warm-up: starting the probe")
         if not cp.start():
             raise RuntimeError(f"the probe could not start on {src['label']}: {cp.error}")
@@ -884,6 +1077,11 @@ def run(job_id: str, cml, con, spec: dict, baseline: dict, d: dict, stop: thread
                 raise RuntimeError("the healthy path never answered steadily during warm-up; nothing was powered off")
         if stop.is_set():
             raise RuntimeError("cancelled before any node was powered off")
+        if runner and not runner._pre_done.is_set():
+            stage("service checks: DHCP renewal before the failure")
+            if not runner.wait_ready(120):
+                raise RuntimeError("the before-failure DHCP renewal did not finish; nothing was powered off")
+            time.sleep(3)                                   # a few healthy seconds after it on the timeline
 
         # -- power off
         ids = {n["label"]: n["id"] for n in cml.nodes_full().values() if n["label"] in sel}
@@ -930,6 +1128,8 @@ def run(job_id: str, cml, con, spec: dict, baseline: dict, d: dict, stop: thread
                             pass
                 if len(stopped) == len(sel) + len(cut) or not pt.is_alive():
                     T1 = time.time()
+                    if runner:
+                        runner.failure_done(T1)
                     for x in [*sel, *cut]:
                         stopped.setdefault(x, T1)
             if T1 is not None and now - last_poll >= 1.0 and live_links and not new_path_seen:
@@ -976,9 +1176,18 @@ def run(job_id: str, cml, con, spec: dict, baseline: dict, d: dict, stop: thread
                     completed_by = "window end"
                     break
             time.sleep(0.25)
+        if runner and any(c["kind"] == "dhcp" for c in checks):
+            stage("service checks: waiting for the after-failure DHCP renewal")
+            t_w = time.time()
+            while time.time() - t_w < 90 and not stop.is_set() and \
+                    not all(any(r.get("phase") == "after" for r in runner.results[c["id"]])
+                            for c in checks if c["kind"] == "dhcp"):
+                time.sleep(1)
         T_end = time.time()
         stage("stopping the probe")
         stopper()
+        if runner:
+            runner.stop()
         pt.join(timeout=200)
         out["power_off_seconds"] = round((T1 or T_end) - T0)
 
@@ -1019,16 +1228,29 @@ def run(job_id: str, cml, con, spec: dict, baseline: dict, d: dict, stop: thread
             logs = collect_device_logs(cml, spec, baseline, sel, T0 - 10, T_end + 5, first=ends)
 
         stage("building the failover timeline")
-        fo = analyse(pcaps, link_map, spec.get("owners") or {}, src=src["label"], ip=ip,
+        console = dict(console_ok) if stream else {}
+        if windows and console:
+            # Windows numbers echo requests per PC, not per ping run: the bridge's
+            # probe 0 went out as the first echo request the source link captured.
+            reqs = []
+            for lid in src_links:
+                for e in parse_pcap(pcaps.get(lid) or b"", lid, link_map[lid], owners):
+                    if e.get("kind") == "echo" and e.get("dir") == "request" and e.get("dst") == ip:
+                        reqs.append(e["seq"])
+            if reqs:
+                off = min(reqs)
+                console = {k + off: v for k, v in console.items()}
+        fo = analyse(pcaps, link_map, owners, src=src["label"], ip=ip,
                      endpoints=endpoints, down=down, baseline_path=list(baseline.get("path") or []),
-                     single_id=linux, interval=interval,
-                     console=dict(console_ok) if linux else {},
+                     single_id=stream, interval=interval,
+                     console=console,
                      times_local={"T0": T0, "T1": T1, "stopped": stopped, "end": T_end, "probe_started": t_probe,
                                   "capture_started": t_cap_local,
                                   "capture_started_cml": max((v for l, v in starts.items() if v and l in src_links),
                                                              default=None)},
                      window_s=window, completed_by=completed_by or "window end", coverage=coverage,
-                     device_logs=logs, cut=cut)
+                     device_logs=logs, cut=cut,
+                     services=(checks, runner.results) if runner else None)
         fo["link_names"] = {lid: f"{l['a']} - {l['b']}" for lid, l in link_map.items() if lid in scope}
         if probe_err:
             fo["probe_error"] = probe_err["error"]
@@ -1036,6 +1258,8 @@ def run(job_id: str, cml, con, spec: dict, baseline: dict, d: dict, stop: thread
         out["_pcaps"] = {fo["link_names"].get(l, l): b for l, b in pcaps.items()}
     finally:
         snap_stop.set()
+        if runner:
+            runner.stop(5)
         if not out.get("failover"):
             try:
                 stopper()

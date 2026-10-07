@@ -605,6 +605,17 @@ def _harvest_windows(n: dict) -> list[dict]:
     return out
 
 
+def parse_win_bridge_addrs(raw: str) -> list[dict]:
+    """The Windows bridge's `ip` lines: nvip if=Ethernet addr=192.168.1.10 gw=... """
+    out = []
+    for m in re.finditer(r"nvip if=(.+?) addr=([\d.,]+)", raw or ""):
+        for ip in m.group(2).split(","):
+            if ip and not ip.startswith("169.254."):
+                out.append({"iface": m.group(1), "ip": ip, "prefix": None, "method": "bridge",
+                            "status": "up", "proto": "up"})
+    return out
+
+
 def _harvest_one(con: Console, n: dict) -> dict:
     at = datetime.now(timezone.utc).isoformat()
     try:
@@ -619,6 +630,9 @@ def _harvest_one(con: Console, n: dict) -> dict:
         elif fam == "asa":
             raw = con.exec(n["label"], "show interface ip brief", timeout_ms=25000)
             addrs = parse_ip_brief(raw)
+        elif fam == "windows":
+            raw = con.win_exec(n["label"], "ip", timeout_ms=25000)
+            addrs = parse_win_bridge_addrs(raw)
         else:
             raw = con.exec(n["label"], "show ip interface brief", timeout_ms=25000)
             addrs = parse_ip_brief(raw)

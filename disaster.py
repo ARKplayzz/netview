@@ -136,6 +136,7 @@ def _power(cml, ids: dict[str, str], action: str, want: set[str], deadline_s: in
             res[label] = f"call failed ({type(e).__name__}); checking state"
     t0 = time.time()
     pending = set(ids)
+    retried: dict[str, float] = {}
     while pending and time.time() - t0 < deadline_s:
         for label in list(pending):
             try:
@@ -145,6 +146,15 @@ def _power(cml, ids: dict[str, str], action: str, want: set[str], deadline_s: in
             if st in want:
                 res[label] = st
                 pending.discard(label)
+            elif action == "start" and st == "STOPPED" and time.time() - retried.get(label, t0) > 30:
+                # Live 2026-10-07: CoreSwitch-HQ-1's start was accepted but it sat
+                # STOPPED for the whole 600 s (CML over-allocated, #45); one more
+                # start booted it in 10 s. Ask again every 30 s while it is STOPPED.
+                retried[label] = time.time()
+                try:
+                    cml.start_node(ids[label])
+                except Exception:                 # noqa: BLE001
+                    pass
         if pending:
             time.sleep(5)
     for label in pending:

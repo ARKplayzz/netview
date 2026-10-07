@@ -58,11 +58,71 @@ function failoverOptions(D, redraw) {
   cb('dz-after-trace', 'afterTrace', 'Also run a full trace afterwards',
      'After the recording, run the normal after-disaster trace too (adds about 1-2 minutes).');
   box.appendChild(row);
+  box.appendChild(failoverChecksEditor(D));
   const fam = (BY.get(trace.source) || {}).probe_family;
-  box.appendChild(el('div', 's-dim', `Probe: ${fam === 'linux' ? '5 per second (0.2 s resolution)' :
+  box.appendChild(el('div', 's-dim', `Probe: ${fam === 'linux' || fam === 'windows' ? '5 per second (0.2 s resolution)' :
     'one per second (1 s resolution: IOS/ASA ping cannot set an interval)'} from ${trace.source || 'the source'}. ` +
     'Uses Verified (packet capture) mode. Runs are saved and listed below.'));
   box.appendChild(failoverHistory());
+  return box;
+}
+
+/* ------------------------------------------------------ service checks */
+const FO_CHECK_KIND = { dns: 'DNS lookup', tcp: 'TCP connect', dhcp: 'DHCP lease' };
+
+function failoverChecksEditor(D) {
+  D.checks = D.checks || [];
+  const box = el('div', 'fo-checks');
+  const head = el('div', 'dz-row');
+  head.appendChild(el('b', null, 'Service checks'));
+  head.appendChild(el('span', 's-dim', ' Prove services, not just routing: each check runs before, during and after ' +
+    'the failure and gets its own row on the timeline.'));
+  box.appendChild(head);
+  const eligible = (kind) => NODES.filter((n) => !n.ghost && n.up &&
+    (kind === 'dhcp' ? ['windows', 'ios'].includes(n.probe_family) : n.probe_family === 'windows'))
+    .map((n) => n.label).sort();
+  const redraw = () => box.replaceWith(failoverChecksEditor(D));
+  D.checks.forEach((c, i) => {
+    const row = el('div', 'dz-row fo-check');
+    row.appendChild(el('span', 'fo-check-k', FO_CHECK_KIND[c.kind]));
+    const fl = el('label', null, 'from ');
+    const fs = el('select'); fs.id = `dz-chk-${i}-from`;
+    const opts = eligible(c.kind);
+    if (!opts.length) fs.appendChild(el('option', null, c.kind === 'dhcp' ? '(no Windows PC or switch running)' : '(no Windows PC with the bridge running)'));
+    opts.forEach((x) => { const o = el('option', null, x); o.value = x; fs.appendChild(o); });
+    if (!c.from || !opts.includes(c.from)) c.from = opts.includes(trace.source) ? trace.source : opts[0];
+    fs.value = c.from || '';
+    fs.addEventListener('change', () => { c.from = fs.value; D.confirming = false; redraw(); });
+    fl.appendChild(fs); row.appendChild(fl);
+    const inp = (key, ph, w) => {
+      const f = el('input'); f.id = `dz-chk-${i}-${key}`; f.placeholder = ph; f.value = c[key] ?? ''; f.style.width = w;
+      f.setAttribute('aria-label', ph);
+      f.addEventListener('input', () => { c[key] = f.value.trim(); D.confirming = false; });
+      row.appendChild(f);
+    };
+    if (c.kind === 'dns') { inp('name', 'name to look up', '15em'); inp('server', 'server (blank: the PC\'s own)', '13em'); }
+    if (c.kind === 'tcp') { inp('host', 'host or address', '12em'); inp('port', 'port', '5em'); }
+    if (c.kind === 'dhcp' && (BY.get(c.from) || {}).probe_family === 'ios') inp('iface', 'DHCP-client interface, e.g. Vlan60', '15em');
+    const rm = el('button', 'linkish', '×'); rm.title = 'Remove this check'; rm.setAttribute('aria-label', 'Remove this check');
+    rm.addEventListener('click', () => { D.checks.splice(i, 1); D.confirming = false; redraw(); });
+    row.appendChild(rm);
+    box.appendChild(row);
+  });
+  const add = el('div', 'dz-row');
+  Object.entries(FO_CHECK_KIND).forEach(([k, t]) => {
+    const b = el('button', null, `+ ${t}`); b.id = `dz-chk-add-${k}`;
+    b.addEventListener('click', () => {
+      const c = { kind: k };
+      if (k === 'tcp') { c.host = trace.ip || ''; c.port = '445'; }
+      if (k === 'dns') { const t = BY.get(trace.target) || {}; c.name = t.fqdn || (t.virtual ? trace.target : ''); }
+      D.checks.push(c); D.confirming = false; redraw();
+    });
+    add.appendChild(b);
+  });
+  if (!eligible('dns').length) {
+    add.appendChild(el('span', 's-dim', ' DNS and TCP checks run from a Windows PC with NetView\'s bridge installed.'));
+  }
+  box.appendChild(add);
   return box;
 }
 
@@ -164,6 +224,7 @@ function failoverResult(res, width) {
     m.verdict === 'no impact' ? ` (${fo.times.window_s} s watched)` :
     m.verdict === 'not recovered' ? ` within the ${fo.times.window_s} s window` :
     m.verdict === 'unstable' ? `: ${m.outage_periods} separate outages` : ''));
+  if (m.blips) vb.appendChild(el('span', 's-dim', ` · ${m.blips} isolated lost probe${m.blips > 1 ? 's' : ''} after recovery`));
   box.appendChild(vb);
   const tiles = el('div', 'fo-tiles');
   const tile = (label, value, note, cls) => {
@@ -188,6 +249,7 @@ function failoverResult(res, width) {
 
   // B. timeline
   box.appendChild(failoverTimeline(fo, width));
+  if ((fo.services || []).length) box.appendChild(failoverServices(fo));
 
   // C. topology: failover path drawn, baseline dotted, downed nodes crossed
   box.appendChild(el('h4', 'fo-h', 'Topology: before and after'));
@@ -368,11 +430,20 @@ function failoverTimeline(fo, width) {
     lo = Math.max(lo, -2);
     hi = Math.min(hi, (rec ? rec.t : Math.max(...probes.map((p) => p.sent), 2)) + 3);
   }
-  const W = Math.max(480, width - 40), L = 96, R = 14;
+  const svcs = fo.services || [];
+  const W = Math.max(480, width - 40), L = svcs.length ? 230 : 96, R = 14;
   const x = (t) => L + ((t - lo) / (hi - lo || 1)) * (W - L - R);
   const paths = fo.paths;
   const logs = fo.device_logs || [];
-  const lanes = ['Disaster', 'Probes', ...paths.map((p) => `Path ${p.id}`), 'Events'].concat(logs.length ? ['Device logs'] : []);
+  // Lanes are keyed by check id (labels can share a long prefix - 2026-10-07 three
+  // DNS checks collapsed onto one lane); the text shown is a short form.
+  const svcLane = (v) => `svc:${v.id}`;
+  const svcText = Object.fromEntries(svcs.map((v) => [svcLane(v), (v.kind === 'dns'
+    ? v.label.replace(/^DNS \S+ via /, 'DNS via ').replace(/^DNS \S+ \(PC's own resolver\)$/, 'DNS (PC resolver)')
+    : v.kind === 'tcp' ? v.label.replace(/^TCP /, '').replace(/ \(SMB\)$/, '').replace(/^/, v.label.includes('(SMB)') ? 'SMB ' : 'TCP ')
+      : `DHCP ${v.from}`).slice(0, 32)]));
+  const lanes = ['Disaster', 'Probes', ...paths.map((p) => `Path ${p.id}`), ...svcs.map(svcLane), 'Events']
+    .concat(logs.length ? ['Device logs'] : []);
   const LH = 22, top = 26;
   const H = top + lanes.length * LH + 30;
   const s = svg('svg', { width: W, height: H, class: 'fo-tl' });
@@ -383,7 +454,7 @@ function failoverTimeline(fo, width) {
     s.appendChild(svg('text', { x: x(t), y: top - 8, class: 'fo-axis', 'text-anchor': 'middle' }, `${+t.toFixed(1)}`));
   }
   lanes.forEach((name, i) => {
-    s.appendChild(svg('text', { x: 4, y: top + i * LH + 15, class: 'fo-lane' }, name));
+    s.appendChild(svg('text', { x: 4, y: top + i * LH + 15, class: 'fo-lane' }, svcText[name] || name));
     s.appendChild(svg('line', { x1: L, x2: W - R, y1: top + (i + 1) * LH, y2: top + (i + 1) * LH, class: 'fo-sep' }));
   });
   const laneY = (name) => top + lanes.indexOf(name) * LH;
@@ -425,6 +496,29 @@ function failoverTimeline(fo, width) {
     s.appendChild(svg('text', { x: Math.min(x(b) + 4, W - R - 160), y: y + 15, class: 'fo-ptxt' },
       `${p.role}: …${p.hops.slice(-3).join(' › ')}`));
   });
+  // service checks: one square per attempt (DNS/TCP), one bar per renewal (DHCP)
+  svcs.forEach((v) => {
+    const y = laneY(svcLane(v));
+    v.attempts.forEach((a) => {
+      if (v.kind === 'dhcp') {
+        const a0 = a.t_released ?? a.t, a1 = a.t_bound ?? a.t_done ?? a.t;
+        if (a1 < lo || a0 > hi) return;
+        const r = svg('rect', { x: x(Math.max(lo, a0)), y: y + 5, width: Math.max(4, x(Math.min(hi, a1)) - x(Math.max(lo, a0))),
+                                height: LH - 10, rx: 2, style: `fill:${a.ok ? 'var(--ok)' : 'var(--bad)'}` });
+        r.appendChild(svg('title', {}, `DHCP ${a.phase || ''} ${foSecs(a0, 2)} → ${foSecs(a1, 2)}: ` +
+          (a.ok ? `${a.address} from ${a.server}` : (a.error || 'no lease'))));
+        s.appendChild(r);
+        if (a.ok && inRange(a1)) s.appendChild(svg('text', { x: Math.min(x(a1) + 4, W - R - 150), y: y + 15, class: 'fo-ptxt' }, `${a.address} from ${a.server}`));
+        return;
+      }
+      if (!inRange(a.t)) return;
+      const w = Math.max(3, (1 / (hi - lo)) * (W - L - R) - 2);
+      const r = svg('rect', { x: x(a.t), y: y + 5, width: w, height: LH - 10, style: `fill:${a.ok ? 'var(--ok)' : 'var(--bad)'}` });
+      r.appendChild(svg('title', {}, `${v.label} at ${foSecs(a.t, 2)}: ${a.ok ? 'ok' : 'FAILED'} (${a.ms} ms)` +
+        (a.answer ? ` → ${a.answer}` : '') + (a.error ? ` ${a.error}` : '')));
+      s.appendChild(r);
+    });
+  });
   // events
   const ey = laneY('Events');
   fo.events.filter((e) => !['power_off_requested', 'node_stopped', 'all_stopped'].includes(e.kind) && inRange(e.t))
@@ -463,6 +557,45 @@ function failoverTimeline(fo, width) {
   return wrap;
 }
 
+/* ------------------------------------------------------ services table */
+function failoverServices(fo) {
+  const box = el('div', 'fo-svc');
+  box.appendChild(el('h4', 'fo-h', 'Service checks'));
+  const t = el('table', 'g fo-table');
+  const h = el('tr');
+  ['Check', 'From', 'Before F', 'After F', 'Outage', 'Back at', 'Answered by (packet capture)'].forEach((x) => h.appendChild(el('th', null, x)));
+  t.appendChild(h);
+  const who = (m) => Object.entries(m || {}).map(([k, n]) => `${k} (${n})`).join(', ') || '-';
+  fo.services.forEach((v) => {
+    const s = v.summary;
+    const tr = el('tr');
+    tr.appendChild(el('td', null, v.label));
+    tr.appendChild(el('td', null, v.from));
+    if (v.kind === 'dhcp') {
+      const ls = (l) => (!l ? '-' : l.ok ? `${l.address} from ${l.server}${l.lease_s ? `, ${l.lease_s} s lease` : ''}` : `FAILED: ${l.error || 'no lease'}`);
+      tr.appendChild(el('td', null, ls(s.before_lease)));
+      tr.appendChild(el('td', (s.after_lease || {}).ok ? 's-ok' : 's-bad', ls(s.after_lease)));
+      const a = s.after_lease || {};
+      tr.appendChild(el('td', null, a.t_bound != null && a.t_released != null ? `renewed in ${(a.t_bound - a.t_released).toFixed(1)} s` : '-'));
+      tr.appendChild(el('td', null, a.t_bound != null ? foSecs(a.t_bound, 1) : '-'));
+      tr.appendChild(el('td', null, a.server ? `lease server ${a.server}` : '-'));
+    } else {
+      tr.appendChild(el('td', null, `${s.before_ok}/${s.before} ok`));
+      tr.appendChild(el('td', s.after_ok === s.after ? 's-ok' : 's-warn', `${s.after_ok}/${s.after} ok`));
+      tr.appendChild(el('td', s.down_s ? 's-warn' : null, (s.down_s != null ? `${s.down_s.toFixed(1)} s` : 'none') +
+        (s.blips ? ` + ${s.blips} blip${s.blips > 1 ? 's' : ''}` : '')));
+      tr.appendChild(el('td', null, s.recovered_at != null ? foSecs(s.recovered_at, 1) : s.verdict));
+      const ev = s.evidence || {};
+      tr.appendChild(el('td', 'wrap', ev.what ? `before: ${who(ev.before)}; after: ${who(ev.after)}` : '-'));
+    }
+    t.appendChild(tr);
+  });
+  box.appendChild(t);
+  box.appendChild(el('div', 's-dim', 'DNS and TCP run every second; DHCP releases and renews once before the failure and once ' +
+    'a few seconds after it. "Answered by" counts the replies seen in the packet capture either side of F.'));
+  return box;
+}
+
 /* ----------------------------------------------------------- packet log */
 function failoverPacketLog(fo) {
   const box = el('div', 'fo-pkts');
@@ -478,7 +611,8 @@ function failoverPacketLog(fo) {
     l.appendChild(s); bar.appendChild(l);
   };
   mk('Show', [['around', 'around the failure and recovery (±2 s)'], ['all', 'everything']], 'phase');
-  mk('Kind', [['all', 'all'], ['echo', 'ping requests/replies'], ['esp', 'ESP (VPN)'], ['unreach', 'ICMP errors'], ['ike', 'IKE']], 'kind');
+  mk('Kind', [['all', 'all'], ['echo', 'ping requests/replies'], ['esp', 'ESP (VPN)'], ['unreach', 'ICMP errors'], ['ike', 'IKE'],
+              ['dns', 'DNS'], ['tcp', 'TCP handshakes']], 'kind');
   const q = el('input'); q.type = 'search'; q.placeholder = 'Filter link, node or probe';
   q.addEventListener('input', () => { f.text = q.value.toLowerCase(); draw(); });
   bar.appendChild(q);
@@ -500,7 +634,8 @@ function failoverPacketLog(fo) {
       tr.appendChild(el('td', null, p.t.toFixed(4)));
       tr.appendChild(el('td', null, `${p.a} (${p.ai}) – ${p.b} (${p.bi})`));
       tr.appendChild(el('td', null, p.dir === 'request' ? '→' : p.dir === 'reply' ? '←' : p.dir === 'esp' ? '⇄' : '!'));
-      tr.appendChild(el('td', null, p.kind === 'echo' ? `ping ${p.dir}` : p.kind));
+      tr.appendChild(el('td', null, p.kind === 'echo' ? `ping ${p.dir}` : p.kind === 'dns' ? `DNS ${p.dir}`
+        : p.kind === 'tcp' ? `TCP ${p.dir.toUpperCase()}` : p.kind));
       tr.appendChild(el('td', null, p.kind === 'esp' ? `${p.spi}` : p.probe != null ? String(p.probe) : ''));
       tr.appendChild(el('td', null, `${p.src} → ${p.dst}`));
       tr.appendChild(el('td', 's-dim', p.info || ''));

@@ -35,6 +35,7 @@ import cmlsource        # noqa: E402
 import features         # noqa: E402
 import model            # noqa: E402
 import disaster         # noqa: E402
+import services         # noqa: E402
 import failover         # noqa: E402
 import pathtrace        # noqa: E402
 import probes           # noqa: E402
@@ -47,18 +48,25 @@ app = Flask(__name__)
 # this is hand-maintained rather than derived. Selectable as a trace TARGET
 # only: what answers depends on which real backend currently holds the name
 # or address, which is exactly the thing a trace to one is meant to reveal.
-VIRTUAL_TARGETS = [
-    # 2026-10-01: was a DNS-failover name (~205 s to move after HQ core loss). Now
-    # an internal anycast VIP (manifest internal_anycast:): HQ primary, DR's route
-    # floats at AD 250 and appears when HQ's /32 is withdrawn from OSPF. The
-    # Windows servers hold it as a SkipAsSource /32 that no harvest reports, so
-    # the members are named here, primary first.
-    {"label": "fileserver.p45.nz", "ip": "10.60.0.70", "kind": "anycast-vip",
-     "holders": ["FileServer-HQ-1", "FileServer-DR-1"],
-     "note": "Network-layer (anycast) failover: always 10.60.0.70. Normally FileServer-HQ-1; "
-             "when HQ's route to it is withdrawn from OSPF, FileServer-DR-1's takes over. "
-             "No DNS lookup involved. DC-DR-1's SMB health check still repoints the name at "
-             "FileServer-DR-1's real address if the HQ server dies while HQ's network is up."},
+def _internal_anycast_targets() -> list[dict]:
+    """One virtual target per manifest `internal_anycast` service (2026-10-07).
+    These used to be typed in here by hand, so the DNS anycast VIP (10.60.0.53)
+    was missing from NetView the moment it was added to the manifest. The Windows
+    servers hold each VIP as a SkipAsSource /32 that no harvest reports, so the
+    declared members are the holders, primary (lowest AD) first."""
+    out = []
+    for name, svc in ((model.load_manifest().get("internal_anycast") or {}).get("services") or {}).items():
+        members = sorted(svc.get("members") or [], key=lambda m: m.get("ad", 1))
+        holders = [m["node"] for m in members]
+        out.append({"label": svc.get("fqdn") or f"{name} anycast ({svc['vip']})", "ip": svc["vip"],
+                    "kind": "anycast-vip", "holders": holders,
+                    "note": f"Network-layer (anycast) failover: always {svc['vip']}. Normally {holders[0]}; "
+                            f"when its site's route is withdrawn from OSPF, "
+                            f"{', '.join(holders[1:]) or 'the backup'} takes over. No DNS lookup involved."})
+    return out
+
+
+VIRTUAL_TARGETS = _internal_anycast_targets() + [
     {"label": "(company)website.p45.nz", "ip": "10.50.100.20", "kind": "anycast-vip",
      "note": "Network-layer (anycast) failover: always the same address, 10.50.100.20 - "
              "whichever site currently advertises the best route to it is who answers. "
@@ -286,7 +294,13 @@ def _address_owners(nodes: list[dict]) -> dict[str, str]:
     for n in nodes:
         for a in (n.get("live") or {}).get("addresses") or []:
             out.setdefault(a["ip"], n["label"])
-    for n in nodes:
+    # Stored addresses: running nodes first, and a STOPPED node owns nothing on the
+    # wire (2026-10-07: the powered-off Linux WFH client's static 192.168.1.10
+    # claimed the packets of the Windows laptop that had leased the same address,
+    # and a failover capture threw every probe away as someone else's).
+    for n in sorted(nodes, key=lambda x: not x.get("up")):
+        if not n.get("up"):
+            continue
         for a in n.get("addresses") or []:
             if a.get("kind") and "virtual" in str(a.get("kind")):
                 continue          # an HSRP VIP belongs to whichever peer is active
@@ -445,17 +459,30 @@ def api_trace():
         spec["disaster"] = {"nodes": list(dz.get("nodes") or []), "links": links,
                             "settle_s": max(15, min(int(dz.get("settle_s", 30)), 120)),
                             "restore": bool(dz.get("restore", True)), "warnings": warnings}
+        if dz.get("mode") != "failover" and spec["source"].get("probe_family") == "windows":
+            return jsonify({"error": "A Windows source runs disaster tests in Failover capture mode."}), 409
+        if dz.get("checks") and dz.get("mode") != "failover":
+            return jsonify({"error": "Service checks run in Failover capture mode."}), 409
         if dz.get("mode") == "failover":
             # Failover capture (spec: docs/failover-capture-spec.md). It needs packet
             # capture, so the baseline runs in Verified mode whatever the page asked.
             window = int(dz.get("window_s") or failover.DEFAULT_WINDOW_S)
             if window not in failover.WINDOWS_S:
                 return jsonify({"error": f"window must be one of {failover.WINDOWS_S} s"}), 400
+            serr, checks = services.validate(list(dz.get("checks") or []), by_label, spec["source"]["label"])
+            if serr:
+                return jsonify({"error": serr}), 409
+            # A check aimed at an anycast VIP carries its holders, so the capture
+            # covers every server that might answer it (DNS anycast, 2026-10-07).
+            vips = {v["ip"]: v.get("holders") or [] for v in VIRTUAL_TARGETS if v.get("ip")}
+            for c in checks:
+                c["holders"] = vips.get(c.get("server") or c.get("host") or "", [])
             spec["capture"] = True
             spec["disaster"].update(mode="failover", window_s=window,
                                     stop_early=bool(dz.get("stop_early", True)),
                                     device_logs=bool(dz.get("device_logs", False)),
                                     after_trace=bool(dz.get("after_trace", False)),
+                                    checks=checks,
                                     settle_s=window + 90)   # only feeds the progress ETA
         plain = {k: v for k, v in body.items() if k != "disaster"}
 

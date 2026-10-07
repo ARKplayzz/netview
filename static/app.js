@@ -982,7 +982,9 @@ const trace = { source: null, target: null, ip: null, count: 100, repeat: false,
                 // links: cable cuts (2026-10-06) - link ids unplugged in CML, the nodes stay up.
                 disaster: { open: false, nodes: [], links: [], settle: 30, restore: true, confirming: false, filter: '',
                             // Failover capture (2026-10-01, docs/failover-capture-spec.md)
-                            mode: 'standard', window: 20, stopEarly: true, deviceLogs: false, afterTrace: false } };
+                            mode: 'standard', window: 20, stopEarly: true, deviceLogs: false, afterTrace: false,
+                            // Service checks (2026-10-06, services.py): DNS / TCP / DHCP during the failover
+                            checks: [] } };
 let pick = null;           // null | 'source' | 'target'
 
 function startPick(src) {
@@ -1106,7 +1108,8 @@ async function runTrace() {
                                settle_s: trace.disaster.settle, restore: trace.disaster.restore,
                                ...(trace.disaster.mode === 'failover' ? {
                                  mode: 'failover', window_s: trace.disaster.window, stop_early: trace.disaster.stopEarly,
-                                 device_logs: trace.disaster.deviceLogs, after_trace: trace.disaster.afterTrace } : {}) }
+                                 device_logs: trace.disaster.deviceLogs, after_trace: trace.disaster.afterTrace,
+                                 checks: trace.disaster.checks } : {}) }
                                : undefined }),
     });
     const j = await r.json();

@@ -421,3 +421,8 @@ button.danger { background: var(--bad); border-color: var(--bad); color: #fff; }
 .fo-foot { display: grid; gap: 2px; font-size: 12px; border-top: 1px solid var(--line2); padding-top: 6px; }
 .fo-exports { display: flex; gap: 12px; flex-wrap: wrap; align-items: baseline; font-size: 12.5px; }
 .fo-table td.wrap { white-space: normal; }
+
+/* service checks (2026-10-06) */
+.fo-checks { margin: 8px 0 4px; display: grid; gap: 4px; }
+.fo-check-k { display: inline-block; min-width: 7.5em; font-weight: 600; }
+.fo-svc { margin: 10px 0; }

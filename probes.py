@@ -205,4 +205,6 @@ def _ping(con: Console, source: dict, dest: str, count: int) -> dict:
         # attaching there fails AND strands the session for the next attach.
         return con.linux_ping(source["label"], dest, count=count,
                               line=source.get("console_line", 0))
+    if source.get("probe_family") == "windows":
+        return con.win_ping(source["label"], dest, count=count)
     return con.ping(source["label"], dest, count=count)

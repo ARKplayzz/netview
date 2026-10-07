@@ -196,6 +196,8 @@ CONTAINER_DEFS = {"dnsmasq", "radius", "nginx", "splunk", "syslog",
                   "server"}                                          # shell on line 1
 IOS_DEFS = {"iosv", "iol-xe", "ioll2-xe", "cat9800", "csr1000v", "iosvl2"}
 ASA_DEFS = {"asav"}
+# Windows desktops: driven through NetView's serial bridge (winclient.py, 2026-10-06).
+WINDOWS_DEFS = {"win10", "win11", "windows10", "windows11"}
 
 NO_SOURCE_REASON = {
     "none": "no console this tool knows how to drive "
@@ -211,6 +213,8 @@ def probe_family(node_definition: str) -> str:
         return "ios"
     if node_definition in ASA_DEFS:
         return "asa"
+    if node_definition in WINDOWS_DEFS:
+        return "windows"
     return "none"
 
 
@@ -595,7 +599,8 @@ def _describe(*, label, topo, nm, managed, role, site, site_info, layer,
         "links": links,
         "probe_family": family,
         "console_line": console_line(node_def),
-        "can_source_probe": family in ("linux", "ios", "asa"),
+        "can_source_probe": family in ("linux", "ios", "asa", "windows"),
+        "source_note": ("Windows: needs NetView's serial bridge on the PC (one-time setup)" if family == "windows" else None),
         "no_source_reason": NO_SOURCE_REASON.get(family),
         "state": None,          # filled in by app.py from live CML
     }

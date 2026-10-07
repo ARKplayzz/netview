@@ -159,6 +159,13 @@ def _burst(con: Console, source: dict, ip: str, count: int, fast: bool) -> dict:
                                  line=source.get("console_line", 0))
             m = _LNX_RATE.search(raw or "")
         sent, recv = (int(m.group(1)), int(m.group(2))) if m else (count, None)
+    elif fam == "windows":
+        # NetView's Windows bridge: one line per probe, 100 ms apart.
+        cmd = f"ping {ip} 100 {count} {300 if fast else 1000}"
+        raw = con.win_exec(source["label"], cmd, timeout_ms=int(count * (400 if fast else 1100) + 20000))
+        lines = [ln for ln in (raw or "").splitlines() if ln.startswith("nvping seq=")]
+        sent = len(lines) or count
+        recv = None if fast else sum(1 for ln in lines if " ok " in ln)
     else:
         # ASA takes the identical `ping ... repeat N timeout 0` syntax and
         # genuinely does not wait for replies with it - verified live
@@ -188,6 +195,8 @@ def _burst(con: Console, source: dict, ip: str, count: int, fast: bool) -> dict:
 
 def _traceroute(con: Console, source: dict, ip: str) -> dict:
     fam = source.get("probe_family")
+    if fam == "windows":       # the bridge has no traceroute; the packet capture shows the path
+        return {"cmd": "(no traceroute from a Windows source)", "raw": "", "hops": []}
     if fam == "linux":
         cmd = f"traceroute -n -q 1 -w 1 -m 12 {ip}"
         raw = con.linux_exec(source["label"], cmd, timeout_ms=40000,
@@ -638,7 +647,7 @@ def _calibratable(src: dict, nodes: list[dict], raw_delta: dict, base: dict,
 def submit(spec: dict) -> str:
     job_id = uuid.uuid4().hex[:12]
     count = spec["count"]
-    per = 0.2 if spec["source"].get("probe_family") == "linux" else 0.05
+    per = {"linux": 0.2, "windows": 0.1}.get(spec["source"].get("probe_family"), 0.05)
     job = {"id": job_id, "spec": spec, "status": "queued", "stage": "waiting for a console session",
            "created": datetime.now(timezone.utc).isoformat(), "result": None, "error": None,
            "eta_seconds": int(probe_engine.COST_OPEN_S + BASELINE_S + 3 * probe_engine.COST_ATTACH_S
