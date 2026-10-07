@@ -456,7 +456,16 @@ def api_trace():
                                             (spec.get("target") or {}).get("label"), links, lmap)
         if error:
             return jsonify({"error": error}), 409
-        spec["disaster"] = {"nodes": list(dz.get("nodes") or []), "links": links,
+        # IOS link ends get shut too (CML's link stop does not drop the link on
+        # IOL) unless the page asks for a bare CML link stop.
+        carrier = []
+        if dz.get("carrier", True):
+            for lid in links.values():
+                l = lmap.get(lid) or {}
+                for node, iface in ((l.get("a"), l.get("ai")), (l.get("b"), l.get("bi"))):
+                    if (by_label.get(node) or {}).get("probe_family") == "ios" and iface:
+                        carrier.append({"node": node, "iface": iface})
+        spec["disaster"] = {"nodes": list(dz.get("nodes") or []), "links": links, "carrier": carrier,
                             "settle_s": max(15, min(int(dz.get("settle_s", 30)), 120)),
                             "restore": bool(dz.get("restore", True)), "warnings": warnings}
         if dz.get("mode") != "failover" and spec["source"].get("probe_family") == "windows":
@@ -517,7 +526,8 @@ def api_disaster_restore():
     rec = st["interrupted"]
     if not rec:
         return jsonify({"restored": {}})
-    res = disaster.restore(cml_api.shared(), rec["nodes"], links=rec.get("links") or {})
+    res = disaster.restore(cml_api.shared(), rec["nodes"], links=rec.get("links") or {},
+                           carrier=rec.get("carrier") or [])
     return jsonify({"restored": res})
 
 

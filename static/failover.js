@@ -423,7 +423,9 @@ function failoverTimeline(fo, width) {
   wrap.appendChild(head);
 
   const probes = fo.probes;
-  const times = probes.map((p) => p.sent).concat(fo.events.map((e) => e.t)).filter((x) => x != null);
+  // Service checks can outlast the probe (a source's own DHCP renewal runs after it).
+  const svcTimes = (fo.services || []).flatMap((v) => v.attempts.flatMap((a) => [a.t, a.t_bound, a.t_done]));
+  const times = probes.map((p) => p.sent).concat(fo.events.map((e) => e.t), svcTimes).filter((x) => x != null);
   let lo = Math.min(...times, -1), hi = Math.max(...times, 1);
   if (foZoom === 'failover') {
     const rec = fo.events.find((e) => e.kind === 'first_reply_new');

@@ -565,6 +565,14 @@ def fill_missing(probes: list[dict], console: dict[int, float], interval: float,
     the probe count is honest. Only possible for seq-numbered (Linux) probes."""
     if not single_id or not probes:
         return probes
+    # A probe the SOURCE got a reply for was answered, whatever the capture shows
+    # (2026-10-07, Finance PC -> anycast after a server-room loss: every reply came
+    # back - the console saw them - but the capture missed them on the way, so 18
+    # answered probes read as "lost-reply" and the run as "not recovered").
+    for p in probes:
+        if p["outcome"] in ("lost-reply", "lost-request", "unknown") and p["key"] in console:
+            p["outcome"] = "ok"
+            p["reply_inferred"] = True
     have = {p["key"] for p in probes}
     known = [(p["key"], p["sent"]) for p in probes if isinstance(p["key"], int)]
     if len(known) < 2:
@@ -701,7 +709,13 @@ def analyse(pcaps: dict, link_map: dict, owners: dict, *, src: str, ip: str,
         base_sig = tuple(baseline_path)
     after = [p for p in probes if p["sent"] >= F]
     ok_after = [p for p in after if p["outcome"] == "ok"]
-    final_sig = tuple(ok_after[-1]["req_path"]) if ok_after and ok_after[-1]["req_path"] else None
+    # The final path is the one MOST answered probes after the failure took - not
+    # the last probe's, which can be a console-only probe with no path (2026-10-07).
+    _sigs: dict = {}
+    for p in ok_after:
+        if p["req_path"]:
+            _sigs[tuple(p["req_path"])] = _sigs.get(tuple(p["req_path"]), 0) + 1
+    final_sig = max(_sigs, key=_sigs.get) if _sigs else None
 
     # paths
     paths: dict[tuple, dict] = {}
@@ -781,6 +795,8 @@ def analyse(pcaps: dict, link_map: dict, owners: dict, *, src: str, ip: str,
         reps = [e["t"] for e in sel if e["kind"] == "echo" and e["dir"] == "reply"
                 and e.get("probe") == first_ok_final["key"] and e["link_id"] in src_links]
         reply_t = min(reps) if reps else first_ok_final["sent"]
+    elif first_ok_after_loss:                 # answered, but no captured path to compare
+        reply_t = first_ok_after_loss["sent"]
     changed = bool(base_sig and final_sig and base_sig != final_sig)
     detect = next((p for p in after if p["outcome"] != "ok" or
                    (p["req_path"] and base_sig and tuple(p["req_path"]) != base_sig)), None)
@@ -1018,6 +1034,9 @@ def run(job_id: str, cml, con, spec: dict, baseline: dict, d: dict, stop: thread
     if checks:
         import services                                    # noqa: PLC0415 - service checks (services.py)
         runner = services.Runner(cml, checks, src["label"], fam)
+        if runner.at_source:
+            stage(f"service checks: DHCP renewal on {src['label']} before the failure")
+            runner.dhcp_at_source("before")
         stage(f"service checks: starting {len(checks)}")
         runner.start()
     if stream:
@@ -1092,7 +1111,7 @@ def run(job_id: str, cml, con, spec: dict, baseline: dict, d: dict, stop: thread
         stopped: dict[str, float] = {}
 
         def power():
-            res = disaster._cut(cml, cut, "stop") if cut else {}
+            res = disaster._cut(cml, cut, "stop", carrier=d.get("carrier")) if cut else {}
             if ids:
                 res.update(disaster._power(cml, ids, "stop", {"STOPPED", "DEFINED_ON_CORE"}, 180))
             out["power_off"] = res
@@ -1163,7 +1182,11 @@ def run(job_id: str, cml, con, spec: dict, baseline: dict, d: dict, stop: thread
                 break
             if T1 is not None:
                 cond = None
-                if stop_early and st["periods"] <= 1 and st["streak"] >= st["k"]:
+                # Service checks run once a second and DNS waits up to 7 s for a
+                # timeout: keep recording at least 20 s after the failure so they
+                # are observed too (a 2.6 s run left anycast DNS with no attempts).
+                min_ok = not runner or el >= 20
+                if stop_early and min_ok and st["periods"] <= 1 and st["streak"] >= st["k"]:
                     if st["had_loss"]:
                         cond = "recovered and stable"
                     elif new_path_seen:
@@ -1176,18 +1199,20 @@ def run(job_id: str, cml, con, spec: dict, baseline: dict, d: dict, stop: thread
                     completed_by = "window end"
                     break
             time.sleep(0.25)
-        if runner and any(c["kind"] == "dhcp" for c in checks):
+        if runner and runner.pending_dhcp():
             stage("service checks: waiting for the after-failure DHCP renewal")
             t_w = time.time()
-            while time.time() - t_w < 90 and not stop.is_set() and \
-                    not all(any(r.get("phase") == "after" for r in runner.results[c["id"]])
-                            for c in checks if c["kind"] == "dhcp"):
+            while time.time() - t_w < 90 and not stop.is_set() and runner.pending_dhcp():
                 time.sleep(1)
         T_end = time.time()
         stage("stopping the probe")
         stopper()
         if runner:
             runner.stop()
+            if runner.at_source and not stop.is_set():
+                # Still inside the failure: nothing is restored until this returns.
+                stage(f"service checks: DHCP renewal on {src['label']} after the failure")
+                runner.dhcp_at_source("after")
         pt.join(timeout=200)
         out["power_off_seconds"] = round((T1 or T_end) - T0)
 

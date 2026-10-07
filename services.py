@@ -89,6 +89,10 @@ class Runner:
         self.by_token = {}
         self.folded = [c for c in checks if c["kind"] in ("dns", "tcp") and c["from"] == source
                        and source_family == "windows"]
+        # DHCP on the test's own source (2026-10-07, Finance PC): its console is busy
+        # with the ping stream and a release would cut its own probes, so it renews
+        # BEFORE the probe starts and right AFTER it stops - still before the restore.
+        self.at_source = [c for c in checks if c["kind"] == "dhcp" and c["from"] == source]
         for c in self.folded:
             self.by_token[token(c)] = c["id"]
         self._stop = threading.Event()
@@ -119,13 +123,30 @@ class Runner:
             t = threading.Thread(target=self._watch_other, args=(node, cs), daemon=True)
             t.start()
             self._threads.append(t)
-        dh = [c for c in self.checks if c["kind"] == "dhcp"]
+        dh = [c for c in self.checks if c["kind"] == "dhcp" and c not in self.at_source]
         if dh:
             t = threading.Thread(target=self._dhcp_all, args=(dh,), daemon=True)
             t.start()
             self._threads.append(t)
         else:
             self._pre_done.set()
+
+    def dhcp_at_source(self, phase: str, deadline_s: float = 150) -> None:
+        """Renew on the source itself (see at_source). After the failure a standby
+        DHCP server may take a while to start answering, so retry until a lease
+        comes back or `deadline_s` passes; every attempt is recorded."""
+        for c in self.at_source:
+            t0 = time.time()
+            while True:
+                self._dhcp_one(c, phase)
+                if self.results[c["id"]][-1].get("ok") or phase == "before" or time.time() - t0 > deadline_s:
+                    break
+                time.sleep(10)
+
+    def pending_dhcp(self) -> list[dict]:
+        """DHCP checks still owed an after-failure renewal by the background runner."""
+        return [c for c in self.checks if c["kind"] == "dhcp" and c not in self.at_source
+                and not any(r.get("phase") == "after" for r in self.results[c["id"]])]
 
     def wait_ready(self, timeout: float = 90) -> bool:
         """Block until the before-failure DHCP renewals are done."""

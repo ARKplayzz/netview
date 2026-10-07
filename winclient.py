@@ -60,8 +60,13 @@ def loader(sha256: str) -> str:
             "else{'NetView: setup rejected (hash mismatch)'}")
 
 
-def install(cml, label: str, passwords: list[str], log=print, shots: Path | None = None) -> bool:
-    """Install the bridge on one Windows PC through its VNC keyboard + serial console."""
+def install(cml, label: str, passwords: list, log=print, shots: Path | None = None,
+            admin: tuple[str, str] | None = None) -> bool:
+    """Install the bridge on one Windows PC through its VNC keyboard + serial console.
+    `passwords`: strings (tried on the account the login screen shows) and/or
+    (user, password) pairs (tried as "Other user", e.g. a domain account).
+    `admin`: (user, password) typed into UAC when the signed-in user is not an
+    administrator (UAC then asks for credentials instead of Yes/No)."""
     from console import Console, _drain                 # noqa: PLC0415
     from vnc import K_CTRL, K_RETURN, K_SHIFT, K_SUPER, VNC  # noqa: PLC0415
 
@@ -78,14 +83,26 @@ def install(cml, label: str, passwords: list[str], log=print, shots: Path | None
         shot(v, "0_start")
         if v.lit() < 5000:
             raise RuntimeError("the screen is still dark - is the PC running?")
-        # At a login screen? (No taskbar yet: try each password; stop when the desktop appears.)
-        for pw in passwords:
+        # At a login screen? Try each credential until the desktop appears.
+        # 2026-10-07 (Finance PC): a rejected password leaves an "incorrect" box
+        # that must be dismissed first, and a domain PC needs "Other user".
+        for cred in passwords:
             if _desktop(v):
                 break
-            v.click(v.w // 2, int(v.h * 0.64))
-            time.sleep(0.5)
+            user, pw = cred if isinstance(cred, tuple) else (None, cred)
+            v.tap(K_RETURN)                              # dismiss a previous "incorrect" box
+            time.sleep(2)
+            if user:
+                v.click(int(v.w * 0.16), int(v.h * 0.91))   # the "Other user" tile
+                time.sleep(3)
+                v.click(v.w // 2, int(v.h * 0.64))          # User name box
+                time.sleep(0.5)
+                v.type(user + "\t")
+            else:
+                v.click(v.w // 2, int(v.h * 0.64))          # the shown account's password box
+                time.sleep(0.5)
             v.type(pw + "\n")
-            time.sleep(15)
+            time.sleep(75 if user else 15)                  # a first domain logon builds a profile
         shot(v, "1_desktop")
         if not _desktop(v):
             raise RuntimeError("could not reach the desktop (login failed?)")
@@ -95,7 +112,15 @@ def install(cml, label: str, passwords: list[str], log=print, shots: Path | None
         v.combo(K_CTRL, K_SHIFT, K_RETURN)               # run as administrator
         time.sleep(5)
         shot(v, "2_uac")
-        v.combo(0xffe9, ord("y"))                        # Alt+Y on the UAC prompt
+        if admin and _uac_credentials(v):
+            # 2026-10-07 (Finance PC): a domain user who is not a local admin gets a
+            # credential prompt; the domain Administrator is a local admin on any
+            # domain PC. Focus is on the password box; the user box is above it.
+            v.click(int(v.w * 0.43), int(v.h * 0.70))
+            time.sleep(0.3)
+            v.type(admin[0] + "\t" + admin[1] + "\n")
+        else:
+            v.combo(0xffe9, ord("y"))                    # Alt+Y on a Yes/No UAC prompt
         time.sleep(6)
         shot(v, "3_powershell")
         con = Console(cml)
@@ -131,10 +156,30 @@ def install(cml, label: str, passwords: list[str], log=print, shots: Path | None
     return ok
 
 
-def _desktop(v) -> bool:
-    """The Windows taskbar: a dark strip along the bottom of the screen."""
+def _uac_credentials(v) -> bool:
+    """A UAC prompt asking for an admin user name + password (two white boxes)."""
     v.refresh()
     w, h, fb = v.w, v.h, v.fb
+
+    def white(y):
+        xs = range(int(w * 0.26), int(w * 0.60), 10)
+        return sum(1 for x in xs if min(fb[(y * w + x) * 3:(y * w + x) * 3 + 3]) > 235) / max(1, len(xs))
+    return white(int(h * 0.77)) > 0.7
+
+
+def _desktop(v) -> bool:
+    """The Windows taskbar (a dark strip along the bottom) and NOT the login
+    screen, whose wallpaper can be dark at the bottom too (2026-10-07): the login
+    screen has a white password / user-name box at about 64 % of the height,
+    or a message box with an OK button there."""
+    v.refresh()
+    w, h, fb = v.w, v.h, v.fb
+
+    def bright(y):
+        xs = range(int(w * 0.34), int(w * 0.67), 10)
+        return sum(1 for x in xs if min(fb[(y * w + x) * 3:(y * w + x) * 3 + 3]) > 225) / max(1, len(xs))
+    if bright(int(h * 0.64)) > 0.7 or bright(int(h * 0.56)) > 0.7:
+        return False
     y = h - 12
     dark = sum(1 for x in range(0, w, 8) if max(fb[(y * w + x) * 3:(y * w + x) * 3 + 3]) < 60)
     return dark > (w // 8) * 0.6

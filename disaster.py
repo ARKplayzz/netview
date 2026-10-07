@@ -165,11 +165,40 @@ def _power(cml, ids: dict[str, str], action: str, want: set[str], deadline_s: in
     return res
 
 
-def _cut(cml, links: dict[str, str], action: str, deadline_s: int = 60) -> dict[str, str]:
+def _carrier(cml, ends: list[dict], up: bool) -> dict[str, str]:
+    """`shutdown` / `no shutdown` on IOS link ends, in parallel (one console each).
+
+    CML's link stop does NOT drop the link on IOL: measured 2026-10-07, all four
+    HQ core <-> server-room links STOPPED and the cores still showed the ports
+    up/up trunking, so the SVI stayed up and nothing reacted to the "cut". A real
+    cut cable drops carrier at both ends; shutting both ends is how that is
+    emulated. Not saved - a reload brings the port back up."""
+    if not ends:
+        return {}
+    from concurrent.futures import ThreadPoolExecutor   # noqa: PLC0415
+    from console import Console                         # noqa: PLC0415
+
+    def one(e):
+        key = f"{e['node']} {e['iface']}"
+        try:
+            with Console(cml) as con:
+                con.configure(e["node"], [f"interface {e['iface']}", "no shutdown" if up else "shutdown"])
+            return key, "up" if up else "shut"
+        except Exception as ex:                       # noqa: BLE001 - reported; restore retries
+            return key, f"failed: {type(ex).__name__}"
+    with ThreadPoolExecutor(max_workers=min(6, len(ends))) as ex:
+        return dict(ex.map(one, ends))
+
+
+def _cut(cml, links: dict[str, str], action: str, deadline_s: int = 60,
+         carrier: list[dict] | None = None) -> dict[str, str]:
     """Stop (unplug) or start (re-plug) each link, then poll until it reports
-    the wanted state. Same shape as _power: a failed call is re-checked by state."""
+    the wanted state. Same shape as _power: a failed call is re-checked by state.
+    `carrier`: IOS link ends to shut after the stop / no-shut before the start."""
     want = "STOPPED" if action == "stop" else "STARTED"
     res: dict[str, str] = {}
+    if action == "start" and carrier:
+        _carrier(cml, carrier, up=True)
     for name, lid in links.items():
         try:
             (cml.stop_link if action == "stop" else cml.start_link)(lid)
@@ -189,10 +218,13 @@ def _cut(cml, links: dict[str, str], action: str, deadline_s: int = 60) -> dict[
             time.sleep(1)
     for name in pending:
         res[name] = f"not {want} after {deadline_s} s"
+    if action == "stop" and carrier:
+        _carrier(cml, carrier, up=False)
     return res
 
 
-def restore(cml, labels: list[str], deadline_s: int = 600, links: dict[str, str] | None = None) -> dict[str, str]:
+def restore(cml, labels: list[str], deadline_s: int = 600, links: dict[str, str] | None = None,
+            carrier: list[dict] | None = None) -> dict[str, str]:
     """Start every node that is not running and re-plug every cut link; the
     record is cleared only if all of them come back."""
     links = links or {}
@@ -200,7 +232,7 @@ def restore(cml, labels: list[str], deadline_s: int = 600, links: dict[str, str]
     down = {k: v for k, v in ids.items() if _state(cml, v) != "BOOTED"}
     res = {k: "BOOTED" for k in ids if k not in down}
     if links:                                     # cables first: they are instant, the nodes are not
-        res.update(_cut(cml, links, "start"))
+        res.update(_cut(cml, links, "start", carrier=carrier))
     if down:
         res.update(_power(cml, down, "start", {"BOOTED"}, deadline_s))
     if all(v in ("BOOTED", "STARTED") for v in res.values()) and set(res) == set(labels) | set(links):
@@ -270,6 +302,7 @@ def run(job_id: str, cml, con, spec: dict, execute, set_, respec) -> dict:
     d = spec["disaster"]
     sel, settle, do_restore = d["nodes"], int(d.get("settle_s", 30)), bool(d.get("restore", True))
     links = dict(d.get("links") or {})
+    carrier = list(d.get("carrier") or [])
     stop = threading.Event()
     with _lock:
         if _active is not None:
@@ -302,6 +335,7 @@ def run(job_id: str, cml, con, spec: dict, execute, set_, respec) -> dict:
                 import failover                    # noqa: PLC0415 - failover capture (spec: failover-capture-spec.md)
                 failover.run(job_id, cml, con, spec, baseline, d, stop, stage, set_, out,
                              write_record=lambda: _write({"job_id": job_id, "nodes": sel, "links": links,
+                                                          "carrier": carrier,
                                                           "restore": do_restore,
                                                           "started": datetime.now(timezone.utc).isoformat()}))
                 powered_off = bool(out.get("power_off"))
@@ -335,7 +369,7 @@ def run(job_id: str, cml, con, spec: dict, execute, set_, respec) -> dict:
             if out.get("power_off") and do_restore:
                 stage(f"restoring {n_back} item{'s' if n_back > 1 else ''}" +
                       (" and waiting for the nodes to boot" if sel else ""))
-                out["restored"] = restore(cml, sel, links=links)
+                out["restored"] = restore(cml, sel, links=links, carrier=carrier)
             elif out.get("power_off"):
                 out["restored"] = {x: "left powered off (restore was not selected)" for x in sel}
                 out["restored"].update({x: "left cut (restore was not selected)" for x in links})
@@ -376,13 +410,14 @@ def _disaster(job_id, cml, spec, baseline, sel, links, settle, do_restore, stop,
     t_wait = time.time()
     while len(seen) < 3 and time.time() - t_wait < 60 and not stop.is_set():
         time.sleep(0.5)
-    _write({"job_id": job_id, "nodes": sel, "links": links, "started": datetime.now(timezone.utc).isoformat(),
+    _write({"job_id": job_id, "nodes": sel, "links": links, "carrier": list(spec["disaster"].get("carrier") or []),
+            "started": datetime.now(timezone.utc).isoformat(),
             "restore": do_restore})
     stage(describe(sel, links))
     t_off = time.time()
     pre = len(seen)
     out["power_off"] = {x: "requested" for x in [*sel, *links]}   # restore is owed from this point on
-    res = _cut(cml, links, "stop") if links else {}
+    res = _cut(cml, links, "stop", carrier=spec["disaster"].get("carrier")) if links else {}
     if ids:
         res.update(_power(cml, ids, "stop", {"STOPPED", "DEFINED_ON_CORE"}, 180))
     out["power_off"] = res

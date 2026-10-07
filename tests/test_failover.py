@@ -267,6 +267,13 @@ def main():
           {"kind": "echo", "probe": 3, "dir": "request", "link_id": "OTHER", "a": "X", "b": "Z", "t": 6.0}]
     ok &= check("cut: F = last packet on the cut link", fo.failure_moment([], ev, set(), {"CUT"}) == 5.2)
     ok &= check("cut: nothing cut, nothing down -> no F", fo.failure_moment([], ev, set(), set()) is None)
+    # 8. console truth: a reply the source saw beats a capture that missed it
+    pr = [{"key": k, "sent": k * 0.2, "outcome": o, "req_path": [], "rep_path": []}
+          for k, o in ((1, "ok"), (2, "lost-reply"), (3, "lost-request"), (4, "lost-reply"))]
+    out = {p["key"]: p for p in fo.fill_missing(pr, {1: 0.2, 2: 0.4, 3: 0.6}, 0.2, True)}
+    ok &= check("console: replied probes become ok", out[2]["outcome"] == "ok" and out[3]["outcome"] == "ok"
+                and out[2].get("reply_inferred"), out)
+    ok &= check("console: unanswered stays lost", out[4]["outcome"] == "lost-reply", out[4])
 
     print("ALL FAILOVER TESTS OK" if ok else "FAILURES ABOVE")
     return 0 if ok else 1
