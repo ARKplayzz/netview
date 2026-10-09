@@ -1390,14 +1390,14 @@ def _slug(s: str) -> str:
     return re.sub(r"[^A-Za-z0-9.-]+", "-", s or "").strip("-")[:40] or "x"
 
 
-def save(result: dict) -> str | None:
+def save(result: dict, suffix: str = "") -> str | None:
     """Save a finished failover run (and its pcaps) to the history folder."""
     d = result.get("disaster") or {}
     if d.get("mode") != "failover":
         return None
     pcaps = d.pop("_pcaps", None) or {}
     name = (f"{datetime.now().strftime('%Y%m%d-%H%M%S')}_{_slug(result.get('source'))}_to_"
-            f"{_slug(result.get('virtual_target') or result.get('target'))}")
+            f"{_slug(result.get('virtual_target') or result.get('target'))}{suffix}")
     try:
         HISTORY_DIR.mkdir(parents=True, exist_ok=True)
         d["run_name"] = name
@@ -1411,6 +1411,105 @@ def save(result: dict) -> str | None:
     except OSError:
         return None
     return name
+
+
+# ================================================================= series ===
+# Repeat (2026-10-08): the same test run N times. Each run is saved on its own;
+# the series is saved as one more run - the representative run's full result
+# (the one nearest the average) plus `disaster.series`: every run's timeline
+# data, drawn layered on one timeline, and the average of each measurement.
+_SLIM_PROBE = ("key", "sent", "outcome", "path")
+_SLIM_ATTEMPT = ("t", "ok", "ms", "phase", "t_released", "t_renew", "t_bound", "t_done", "address", "server", "answer")
+
+
+def _stat(vals) -> dict | None:
+    v = [x for x in vals if isinstance(x, (int, float))]
+    if not v:
+        return None
+    return {"mean": round(sum(v) / len(v), 3), "min": round(min(v), 3), "max": round(max(v), 3), "n": len(v)}
+
+
+def _loss_window(probes: list[dict]) -> tuple[float | None, float | None]:
+    """(first lost probe after F, first answered probe after it), by send time."""
+    after = sorted((p for p in probes if p.get("sent") is not None and p["sent"] >= 0), key=lambda p: p["sent"])
+    first = next((p["sent"] for p in after if p.get("outcome") != "ok"), None)
+    if first is None:
+        return None, None
+    back = next((p["sent"] for p in after if p["sent"] > first and p.get("outcome") == "ok"), None)
+    return first, back
+
+
+def series_summary(results: list[dict]) -> dict:
+    """Every run's timeline data and the average of each measurement."""
+    runs = []
+    for i, r in enumerate(results):
+        d = r.get("disaster") or {}
+        fo = d.get("failover") or {}
+        m = fo.get("metrics") or {}
+        ls, le = _loss_window(fo.get("probes") or [])
+        runs.append({
+            "n": i + 1, "run_name": d.get("run_name"), "error": d.get("error"), "metrics": m,
+            "loss_start": ls, "loss_end": le,
+            "interval_s": (fo.get("probe") or {}).get("interval_s"),
+            "probes": [{k: p.get(k) for k in _SLIM_PROBE} for p in fo.get("probes") or []],
+            "paths": [{k: p.get(k) for k in ("id", "role", "first", "last", "hops")} for p in fo.get("paths") or []],
+            "events": [e for e in fo.get("events") or [] if e.get("kind") in
+                       ("failure", "first_loss", "all_stopped", "first_reply_new", "end")],
+            "services": [{"id": v["id"], "kind": v["kind"], "label": v.get("label"), "summary": v.get("summary") or {},
+                          "attempts": [{k: a.get(k) for k in _SLIM_ATTEMPT if k in a} for a in v.get("attempts") or []]}
+                         for v in fo.get("services") or []],
+        })
+    ok = [r for r in runs if r["metrics"]]
+    avg = {k: _stat(r["metrics"].get(k) for r in ok)
+           for k in ("failover_s", "outage_s", "detection_s", "lost", "sent_after_F", "from_click_s")}
+    avg["loss_start"] = _stat(r["loss_start"] for r in ok)
+    avg["loss_end"] = _stat(r["loss_end"] for r in ok)
+    svc: dict[str, dict] = {}
+    for r in ok:
+        for v in r["services"]:
+            s = v["summary"]
+            e = svc.setdefault(v["id"], {"id": v["id"], "kind": v["kind"], "label": v["label"], "runs": []})
+            row = {"n": r["n"], "verdict": s.get("verdict"), "down_s": s.get("down_s"),
+                   "first_fail": s.get("first_fail"), "recovered_at": s.get("recovered_at")}
+            if v["kind"] == "dhcp":
+                al = s.get("after_lease") or {}
+                row.update(t_bound=al.get("t_bound"), server=al.get("server"), ok=al.get("ok"))
+            e["runs"].append(row)
+    for e in svc.values():
+        for k in ("down_s", "first_fail", "recovered_at", "t_bound"):
+            e[k] = _stat(x.get(k) for x in e["runs"])
+        e["impacted"] = sum(1 for x in e["runs"] if x.get("down_s"))
+    verdicts: dict[str, int] = {}
+    for r in ok:
+        verdicts[r["metrics"].get("verdict") or "?"] = verdicts.get(r["metrics"].get("verdict") or "?", 0) + 1
+    return {"runs": runs, "avg": avg, "services": list(svc.values()), "verdicts": verdicts}
+
+
+def combine_series(results: list[dict], asked: int) -> dict:
+    """The series result: the run nearest the average failover time, carrying
+    `disaster.series`. Saved as its own history entry."""
+    if not results:
+        raise RuntimeError("no run completed")
+    ser = series_summary(results)
+    ser["asked"] = asked
+    mean = (ser["avg"].get("failover_s") or {}).get("mean")
+    with_fo = [r for r in results if ((r.get("disaster") or {}).get("failover") or {}).get("metrics")]
+    rep = min(with_fo, key=lambda r: abs(((r["disaster"]["failover"]["metrics"].get("failover_s") or 0)) - (mean or 0))) \
+        if with_fo else results[-1]
+    ser["representative"] = results.index(rep) + 1
+    ser["representative_run"] = rep["disaster"].get("run_name")
+    out = json.loads(json.dumps(rep, default=str))          # a copy: the run itself is saved already
+    d = out["disaster"]
+    d["series"] = ser
+    # every run's warnings (a run that never started is reported on the one before)
+    d["warnings"] = list(dict.fromkeys(w for r in results for w in (r.get("disaster") or {}).get("warnings") or []))
+    if len(results) < asked:
+        d.setdefault("warnings", []).append(
+            f"Stopped after {len(results)} of {asked} runs: " +
+            (results[-1]["disaster"].get("error") or "a run did not record or restore cleanly") + ".")
+    d["pcaps"] = False                                      # the pcaps stay with each run's own entry
+    save(out, suffix=f"_x{len(results)}")
+    return out
 
 
 def history() -> list[dict]:
@@ -1429,7 +1528,9 @@ def history() -> list[dict]:
                     "nodes": d.get("nodes"), "at": (fo.get("times") or {}).get("F_utc"), "verdict": m.get("verdict"),
                     "failover_s": m.get("failover_s"), "outage_s": m.get("outage_s"), "lost": m.get("lost"),
                     "sent": m.get("sent_after_F"), "path_changed": m.get("path_changed"),
-                    "answered_by": m.get("answered_by"), "pcaps": (HISTORY_DIR / f"{f.stem}.pcaps.zip").exists()})
+                    "answered_by": m.get("answered_by"), "pcaps": (HISTORY_DIR / f"{f.stem}.pcaps.zip").exists(),
+                    "series": len((d.get("series") or {}).get("runs") or []) or None,
+                    "avg": (d.get("series") or {}).get("avg")})
     return out
 
 

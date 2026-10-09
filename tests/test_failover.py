@@ -274,6 +274,27 @@ def main():
     ok &= check("console: replied probes become ok", out[2]["outcome"] == "ok" and out[3]["outcome"] == "ok"
                 and out[2].get("reply_inferred"), out)
     ok &= check("console: unanswered stays lost", out[4]["outcome"] == "lost-reply", out[4])
+    # 9. repeat: a series averages its runs and keeps each run's timeline
+    def one(fs, lost_at, back_at, smb_down):
+        prs = [{"key": k, "sent": -1 + k * 0.2, "outcome": "ok" if not (lost_at <= -1 + k * 0.2 < back_at) else "lost-reply",
+                "path": "A"} for k in range(30)]
+        return {"disaster": {"run_name": f"r{fs}", "failover": {
+            "metrics": {"verdict": "failed over", "failover_s": fs, "outage_s": back_at - lost_at, "lost": 3, "sent_after_F": 25},
+            "probes": prs, "paths": [{"id": "A", "role": "baseline", "first": -1, "last": 5, "hops": ["x", "y"]}],
+            "events": [{"t": fs, "kind": "first_reply_new", "text": "x"}], "probe": {"interval_s": 0.2},
+            "services": [{"id": "c1", "kind": "tcp", "label": "TCP", "attempts": [{"t": 1, "ok": False, "ms": 1000}],
+                          "summary": {"verdict": "recovered" if smb_down else "no impact", "down_s": smb_down,
+                                      "first_fail": 1.0 if smb_down else None, "recovered_at": 1 + smb_down if smb_down else None}}]}}}
+    ser = fo.series_summary([one(2.0, 0.4, 2.0, 2.0), one(3.0, 0.4, 3.0, 3.0), one(4.0, 0.4, 4.0, None)])
+    ok &= check("series: failover mean/min/max", ser["avg"]["failover_s"] == {"mean": 3.0, "min": 2.0, "max": 4.0, "n": 3},
+                ser["avg"]["failover_s"])
+    ok &= check("series: loss window averaged", abs(ser["avg"]["loss_start"]["mean"] - 0.4) < 0.01
+                and abs(ser["avg"]["loss_end"]["mean"] - 3.0) < 0.01, (ser["avg"]["loss_start"], ser["avg"]["loss_end"]))
+    smb = ser["services"][0]
+    ok &= check("series: service outage averages only impacted runs", smb["impacted"] == 2
+                and smb["down_s"]["mean"] == 2.5 and smb["recovered_at"]["mean"] == 3.5, smb)
+    ok &= check("series: every run's probes kept", [len(r["probes"]) for r in ser["runs"]] == [30, 30, 30])
+    ok &= check("series: verdicts counted", ser["verdicts"] == {"failed over": 3}, ser["verdicts"])
 
     print("ALL FAILOVER TESTS OK" if ok else "FAILURES ABOVE")
     return 0 if ok else 1

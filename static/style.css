@@ -406,6 +406,13 @@ button.danger { background: var(--bad); border-color: var(--bad); color: #fff; }
 .fo-tl .fo-F { stroke: var(--bad); stroke-width: 1.5; }
 .fo-tl .fo-F-t { fill: var(--bad); font-weight: 600; }
 .fo-tl .fo-unreach { opacity: .6; }
+/* Repeat (2026-10-08): the runs are drawn faintly; the average is dark. */
+.fo-tl .fo-avg-band { fill: var(--bad); stroke: var(--ink); stroke-width: .5; }
+.fo-tl .fo-avg-line { stroke: var(--ink); stroke-width: 2.5; }
+.fo-tl .fo-avg-t { fill: var(--ink); font-size: 10px; font-weight: 700; }
+.fo-swatch.fo-avg-swatch { background: var(--ink); }
+.fo-table tr.fo-rep td { font-weight: 600; }
+.fo-rep-h { margin-top: 18px; }
 .fo-tl [class^="fo-m-"] { fill: var(--ink2); }
 .fo-tl .fo-m-all_stopped { fill: var(--bad); }
 .fo-tl .fo-ev { fill: var(--ink2); }

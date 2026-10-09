@@ -655,6 +655,9 @@ def submit(spec: dict) -> str:
     if spec.get("disaster"):
         # two traces + power-off + outage window + restore/boot
         job["eta_seconds"] = job["eta_seconds"] * 2 + spec["disaster"]["settle_s"] + 60 + 90
+        n = int(spec["disaster"].get("repeat") or 1)
+        if n > 1:                                   # repeated failover test: N runs + the pauses
+            job["eta_seconds"] = job["eta_seconds"] * n + 45 * (n - 1)
     with _jobs_lock:
         _jobs[job_id] = job
         while len(_jobs) > 100:

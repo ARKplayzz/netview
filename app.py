@@ -460,11 +460,11 @@ def api_trace():
         # IOL) unless the page asks for a bare CML link stop.
         carrier = []
         if dz.get("carrier", True):
-            for lid in links.values():
+            for lname, lid in links.items():
                 l = lmap.get(lid) or {}
                 for node, iface in ((l.get("a"), l.get("ai")), (l.get("b"), l.get("bi"))):
                     if (by_label.get(node) or {}).get("probe_family") == "ios" and iface:
-                        carrier.append({"node": node, "iface": iface})
+                        carrier.append({"node": node, "iface": iface, "link": lname})
         spec["disaster"] = {"nodes": list(dz.get("nodes") or []), "links": links, "carrier": carrier,
                             "settle_s": max(15, min(int(dz.get("settle_s", 30)), 120)),
                             "restore": bool(dz.get("restore", True)), "warnings": warnings}
@@ -492,6 +492,8 @@ def api_trace():
                                     device_logs=bool(dz.get("device_logs", False)),
                                     after_trace=bool(dz.get("after_trace", False)),
                                     checks=checks,
+                                    # Repeat (2026-10-08): the whole test N times, averaged.
+                                    repeat=max(1, min(int(dz.get("repeat") or 1), disaster.MAX_REPEAT)),
                                     settle_s=window + 90)   # only feeds the progress ETA
         plain = {k: v for k, v in body.items() if k != "disaster"}
 

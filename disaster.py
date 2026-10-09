@@ -28,6 +28,7 @@ STATE_FILE = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "NetView" 
 _lock = threading.Lock()
 _active: dict | None = None
 _cancel: dict[str, threading.Event] = {}
+_series_job: str | None = None   # a repeated test, also between its runs
 
 
 # ---------------------------------------------------------------- state ---
@@ -59,7 +60,7 @@ def status() -> dict:
 
 
 def is_active() -> bool:
-    return _active is not None
+    return _active is not None or _series_job is not None
 
 
 def cancel(job_id: str) -> bool:
@@ -166,28 +167,52 @@ def _power(cml, ids: dict[str, str], action: str, want: set[str], deadline_s: in
 
 
 def _carrier(cml, ends: list[dict], up: bool) -> dict[str, str]:
-    """`shutdown` / `no shutdown` on IOS link ends, in parallel (one console each).
+    """`shutdown` / `no shutdown` on IOS link ends: one console session per NODE
+    (nodes in parallel, at most 6), each end read back and retried once.
 
     CML's link stop does NOT drop the link on IOL: measured 2026-10-07, all four
     HQ core <-> server-room links STOPPED and the cores still showed the ports
     up/up trunking, so the SVI stayed up and nothing reacted to the "cut". A real
     cut cable drops carrier at both ends; shutting both ends is how that is
-    emulated. Not saved - a reload brings the port back up."""
+    emulated. Not saved - a reload brings the port back up.
+
+    2026-10-08: this used to open one session per END. A switch with two cut
+    cables then had two sessions attached at once (the skill's one rule for the
+    console server), and one `no shutdown` was lost: CoreSwitch-HQ-1 Et0/1 and
+    ServerRoomSwitch-HQ-1 Et0/2 stayed shut after a restore, cutting the HQ
+    server room off for the next run. Every end is now confirmed."""
     if not ends:
         return {}
     from concurrent.futures import ThreadPoolExecutor   # noqa: PLC0415
     from console import Console                         # noqa: PLC0415
+    by_node: dict[str, list[str]] = {}
+    for e in ends:
+        by_node.setdefault(e["node"], []).append(e["iface"])
 
-    def one(e):
-        key = f"{e['node']} {e['iface']}"
+    def node_job(item):
+        node, ifaces = item
+        out: dict[str, str] = {}
         try:
             with Console(cml) as con:
-                con.configure(e["node"], [f"interface {e['iface']}", "no shutdown" if up else "shutdown"])
-            return key, "up" if up else "shut"
-        except Exception as ex:                       # noqa: BLE001 - reported; restore retries
-            return key, f"failed: {type(ex).__name__}"
-    with ThreadPoolExecutor(max_workers=min(6, len(ends))) as ex:
-        return dict(ex.map(one, ends))
+                want = "up" if up else "shut"
+                for _attempt in range(2):
+                    todo = [i for i in ifaces if out.get(f"{node} {i}") != want]
+                    if not todo:
+                        break
+                    con.configure_batch(node, [[f"interface {i}", "no shutdown" if up else "shutdown"] for i in todo])
+                    for i in todo:                    # read back: was it applied?
+                        cfg = con.exec(node, f"show running-config interface {i} | include ^ shutdown")
+                        is_shut = any(l.strip() == "shutdown" for l in cfg.splitlines())
+                        out[f"{node} {i}"] = want if is_shut != up else f"still {'shut' if is_shut else 'up'}"
+        except Exception as ex:                       # noqa: BLE001 - reported to the caller
+            for i in ifaces:
+                out.setdefault(f"{node} {i}", f"failed: {type(ex).__name__}")
+        return out
+    res: dict[str, str] = {}
+    with ThreadPoolExecutor(max_workers=min(6, len(by_node))) as ex:
+        for r in ex.map(node_job, by_node.items()):
+            res.update(r)
+    return res
 
 
 def _cut(cml, links: dict[str, str], action: str, deadline_s: int = 60,
@@ -197,8 +222,7 @@ def _cut(cml, links: dict[str, str], action: str, deadline_s: int = 60,
     `carrier`: IOS link ends to shut after the stop / no-shut before the start."""
     want = "STOPPED" if action == "stop" else "STARTED"
     res: dict[str, str] = {}
-    if action == "start" and carrier:
-        _carrier(cml, carrier, up=True)
+    car = _carrier(cml, carrier, up=True) if action == "start" and carrier else {}
     for name, lid in links.items():
         try:
             (cml.stop_link if action == "stop" else cml.start_link)(lid)
@@ -219,7 +243,15 @@ def _cut(cml, links: dict[str, str], action: str, deadline_s: int = 60,
     for name in pending:
         res[name] = f"not {want} after {deadline_s} s"
     if action == "stop" and carrier:
-        _carrier(cml, carrier, up=False)
+        car = _carrier(cml, carrier, up=False)
+    # A link end whose carrier did not change is reported against its link, so
+    # a restore that left a port shut is never read as "back in service".
+    for e in carrier or []:
+        k = f"{e['node']} {e['iface']}"
+        v = car.get(k)
+        name = e.get("link")
+        if v not in (None, "up", "shut") and name in res and res[name] == want:
+            res[name] = f"{want}, but {k}: {v}"
     return res
 
 
@@ -294,28 +326,108 @@ def path_diff(before: list[str], after: list[str]) -> dict:
 
 
 # ----------------------------------------------------------------- run ---
+MAX_REPEAT = 5
+BETWEEN_RUNS_S = 45     # after a restore: routing fails back, STP / loop guard clear
+
+
 def run(job_id: str, cml, con, spec: dict, execute, set_, respec) -> dict:
     """The disaster job. `execute` runs one trace (pathtrace._execute), `set_`
     updates the job's stage, `respec()` rebuilds the trace spec from a fresh
-    inventory (node states, holders and DNS vantage as the network is NOW)."""
+    inventory (node states, holders and DNS vantage as the network is NOW).
+
+    Repeat (2026-10-08, failover mode): the whole test - baseline, failure,
+    recording, restore - runs `repeat` times with a pause between, and the
+    result carries every run plus their average (failover.series_summary).
+    One run can be luck; three show whether the number holds."""
+    global _series_job
+    d = spec["disaster"]
+    n = max(1, min(int(d.get("repeat") or 1), MAX_REPEAT)) if d.get("mode") == "failover" else 1
+    stop = threading.Event()
+    _cancel[job_id] = stop
+    _keep_awake(True)
+    try:
+        if n == 1:
+            return _run_once(job_id, cml, con, spec, execute, set_, respec, stop, "")
+        _series_job = job_id
+        results: list[dict] = []
+        for i in range(n):
+            # The same spec each time: every run starts from the restored network,
+            # which is the network the spec was built from. Each repeat gets its
+            # own console session: the job's one can die during a long series
+            # (2026-10-08: "Socket is closed" after the laptop slept) and would
+            # then fail every later run.
+            try:
+                if i == 0:
+                    r = _run_once(job_id, cml, con, spec, execute, set_, respec, stop, f"run {i + 1} of {n}: ")
+                else:
+                    from console import Console                 # noqa: PLC0415
+                    with Console(cml) as con_i:
+                        r = _run_once(job_id, cml, con_i, spec, execute, set_, respec, stop, f"run {i + 1} of {n}: ")
+            except Exception as e:                 # noqa: BLE001 - keep the runs already finished
+                if not results:
+                    raise
+                results[-1].setdefault("disaster", {}).setdefault("warnings", []).append(
+                    f"Run {i + 1} failed before its disaster: {type(e).__name__}: {e}")
+                break
+            dd = r.get("disaster") or {}
+            if not dd.get("failover"):             # never reached its disaster: not a run
+                if not results:
+                    return r
+                results[-1]["disaster"].setdefault("warnings", []).append(
+                    f"Run {i + 1} did not start its disaster: {dd.get('error') or 'no recording'}")
+                break
+            results.append(r)
+            bad = [k for k, v in (dd.get("restored") or {}).items() if v not in ("BOOTED", "STARTED")]
+            if stop.is_set() or dd.get("error") or bad:
+                break                              # never stack a disaster on an unrestored one
+            if i < n - 1:
+                for left in range(BETWEEN_RUNS_S, 0, -5):
+                    set_(job_id, stage=f"run {i + 1} of {n} done; letting the network settle ({left} s)")
+                    if stop.wait(5):
+                        break
+                if stop.is_set():
+                    break
+        import failover                            # noqa: PLC0415
+        return failover.combine_series(results, n)
+    finally:
+        _series_job = None
+        _cancel.pop(job_id, None)
+        _keep_awake(False)
+
+
+def _keep_awake(on: bool) -> None:
+    """Ask Windows not to idle-sleep while a disaster test is active.
+
+    2026-10-08: the laptop slept 8.5 h in the middle of a run, so the HQ server
+    room stayed cut for 8.5 h and the run's console died. A cut or a power-off
+    must never outlive the test because the PC running it went to sleep. Covers
+    idle sleep only (not a closed lid). No-op off Windows."""
+    try:
+        import ctypes                                   # noqa: PLC0415
+        ES_CONTINUOUS, ES_SYSTEM_REQUIRED = 0x80000000, 0x00000001
+        ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS | (ES_SYSTEM_REQUIRED if on else 0))
+    except Exception:                                   # noqa: BLE001 - best effort
+        pass
+
+
+def _run_once(job_id: str, cml, con, spec: dict, execute, set_, respec, stop, prefix: str) -> dict:
+    """One complete disaster test (see run)."""
     global _active
     d = spec["disaster"]
     sel, settle, do_restore = d["nodes"], int(d.get("settle_s", 30)), bool(d.get("restore", True))
     links = dict(d.get("links") or {})
     carrier = list(d.get("carrier") or [])
-    stop = threading.Event()
     with _lock:
         if _active is not None:
             raise RuntimeError("another disaster test is already running")
         _active = {"job_id": job_id, "nodes": sel, "links": links, "stage": "baseline trace",
                    "since": datetime.now(timezone.utc).isoformat(), "restore": do_restore}
-    _cancel[job_id] = stop
 
     def stage(txt: str) -> None:
-        set_(job_id, stage=txt)
+        set_(job_id, stage=prefix + txt)
         with _lock:
             if _active:
-                _active["stage"] = txt
+                _active["stage"] = prefix + txt
 
     out: dict = {"nodes": sel, "links": links, "settle_s": settle, "restore": do_restore, "warnings": d.get("warnings", [])}
     failover_mode = d.get("mode") == "failover"
@@ -380,7 +492,6 @@ def run(job_id: str, cml, con, spec: dict, execute, set_, respec) -> dict:
             out.pop("_pcaps", None)
             with _lock:
                 _active = None
-            _cancel.pop(job_id, None)
 
 
 def _disaster(job_id, cml, spec, baseline, sel, links, settle, do_restore, stop, stage, out) -> bool:

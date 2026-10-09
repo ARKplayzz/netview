@@ -194,4 +194,60 @@ assert rec["links"] == {"A - B": "L1"} and cml.links["L1"] == "STOPPED", rec
 assert dz.restore(cml, rec["nodes"], links=rec["links"]) == {"A - B": "STARTED"} and not dz.STATE_FILE.exists()
 assert dz.describe(["A"], {"A - B": "L1"}) == "powering off 1 node: A; cutting 1 link: A - B"
 print("cable cuts OK")
+
+# carrier emulation (2026-10-08): one session per NODE, never two at once on a
+# node, every end read back; a port left shut is reported against its link.
+import console as _real_console  # noqa: E402
+_open: dict = {}
+_lock = threading.Lock()
+_shut = {("C1", "Et0/1"), ("C1", "Et1/1"), ("S1", "Et0/2"), ("S1", "Et1/2")}
+_stuck = {("S1", "Et1/2")}                  # ignores `no shutdown`
+
+
+class FakeConsole:
+    def __init__(self, cml):
+        self.node = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        if self.node:
+            with _lock:
+                _open[self.node] -= 1
+
+    def _attach(self, node):
+        if self.node != node:
+            with _lock:
+                _open[node] = _open.get(node, 0) + 1
+                assert _open[node] == 1, f"two sessions on {node}"
+            self.node = node
+            _t.sleep(0.05)
+
+    def configure_batch(self, node, chunks, save=False):
+        self._attach(node)
+        for iface, cmd in ((c[0].split()[1], c[1]) for c in chunks):
+            if cmd == "shutdown":
+                _shut.add((node, iface))
+            elif (node, iface) not in _stuck:
+                _shut.discard((node, iface))
+        return ""
+
+    def exec(self, node, cmd):
+        self._attach(node)
+        iface = cmd.split()[3]
+        return " shutdown\n" if (node, iface) in _shut else ""
+
+
+sys.modules["console"] = types.SimpleNamespace(Console=FakeConsole)
+ends = [{"node": "C1", "iface": "Et0/1", "link": "C1 - S1"}, {"node": "S1", "iface": "Et0/2", "link": "C1 - S1"},
+        {"node": "C1", "iface": "Et1/1", "link": "C1 - S2"}, {"node": "S1", "iface": "Et1/2", "link": "C2 - S1"}]
+r = dz._carrier(None, ends, up=True)
+assert r == {"C1 Et0/1": "up", "C1 Et1/1": "up", "S1 Et0/2": "up", "S1 Et1/2": "still shut"}, r
+cml = FakeCML(["A", "B"])
+cml.links = {"L1": "STOPPED", "L2": "STOPPED"}
+res = dz._cut(cml, {"C1 - S1": "L1", "C2 - S1": "L2"}, "start", deadline_s=3, carrier=ends)
+assert res["C1 - S1"] == "STARTED" and res["C2 - S1"].startswith("STARTED, but S1 Et1/2"), res
+sys.modules["console"] = _real_console
+print("carrier emulation OK")
 print("ALL DISASTER TESTS OK")
